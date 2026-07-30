@@ -1,0 +1,32 @@
+# Config used by the DVC `train` stage. Reads the Spark-produced Parquet dataset
+# and logs/registers the model in MLflow.
+task: multiclass
+seed: 42
+output_dir: outputs
+
+data:
+  kind: tabular
+  csv_path: data/processed        # a directory of Parquet part-files (Spark output)
+  target_col: label
+  imbalance_strategy: smote
+
+model:
+  name: mlp
+  hidden_dims: [64, 32]
+  dropout: 0.3
+
+optim:
+  lr: 0.001
+  weight_decay: 0.0001
+
+train:
+  epochs: 20
+  batch_size: 32
+  num_workers: -1
+  patience: 8
+
+logging:
+  backend: mlflow
+  mlflow_tracking_uri: sqlite:///mlflow.db   # prod: http://mlflow:5000
+  mlflow_experiment: ml-framework
+  registered_model_name: ml-framework

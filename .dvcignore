@@ -1,0 +1,5 @@
+# Patterns DVC should not track. https://dvc.org/doc/user-guide/project-structure/dvcignore-files
+*.tmp
+__pycache__/
+.venv/
+outputs/metrics/

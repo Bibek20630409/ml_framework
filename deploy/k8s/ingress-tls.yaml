@@ -1,0 +1,43 @@
+# TLS-terminating Ingress via cert-manager (Let's Encrypt). Apply INSTEAD of the
+# plain Ingress in api.yaml once cert-manager + an ingress controller are installed.
+# TLS terminates at the ingress; the app speaks plain HTTP behind it.
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-prod
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    email: admin@example.com            # ← your email
+    privateKeySecretRef:
+      name: letsencrypt-prod
+    solvers:
+      - http01:
+          ingress:
+            class: nginx
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ml-framework-api-tls
+  namespace: ml-framework
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - ml-framework.example.com       # ← your domain
+      secretName: ml-framework-tls        # cert-manager creates/fills this
+  rules:
+    - host: ml-framework.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: ml-framework-api
+                port:
+                  number: 80

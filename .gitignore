@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# Tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Framework outputs
+outputs/
+wandb/
+lightning_logs/
+*.ckpt
+*.pkl
+
+# MLOps: MLflow local store, DVC-produced data, caches
+mlflow.db
+mlruns/
+mlartifacts/
+/data/processed/
+.dvc/cache/
+.dvc/tmp/
+.dvc/config.local
+
+# Secrets — never commit real credentials
+.env
+deploy/k8s/secrets.yaml
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store

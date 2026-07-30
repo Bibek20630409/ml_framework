@@ -1,0 +1,120 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ml-framework"
+version = "1.0.0"
+description = "Production-grade PyTorch Lightning framework for tabular, image, and mixed data."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "ML Framework" }]
+keywords = ["pytorch", "lightning", "mlops", "tabular", "training"]
+
+dependencies = [
+    "torch>=2.0.0",
+    "pytorch-lightning>=2.0.0",
+    "torchmetrics>=1.0.0",
+    "pandas>=2.0.0",
+    "numpy>=1.24.0",
+    "scikit-learn>=1.3.0",
+    "imbalanced-learn>=0.11.0",
+    "joblib>=1.3.0",
+    "pydantic>=2.5.0",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+image = ["torchvision>=0.15.0", "Pillow>=9.0.0"]
+serve = [
+    "fastapi>=0.110.0",
+    "uvicorn>=0.27.0",
+    "prometheus-fastapi-instrumentator>=6.1.0",
+]
+hpo = ["optuna>=3.4.0", "optuna-integration[pytorch_lightning]>=3.4.0"]
+# Model families beyond the Lightning path. The extra NAMES are load-bearing:
+# `Requirement.extra` is interpolated verbatim into the MissingExtraError hint, so
+# renaming one here breaks the `pip install 'ml-framework[…]'` message users are
+# told to run. Backends/plugins for these land in P3 (gbdt), P6 (timeseries) and
+# P7 (nlp); the extras are declared now so the error messages are already truthful.
+gbdt = ["xgboost>=2.0", "lightgbm>=4.0", "catboost>=1.2"]
+timeseries = ["statsmodels>=0.14", "prophet>=1.1"]
+nlp = ["transformers>=4.40", "tokenizers", "datasets"]
+export = ["onnx", "onnxruntime", "skl2onnx"]
+diagnostics = ["torch-lr-finder>=0.2.1", "matplotlib>=3.7.0"]
+logging = ["wandb>=0.15.0"]
+# Production MLOps stack. (Airflow is installed separately with its own
+# constraints file / container — see orchestration/airflow — not pinned here.)
+mlops = [
+    "mlflow>=2.9.0",
+    "dvc[s3]>=3.0.0",
+    "pyspark>=3.5.0",
+    "prometheus-fastapi-instrumentator>=6.1.0",
+]
+# Serving hardening: rate limiting + multi-worker production server.
+security = [
+    "slowapi>=0.1.9",
+    "gunicorn>=21.2.0",
+]
+# Drift detection + data contracts.
+monitoring = [
+    "scipy>=1.11.0",
+    "pandera>=0.18.0",
+]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-cov>=4.1.0",
+    "httpx>=0.27.0",
+    "black>=24.0.0",
+    "isort>=5.13.0",
+    "ruff>=0.3.0",
+    "mypy>=1.8.0",
+    "pre-commit>=3.6.0",
+    "fastapi>=0.110.0",
+    "torchvision>=0.15.0",
+    "mlflow>=2.9.0",
+    "prometheus-fastapi-instrumentator>=6.1.0",
+    "slowapi>=0.1.9",
+    "scipy>=1.11.0",
+    "pandera>=0.18.0",
+]
+
+[project.scripts]
+mlf = "ml_framework.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.black]
+line-length = 100
+target-version = ["py310"]
+
+[tool.isort]
+profile = "black"
+line_length = 100
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "C4"]
+ignore = ["E501"]
+
+[tool.mypy]
+# 3.12 needed to parse PEP 695 `type` statements in numpy 2.x stubs; the runtime
+# still supports 3.10+ (code uses only 3.10-compatible syntax).
+python_version = "3.12"
+ignore_missing_imports = true
+warn_unused_ignores = false
+disallow_untyped_defs = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --ignore=tests/load"   # load scripts (locust/k6) run out-of-band
+markers = [
+    "unit: fast isolated tests",
+    "integration: end-to-end training tests",
+    "serving: FastAPI endpoint tests",
+]

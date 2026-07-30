@@ -1,0 +1,57 @@
+# Local Apache Airflow (LocalExecutor) for developing/running the pipeline DAG.
+# A trimmed version of the official compose — for local use, not production
+# (production Airflow runs on Kubernetes via the official Helm chart).
+#
+#   docker compose -f docker-compose.airflow.yml up airflow-init
+#   docker compose -f docker-compose.airflow.yml up
+#   → UI at http://localhost:8080  (user/pass: airflow / airflow)
+x-airflow-common: &airflow-common
+  image: apache/airflow:2.9.3-python3.11
+  environment: &airflow-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    PROJECT_DIR: /opt/ml_framework
+    MLFLOW_TRACKING_URI: http://mlflow:5000
+    MODEL_NAME: ml-framework
+    _PIP_ADDITIONAL_REQUIREMENTS: "mlflow>=2.9.0 dvc"
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ..//..:/opt/ml_framework          # mount the project so tasks can run mlf/dvc/spark
+  depends_on:
+    postgres:
+      condition: service_healthy
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 5
+    volumes:
+      - airflow-db:/var/lib/postgresql/data
+
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    command: -c "airflow db migrate && airflow users create --role Admin --username airflow --password airflow --email admin@example.com --firstname a --lastname b"
+
+  airflow-webserver:
+    <<: *airflow-common
+    command: webserver
+    ports:
+      - "8080:8080"
+    restart: always
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    restart: always
+
+volumes:
+  airflow-db:

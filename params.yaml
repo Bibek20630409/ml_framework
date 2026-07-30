@@ -1,0 +1,8 @@
+# DVC pipeline parameters — the single source of truth the pipeline stages read.
+preprocess:
+  input: data/raw/sample.csv
+  output: data/processed
+  target_col: label
+
+train:
+  config: configs/dvc_tabular.yaml

@@ -1,0 +1,35 @@
+# DVC pipeline — reproducible, content-addressed stages.
+#   dvc repro            → run the whole DAG (preprocess → train)
+#   dvc dag              → visualize it
+#   dvc status / metrics → what changed / current scores
+#
+# The Spark preprocess stage needs a JVM (Java 11/17) + pyspark. The train stage
+# reads the processed Parquet the datamodule now understands.
+stages:
+  preprocess:
+    cmd: >-
+      python -m ml_framework.pipeline.spark_preprocess
+      --input ${preprocess.input}
+      --output ${preprocess.output}
+      --target-col ${preprocess.target_col}
+    deps:
+      - ${preprocess.input}
+      - src/ml_framework/pipeline/spark_preprocess.py
+    params:
+      - preprocess
+    outs:
+      - ${preprocess.output}
+
+  train:
+    cmd: mlf train --config ${train.config}
+    deps:
+      - ${preprocess.output}
+      - ${train.config}
+      - src/ml_framework
+    outs:
+      - outputs/model.ckpt
+      - outputs/scaler.pkl
+      - outputs/metadata.json
+    metrics:
+      - outputs/metrics.json:
+          cache: false

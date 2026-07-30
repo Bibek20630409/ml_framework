@@ -1,0 +1,28 @@
+# Prometheus scrape configuration for the ML Framework serving API.
+# Local (docker-compose): targets the `api` service. In Kubernetes, prefer a
+# ServiceMonitor (Prometheus Operator) or pod annotations instead of static targets.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - alerts.yml
+
+# Uncomment once an AlertManager is running (see docs/MLOPS.md):
+# alerting:
+#   alertmanagers:
+#     - static_configs:
+#         - targets: ["alertmanager:9093"]
+
+scrape_configs:
+  - job_name: ml-framework-api
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["api:8000"]
+        labels:
+          service: ml-framework
+          component: serving
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

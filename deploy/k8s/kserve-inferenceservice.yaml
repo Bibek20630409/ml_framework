@@ -1,0 +1,40 @@
+# OPTIONAL advanced serving via KServe (serverless inference: scale-to-zero,
+# canary traffic splitting, standardized inference protocol). Use this INSTEAD of
+# the api.yaml Deployment/Service/HPA if your cluster has KServe installed.
+#
+#   kubectl apply -f kserve-inferenceservice.yaml
+#
+# This runs the same container image; KServe provides the autoscaling + routing.
+apiVersion: serving.kserve.io/v1beta1
+kind: InferenceService
+metadata:
+  name: ml-framework
+  namespace: ml-framework
+  annotations:
+    serving.kserve.io/enable-prometheus-scraping: "true"
+spec:
+  predictor:
+    minReplicas: 0          # scale to zero when idle
+    maxReplicas: 10
+    scaleTarget: 70
+    scaleMetric: cpu
+    containers:
+      - name: kserve-container
+        image: ml-framework-serve:latest
+        command: ["mlf", "serve"]
+        args:
+          - "--registry-model"
+          - "ml-framework"
+          - "--registry-stage"
+          - "production"
+          - "--tracking-uri"
+          - "http://mlflow:5000"
+          - "--host"
+          - "0.0.0.0"
+          - "--port"
+          - "8000"
+        ports:
+          - containerPort: 8000
+        env:
+          - name: MLFLOW_TRACKING_URI
+            value: "http://mlflow:5000"

@@ -1,0 +1,40 @@
+# ── Example image experiment config ──────────────────────────────────
+# Load with:  mlf train --config configs/example_image.yaml
+
+task: multiclass
+seed: 42
+output_dir: outputs
+
+data:
+  kind: image
+  train_dir: data/train
+  # val_dir: data/val          # optional — auto-split from train if absent
+  test_dir: data/test
+  img_size: 224
+  imbalance_strategy: class_weights   # image path uses WeightedRandomSampler regardless
+
+model:
+  name: cnn
+  backbone: resnet18           # torchvision backbone
+  pretrained: true
+  dropout: 0.3
+
+optim:
+  lr: 0.0003
+  weight_decay: 0.0001
+  lr_patience: 5
+  lr_factor: 0.5
+
+train:
+  epochs: 50
+  batch_size: 32
+  num_workers: -1
+  patience: 10
+  gradient_clip_val: 1.0
+  deterministic: true
+
+logging:
+  backend: csv
+  wandb_project: my-image-project
+  wandb_run: run-01
+  log_model: false

@@ -1,0 +1,91 @@
+# Local full MLOps stack — one command brings up serving + tracking + monitoring.
+#   docker compose up --build
+#     api        → http://localhost:8000   (/health, /predict, /metrics)
+#     mlflow     → http://localhost:5000   (experiments + model registry)
+#     prometheus → http://localhost:9090
+#     grafana    → http://localhost:3000   (admin/admin) — "ML Framework — Serving"
+#     minio      → http://localhost:9001   (minio/minio12345) — artifact store
+#
+# Train first (writes ./outputs) so the API has a model to serve:
+#   docker compose run --rm train train --config configs/example_tabular.yaml
+services:
+  api:
+    build:
+      context: .
+      target: serve
+    image: ml-framework-serve:latest
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./outputs:/app/outputs:ro
+    environment:
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      MLF_API_KEY: ${MLF_API_KEY:-}
+      MLF_RATE_LIMIT: ${MLF_RATE_LIMIT:-60/minute}
+    command: ["mlf", "serve", "--artifacts", "outputs", "--host", "0.0.0.0", "--port", "8000"]
+    depends_on:
+      - mlflow
+
+  train:
+    build:
+      context: .
+      target: train
+    image: ml-framework-train:latest
+    volumes:
+      - ./:/app
+    environment:
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+    profiles: ["tools"]   # only runs when explicitly invoked (docker compose run train …)
+
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.16.2
+    command: >-
+      mlflow server --host 0.0.0.0 --port 5000
+      --backend-store-uri sqlite:////mlflow/mlflow.db
+      --artifacts-destination s3://mlflow
+    ports:
+      - "5000:5000"
+    environment:
+      MLFLOW_S3_ENDPOINT_URL: http://minio:9000
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-minio}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-change_me_minio}
+    volumes:
+      - mlflow-data:/mlflow
+    depends_on:
+      - minio
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minio}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-change_me_minio}
+    volumes:
+      - minio-data:/data
+
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./deploy/monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    volumes:
+      - ./deploy/monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus
+
+volumes:
+  mlflow-data:
+  minio-data:

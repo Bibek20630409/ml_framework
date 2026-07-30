@@ -1,0 +1,46 @@
+# ── Example tabular experiment config ────────────────────────────────
+# This is the only file you edit per project (plus optional custom models).
+# Load with:  mlf train --config configs/example_tabular.yaml
+
+task: multiclass          # binary | multiclass | regression
+seed: 42
+output_dir: outputs
+
+data:
+  kind: tabular
+  csv_path: data.csv
+  target_col: label
+  # class_names: [cat, dog, bird]   # optional, for readable reports
+  val_size: 0.15
+  test_size: 0.15
+  holdout_threshold: 5000           # n >= this → holdout, else KFold-derived split
+  imbalance_strategy: smote         # smote | class_weights | none
+  imbalance_threshold: 0.3
+
+model:
+  name: mlp                         # registry key (mlp | cnn)
+  hidden_dims: [128, 64, 32]        # paste tuned values from `mlf hpo`
+  dropout: 0.3
+
+optim:
+  lr: 0.001                         # paste tuned value from `mlf lr`
+  weight_decay: 0.0001
+  lr_patience: 10
+  lr_factor: 0.5
+
+train:
+  epochs: 200
+  batch_size: 32
+  num_workers: -1                   # -1 → auto (0 on Windows, 4 elsewhere)
+  patience: 20
+  gradient_clip_val: 1.0
+  deterministic: true
+
+logging:
+  backend: csv                      # wandb | csv | none
+  wandb_project: my-project
+  wandb_run: run-01
+  log_model: false
+
+hpo_n_trials: 50
+hpo_timeout: 3600
