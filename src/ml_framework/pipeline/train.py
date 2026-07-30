@@ -78,6 +78,12 @@ def train(config: ExperimentConfig) -> dict:
     dm.setup()
     log.info("input_dim=%d output_dim=%d", dm.input_dim, dm.output_dim)
 
+    # The preprocessor owns every piece of fitted transform state, and the
+    # orchestrator owns where it is written — the data layer no longer knows about
+    # output dirs. (P1b moves this into the bundle's preprocessor/ directory.)
+    if dm.preprocessor is not None:
+        dm.preprocessor.save(out)
+
     model = build_model(
         config,
         input_dim=dm.input_dim,

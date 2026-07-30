@@ -1,37 +1,77 @@
 """
 data/builders.py
 ────────────────
-Factory helpers that turn a validated config into concrete datamodule / model
-instances via the registry. Importing this module guarantees the built-in
-datamodules and models are registered.
+Config → concrete objects, via the registries. Importing this module guarantees
+the built-in sources, datamodules and models are registered.
 
-For custom data, register your own datamodule:
+``build_bundle`` is the entry point the training orchestrator uses: it returns a
+:class:`~ml_framework.data.types.DataBundle`, which is framework-agnostic, rather
+than a ``LightningDataModule``, which is not. ``build_datamodule`` remains for the
+Lightning path (and for the LR finder), now as a thin wrapper.
 
-    from ml_framework.core import register_datamodule, TabularDataModule
+For custom data, register a source:
 
-    @register_datamodule("my_source")
-    class MyDataModule(TabularDataModule):
-        def setup(self, stage=None):
-            ...            # load/merge, then reuse parent logic
-            super().setup(stage)
+    from ml_framework.core.registry import register_source
+    from ml_framework.core.plugins import SourceSpec
+
+    register_source(SourceSpec(name="my_source", data_kind="tabular",
+                               build=my_build_fn, payload="arrays"))
 
 ...then set ``data.kind: my_source`` in the YAML.
+
+**Import discipline:** everything below imports core *submodules*
+(``..core.lit_model``, ``..core.registry``) rather than the ``..core`` package
+surface. ``core`` re-exports the data layer's helpers, so reaching for
+``from ..core import X`` here would be a circular import that only shows up in
+whichever module happens to be imported first.
 """
 
 from __future__ import annotations
+
+from typing import Any
 
 import torch
 
 # Side-effect imports register the built-ins.
 from .. import models as _models  # noqa: F401  (registers mlp/cnn)
 from ..config import ExperimentConfig
-from ..core import BaseModel, FrameworkDataModule  # registers tabular/image datamodules
+from ..core.lit_model import BaseModel
 from ..core.plugins import SourceSpec
 from ..core.registry import get_datamodule_class, get_model_class, register_source
 from ..core.types import Requirement
+from .lightning_adapter import (  # noqa: F401  (registers tabular/image datamodules)
+    BundleDataModule,
+    ImageDataModule,
+    TabularDataModule,
+)
+from .sources import build_image_bundle, build_tabular_bundle
+from .types import DataBundle
+
+_BUNDLE_BUILDERS = {
+    "tabular": build_tabular_bundle,
+    "image": build_image_bundle,
+}
 
 
-def build_datamodule(config: ExperimentConfig) -> FrameworkDataModule:
+def build_bundle(config: ExperimentConfig) -> DataBundle:
+    """Materialize the configured data source as a :class:`DataBundle`.
+
+    Dispatches through ``SOURCES`` so a third-party source is reachable by the
+    same ``data.kind`` mechanism as the built-ins.
+    """
+    from ..core.registry import SOURCES
+
+    if config.data.kind in SOURCES:
+        spec = SOURCES.get(config.data.kind)
+        return spec.build(config)
+    builder = _BUNDLE_BUILDERS.get(config.data.kind)
+    if builder is None:
+        raise KeyError(f"Unknown data kind '{config.data.kind}'. Known: {SOURCES.names()}")
+    return builder(config)
+
+
+def build_datamodule(config: ExperimentConfig) -> Any:
+    """The Lightning adapter for the configured data kind."""
     return get_datamodule_class(config.data.kind)(config)
 
 
@@ -51,17 +91,14 @@ def build_model(
 
 
 # ── v2 source specs ───────────────────────────────────────
-# Data *sources* are the extension point that replaces datamodules: from P1 there
-# is exactly one datamodule (the Lightning adapter over a DataBundle), so
-# registering datamodules stops making sense while registering sources starts to.
-#
-# `build` returns today's FrameworkDataModule; in P1 it returns a DataBundle. The
-# spec metadata (data kind, payload, requirements) is already final.
+# `build` now returns a DataBundle, which is what `SourceSpec.build`'s docstring
+# promised from P1. The spec metadata (data kind, payload, requirements) is
+# unchanged from P0.
 register_source(
     SourceSpec(
         name="tabular",
         data_kind="tabular",
-        build=build_datamodule,
+        build=build_tabular_bundle,
         payload="arrays",
         requires=(),
         description="CSV/Parquet table with a target column.",
@@ -71,7 +108,7 @@ register_source(
     SourceSpec(
         name="image",
         data_kind="image",
-        build=build_datamodule,
+        build=build_image_bundle,
         payload="dataset",
         requires=(
             Requirement("torchvision", extra="image", min_version="0.15"),

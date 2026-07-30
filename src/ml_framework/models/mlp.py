@@ -11,7 +11,8 @@ from __future__ import annotations
 
 import torch.nn as nn
 
-from ..core import BaseModel, register_model
+from ..core.lit_model import BaseModel
+from ..core.registry import register_model
 
 
 @register_model("mlp")
