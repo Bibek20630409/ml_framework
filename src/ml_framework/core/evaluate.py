@@ -1,8 +1,25 @@
 """
 core/evaluate.py
 ────────────────
-Held-out test-set evaluation. Writes report.txt, predictions.csv, and (for
-classification) confusion_matrix.txt. Returns a metrics dict.
+Held-out evaluation, from **arrays**. Writes ``report.txt``, ``predictions.csv``
+and (for classification) ``confusion_matrix.txt``; returns a metrics dict.
+
+v1 ran its own torch inference loop here with a three-way ``config.task`` branch
+inside it — the third copy of postprocessing logic that also existed in
+``lit_model._shared_step`` and ``inference.py``. The loop now belongs to the
+backend (``predict_split`` returns :class:`Predictions`) and the branching to the
+estimator, which leaves this module with the part that was always
+framework-agnostic: turning predictions into numbers and files.
+
+**No torch, no Lightning.** That is what lets a GBDT and a Prophet model be
+evaluated by this same code path.
+
+The output contract is preserved exactly, because these files are consumed by DVC
+metrics, the Airflow quality gate and humans comparing runs across the refactor:
+
+    metrics         {"test_acc"} | {"test_mae", "test_rmse"}
+    report.txt      "Accuracy: …" + sklearn classification_report(digits=4)
+    predictions.csv label, prediction, prob_class_{i} (multiclass) | probability (binary)
 """
 
 from __future__ import annotations
@@ -12,73 +29,91 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import pytorch_lightning as pl
-import torch
-from sklearn.metrics import classification_report, confusion_matrix
 
-from ..config import ExperimentConfig
+from .metrics import accuracy, mae, rmse
+from .protocols import Predictions
+from .task import get_task_spec
 
 log = logging.getLogger(__name__)
 
+REPORT_NAME = "report.txt"
+PREDICTIONS_NAME = "predictions.csv"
+CONFUSION_NAME = "confusion_matrix.txt"
+
 
 def evaluate(
-    model: pl.LightningModule,
-    datamodule: pl.LightningDataModule,
-    config: ExperimentConfig,
-    output_dir: str | None = None,
-) -> dict:
-    out = Path(output_dir or config.output_dir)
+    predictions: Predictions,
+    task: str,
+    *,
+    output_dir: str | Path,
+    class_names: list[str] | None = None,
+) -> dict[str, float]:
+    """Score ``predictions`` for ``task`` and write the report files.
+
+    Raises rather than guessing when the predictions carry no labels: an
+    evaluation without ground truth is a prediction run, and silently returning an
+    empty metrics dict would let a broken pipeline look successful.
+    """
+    out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = model.to(device).eval()
+    if predictions.y_true is None:
+        raise ValueError("evaluate() needs labelled predictions (Predictions.y_true is None)")
 
-    all_preds: list = []
-    all_labels: list = []
-    all_probs: list = []
-    with torch.no_grad():
-        for x, y in datamodule.test_dataloader():
-            out_logits = model(x.to(device))
-            if config.task == "binary":
-                probs = torch.sigmoid(out_logits.squeeze(1))
-                preds = (probs > 0.5).long()
-            elif config.task == "multiclass":
-                probs = torch.softmax(out_logits, dim=1)
-                preds = out_logits.argmax(dim=1)
-            else:  # regression
-                preds = out_logits.squeeze(1)
-                probs = preds
-            all_preds.extend(preds.cpu().numpy())
-            all_labels.extend(y.numpy())
-            all_probs.extend(probs.cpu().numpy())
+    spec = get_task_spec(task)
+    labels = np.asarray(predictions.y_true)
+    preds = np.asarray(predictions.y_pred)
+    probs = None if predictions.y_prob is None else np.asarray(predictions.y_prob)
 
-    preds_arr = np.array(all_preds)
-    labels_arr = np.array(all_labels)
-    probs_arr = np.array(all_probs)
-
-    if config.task in ("binary", "multiclass"):
-        report = classification_report(
-            labels_arr, preds_arr, target_names=config.data.class_names, digits=4, zero_division=0
-        )
-        cm = confusion_matrix(labels_arr, preds_arr)
-        acc = float(np.mean(preds_arr == labels_arr))
-        log.info("Test accuracy: %.4f\n%s", acc, report)
-        (out / "report.txt").write_text(f"Accuracy: {acc:.4f}\n\n{report}", encoding="utf-8")
-        (out / "confusion_matrix.txt").write_text(str(cm), encoding="utf-8")
-        metrics = {"test_acc": acc}
+    if spec.is_classification:
+        metrics = _write_classification(out, labels, preds, class_names)
     else:
-        mae = float(np.abs(preds_arr - labels_arr).mean())
-        rmse = float(np.sqrt(((preds_arr - labels_arr) ** 2).mean()))
-        log.info("Test MAE: %.4f | RMSE: %.4f", mae, rmse)
-        (out / "report.txt").write_text(f"MAE: {mae:.4f}\nRMSE: {rmse:.4f}", encoding="utf-8")
-        metrics = {"test_mae": mae, "test_rmse": rmse}
+        metrics = _write_regression(out, labels, preds)
 
-    df_out = pd.DataFrame({"label": labels_arr, "prediction": preds_arr})
-    if config.task == "multiclass" and probs_arr.ndim == 2:
-        for i in range(probs_arr.shape[1]):
-            df_out[f"prob_class_{i}"] = probs_arr[:, i]
-    elif config.task == "binary":
-        df_out["probability"] = probs_arr
-    df_out.to_csv(out / "predictions.csv", index=False)
-    log.info("predictions saved → %s", out / "predictions.csv")
-
+    _write_predictions(out, task, labels, preds, probs)
     return metrics
+
+
+def _write_classification(
+    out: Path, labels: np.ndarray, preds: np.ndarray, class_names: list[str] | None
+) -> dict[str, float]:
+    from sklearn.metrics import classification_report, confusion_matrix
+
+    report = classification_report(
+        labels, preds, target_names=class_names, digits=4, zero_division=0
+    )
+    acc = accuracy(labels, preds)
+    log.info("Test accuracy: %.4f\n%s", acc, report)
+    (out / REPORT_NAME).write_text(f"Accuracy: {acc:.4f}\n\n{report}", encoding="utf-8")
+    (out / CONFUSION_NAME).write_text(str(confusion_matrix(labels, preds)), encoding="utf-8")
+    return {"test_acc": acc}
+
+
+def _write_regression(out: Path, labels: np.ndarray, preds: np.ndarray) -> dict[str, float]:
+    test_mae, test_rmse = mae(labels, preds), rmse(labels, preds)
+    log.info("Test MAE: %.4f | RMSE: %.4f", test_mae, test_rmse)
+    (out / REPORT_NAME).write_text(f"MAE: {test_mae:.4f}\nRMSE: {test_rmse:.4f}", encoding="utf-8")
+    return {"test_mae": test_mae, "test_rmse": test_rmse}
+
+
+def _write_predictions(
+    out: Path,
+    task: str,
+    labels: np.ndarray,
+    preds: np.ndarray,
+    probs: np.ndarray | None,
+) -> None:
+    """The v1 column schema, unchanged.
+
+    Binary keeps a single ``probability`` column holding P(class 1), even though
+    the estimator's canonical ``predict_proba`` output is two columns — the file
+    is a published contract and the second column is redundant.
+    """
+    frame = pd.DataFrame({"label": labels, "prediction": preds})
+    if probs is not None:
+        if task == "multiclass" and probs.ndim == 2:
+            for i in range(probs.shape[1]):
+                frame[f"prob_class_{i}"] = probs[:, i]
+        elif task == "binary":
+            frame["probability"] = probs[:, 1] if probs.ndim == 2 else probs
+    frame.to_csv(out / PREDICTIONS_NAME, index=False)
+    log.info("predictions saved → %s", out / PREDICTIONS_NAME)

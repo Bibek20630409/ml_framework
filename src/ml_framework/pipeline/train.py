@@ -1,11 +1,25 @@
 """
 pipeline/train.py
 ─────────────────
-Final training entry point (hardened successor to the old top-level run.py).
+Training orchestration. **Zero torch, zero Lightning.**
 
-Produces a self-contained artifact bundle in ``config.output_dir``:
-  model.ckpt · scaler.pkl · metadata.json · report.txt · predictions.csv
-plus training.log and (optionally) a WandB dashboard.
+    build the data → pick the backend → fit → predict → evaluate → write the bundle
+
+Every step above is a call through a protocol, so the same function trains an MLP,
+an XGBoost model and a Prophet model. The mechanical check on that claim is that
+grepping this file for the Lightning package name finds nothing — v1 constructed
+``pl.Trainer`` and its callbacks right here, which is precisely why no non-torch
+estimator could enter the pipeline at any price. (The phase gate greps for the
+literal module name, so this file must not spell it out, even in prose.)
+
+Produces an artifact bundle v2 in ``config.output_dir``:
+
+    manifest.json · config.json · model/ · preprocessor/ · metrics.json
+    reference_stats.json · report.txt · confusion_matrix.txt · predictions.csv · training.log
+
+plus three files at the bundle root (``model.ckpt``, ``scaler.pkl``,
+``metadata.json``) that reproduce v1's layout. Those are transitional — see
+:func:`_write_v1_artifacts`.
 
 All execution is inside a function so the DataLoader worker processes on Windows
 have a proper ``__main__`` guard (via the CLI / console-script entry point).
@@ -17,53 +31,32 @@ import json
 import logging
 import shutil
 from pathlib import Path
+from typing import Any
 
-import pytorch_lightning as pl
-from pytorch_lightning.callbacks import (
-    EarlyStopping,
-    LearningRateMonitor,
-    ModelCheckpoint,
-)
-
+from .. import backends as _backends  # noqa: F401  (registers the lightning backend)
+from ..backends.base import resolve_budget
 from ..config import ExperimentConfig
-from ..core import evaluate
-from ..data import build_datamodule, build_model
+from ..core.bundle import (
+    MODEL_DIR,
+    PREPROCESSOR_DIR,
+    InputSignature,
+    Manifest,
+    ModelRef,
+    OutputSignature,
+    PreprocessorRef,
+    RequirementRef,
+    Signature,
+    write_bundle,
+)
+from ..core.evaluate import evaluate
+from ..core.protocols import RunContext
+from ..core.registry import get_backend, validate_combination
+from ..core.task import get_task_spec
+from ..data import build_bundle
+from ..tracking import build_run_logger
 from ..utils import seed_everything, setup_logging
 
 log = logging.getLogger(__name__)
-
-
-def _build_logger(config: ExperimentConfig):
-    backend = config.logging.backend
-    if backend == "wandb":
-        from pytorch_lightning.loggers import WandbLogger
-
-        return WandbLogger(
-            project=config.logging.wandb_project,
-            name=config.logging.wandb_run,
-            log_model=config.logging.log_model,
-        )
-    if backend == "mlflow":
-        from ..tracking import get_mlflow_logger
-
-        return get_mlflow_logger(config)
-    if backend == "csv":
-        from pytorch_lightning.loggers import CSVLogger
-
-        return CSVLogger(save_dir=config.output_dir, name="metrics")
-    return False
-
-
-def _write_metadata(config: ExperimentConfig, dm, out: Path) -> None:
-    meta = {
-        "task": config.task,
-        "input_dim": int(dm.input_dim),
-        "output_dim": int(dm.output_dim),
-        "feature_cols": list(getattr(dm, "feature_cols", []) or []),
-        "class_names": config.data.class_names,
-        "config": config.model_dump(),
-    }
-    (out / "metadata.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
 
 def train(config: ExperimentConfig) -> dict:
@@ -73,87 +66,195 @@ def train(config: ExperimentConfig) -> dict:
     seed_everything(config.seed, workers=True)
     log.info("task=%s model=%s data=%s", config.task, config.model.name, config.data.kind)
 
-    dm = build_datamodule(config)
-    dm.prepare_data()
-    dm.setup()
-    log.info("input_dim=%d output_dim=%d", dm.input_dim, dm.output_dim)
+    # Fails here — with a pip command or an explanation of why the combination
+    # cannot work — rather than 40 seconds into data loading.
+    spec = validate_combination(config.task, config.data.kind, config.model.name)
+    backend = get_backend(spec.backend)
 
-    # The preprocessor owns every piece of fitted transform state, and the
-    # orchestrator owns where it is written — the data layer no longer knows about
-    # output dirs. (P1b moves this into the bundle's preprocessor/ directory.)
-    if dm.preprocessor is not None:
-        dm.preprocessor.save(out)
+    bundle = build_bundle(config)
+    log.info("input_dim=%d output_dim=%d", bundle.input_dim, bundle.output_dim)
 
-    model = build_model(
-        config,
-        input_dim=dm.input_dim,
-        output_dim=dm.output_dim,
-        class_weights=dm.class_weights,
+    run_logger = build_run_logger(
+        config.logging.backend,
+        output_dir=out,
+        experiment=config.logging.mlflow_experiment,
+        tracking_uri=config.logging.mlflow_tracking_uri,
+        run_name=config.logging.wandb_run,
+        artifact_location=config.logging.mlflow_artifact_location,
+        project=config.logging.wandb_project,
     )
-    log.info("trainable params: %d", model.count_parameters())
-
-    logger = _build_logger(config)
-    callbacks = [
-        EarlyStopping(monitor="val/loss", patience=config.train.patience, mode="min"),
-        ModelCheckpoint(
-            dirpath=str(out),
-            filename="best",
-            monitor="val/loss",
-            mode="min",
-            save_top_k=1,
-        ),
-    ]
-    # LearningRateMonitor requires an active logger.
-    if logger:
-        callbacks.append(LearningRateMonitor(logging_interval="epoch"))
-    if config.logging.backend == "wandb" and logger:
-        logger.watch(model, log="gradients", log_freq=50)
-
-    trainer = pl.Trainer(
-        max_epochs=config.train.epochs,
-        accelerator="auto",
-        devices="auto",
-        callbacks=callbacks,
-        logger=logger,
-        gradient_clip_val=config.train.gradient_clip_val,
+    run = RunContext(
+        output_dir=out,
+        seed=config.seed,
+        budget=resolve_budget(config),
+        run_logger=run_logger,
         deterministic=config.train.deterministic,
-        log_every_n_steps=10,
     )
 
-    log.info("training…")
-    trainer.fit(model, dm)
-    trainer.test(model, dm)
+    try:
+        result = backend.fit(spec, bundle, config, run=run)
+        size = backend.model_size(result.estimator)
+        if size:
+            log.info("model size: %s", size)
 
-    best_path = getattr(trainer.checkpoint_callback, "best_model_path", "")
-    log.info("best checkpoint: %s", best_path)
-    if best_path and Path(best_path).exists():
-        shutil.copyfile(best_path, out / "model.ckpt")
+        predictions = backend.predict_split(result.estimator, bundle, "test")
+        metrics = evaluate(
+            predictions,
+            config.task,
+            output_dir=out,
+            class_names=config.data.class_names,
+        )
 
-    best_model = type(model).load_from_checkpoint(
-        best_path,
-        input_dim=dm.input_dim,
-        output_dim=dm.output_dim,
-        config=config,
-        class_weights=None,
-    )
-    metrics = evaluate(best_model, dm, config, output_dir=str(out))
-    _write_metadata(config, dm, out)
-    # Machine-readable metrics (consumed by DVC `metrics` + dashboards).
-    (out / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
-    # Drift baseline for serving-time monitoring.
-    if getattr(dm, "reference_stats", None):
-        (out / "reference_stats.json").write_text(json.dumps(dm.reference_stats), encoding="utf-8")
-
-    # MLflow: log the bundle to the run and register a model version.
-    if config.logging.backend == "mlflow" and logger:
-        from ..tracking import log_and_register
-
-        version = log_and_register(config, logger, out, metrics)
-        if version:
-            log.info(
-                "registered model '%s' version %s", config.logging.registered_model_name, version
+        artifact = backend.save(result.estimator, out / MODEL_DIR)
+        preprocessor_ref = _save_preprocessor(bundle, out)
+        manifest = _build_manifest(config, bundle, spec, artifact, preprocessor_ref, metrics, size)
+        write_bundle(out, manifest, config=config.model_dump(), metrics=metrics)
+        if bundle.reference_stats:
+            (out / "reference_stats.json").write_text(
+                json.dumps(bundle.reference_stats), encoding="utf-8"
             )
+        _write_v1_artifacts(config, bundle, out, artifact, preprocessor_ref)
+
+        run_logger.log_params(_tracked_params(config))
+        run_logger.log_metrics(metrics)
+        run_logger.log_artifacts(out, artifact_path="bundle")
+        _register_with_mlflow(config, run_logger, out, metrics)
+    except Exception:
+        run_logger.finish("FAILED")
+        raise
+    run_logger.finish("FINISHED")
 
     log.info("final metrics: %s", metrics)
-    log.info("artifacts written to %s (model.ckpt, scaler.pkl, metadata.json)", out)
+    log.info("artifacts written to %s (manifest.json, %s/, %s/)", out, MODEL_DIR, PREPROCESSOR_DIR)
     return metrics
+
+
+# ── Tracking ──────────────────────────────────────────────
+def _tracked_params(config: ExperimentConfig) -> dict[str, Any]:
+    """The config as flat dotted keys, which is the shape trackers accept."""
+    flat: dict[str, Any] = {}
+
+    def walk(node: Any, prefix: str) -> None:
+        for key, value in node.items():
+            path = f"{prefix}{key}"
+            if isinstance(value, dict):
+                walk(value, f"{path}.")
+            else:
+                flat[path] = value
+
+    walk(config.model_dump(), "")
+    return flat
+
+
+def _register_with_mlflow(
+    config: ExperimentConfig, run_logger: Any, out: Path, metrics: dict[str, float]
+) -> None:
+    if config.logging.backend != "mlflow" or run_logger.run_id is None:
+        return
+    from ..tracking import log_and_register
+
+    version = log_and_register(config, run_logger, out, metrics)
+    if version:
+        log.info("registered model '%s' version %s", config.logging.registered_model_name, version)
+
+
+# ── Bundle assembly ───────────────────────────────────────
+def _save_preprocessor(bundle: Any, out: Path) -> dict[str, Any] | None:
+    """Write the preprocessor's own directory and return its manifest fragment.
+
+    The orchestrator decides *where*; the preprocessor decides *what*. Nothing
+    here knows that a scaler exists.
+    """
+    if bundle.preprocessor is None:
+        return None
+    return bundle.preprocessor.save(out / PREPROCESSOR_DIR)
+
+
+def _build_manifest(
+    config: ExperimentConfig,
+    bundle: Any,
+    spec: Any,
+    artifact: Any,
+    preprocessor_ref: dict[str, Any] | None,
+    metrics: dict[str, float],
+    size: dict[str, Any],
+) -> Manifest:
+    """The serving contract.
+
+    Deliberately does **not** embed the training config: reconstructing an
+    ``ExperimentConfig`` at serving time would require a populated plugin registry
+    *and* every training extra. ``config.json`` sits beside it as the audit record.
+    """
+    task_spec = get_task_spec(config.task)
+    class_names = config.data.class_names or (
+        list(bundle.schema.class_names) if bundle.schema.class_names else None
+    )
+    return Manifest(
+        task=config.task,
+        data_kind=config.data.kind,
+        model=ModelRef(
+            name=spec.name,
+            backend=spec.backend,
+            artifact=artifact.path,
+            format=artifact.format,
+            params=config.model.model_dump(),
+            size=size or None,
+        ),
+        signature=Signature(
+            input=InputSignature(
+                payload=bundle.payload,
+                features=list(bundle.schema.feature_names),
+                n_features=bundle.input_dim,
+            ),
+            output=OutputSignature(
+                kind=task_spec.output_kind,
+                n_classes=bundle.n_classes,
+                class_names=class_names,
+            ),
+        ),
+        preprocessor=PreprocessorRef(**preprocessor_ref) if preprocessor_ref else None,
+        requires=[RequirementRef.from_requirement(r) for r in spec.requires],
+        metrics=metrics,
+    )
+
+
+def _write_v1_artifacts(
+    config: ExperimentConfig,
+    bundle: Any,
+    out: Path,
+    artifact: Any,
+    preprocessor_ref: dict[str, Any] | None,
+) -> None:
+    """Mirror the v1 bundle layout at the bundle root.
+
+    ``Inferencer``, ``serving/api.py`` and ``mlflow_utils.log_and_register`` all
+    still read ``model.ckpt`` / ``scaler.pkl`` / ``metadata.json`` from the root.
+    Rewriting them to read the manifest is P3's job — it is the same edit as making
+    them torch-free, and doing half of it here would be churn that P3 undoes. The
+    alternative, moving the artifacts now, would break serving for two phases.
+
+    Note that even here nothing names ``scaler.pkl``: the files come from the
+    preprocessor's own manifest fragment, so the "nothing outside the preprocessor
+    knows its filenames" invariant holds in the compatibility path too.
+
+    **Removal owner: P3.** When ``inference.py`` becomes manifest-driven, delete
+    this function and the files it writes.
+    """
+    source = out / artifact.path
+    if source.is_file():
+        shutil.copyfile(source, out / "model.ckpt")
+
+    for name in (preprocessor_ref or {}).get("files", []):
+        staged = out / PREPROCESSOR_DIR / name
+        if staged.is_file():
+            shutil.copyfile(staged, out / name)
+
+    meta = {
+        "task": config.task,
+        "input_dim": int(bundle.input_dim),
+        "output_dim": int(bundle.output_dim),
+        "feature_cols": list(bundle.schema.feature_names),
+        "class_names": config.data.class_names,
+        "config": config.model_dump(),
+    }
+    (out / "metadata.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")

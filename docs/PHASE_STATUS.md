@@ -6,7 +6,7 @@ Tracks progress against [ml_framework_architecture_plan.md](../ml_framework_arch
 | Phase | State | Commit |
 |---|---|---|
 | P0 — Foundations | **done** | `a8692a1` |
-| P1 — Data + backend extraction | not started | — |
+| P1 — Data + backend extraction | **done** | `95c4359` (P1a) · P1b |
 | P2 — v2 config | not started | — |
 | P3 — GBDT | not started | — |
 | P4 — AutoML | not started | — |
@@ -18,15 +18,19 @@ Tracks progress against [ml_framework_architecture_plan.md](../ml_framework_arch
 
 ## Test baseline
 
-**130 passed, 4 skipped** as of `a8692a1` (46 passed / 4 skipped before P0; P0 added
-84 tests and edited none). Every phase gate is measured against this number — a
-phase that ends with fewer passing tests than it started with has regressed
-something, regardless of what its own new tests say.
+**247 passed, 4 skipped** after P1 (46/4 before P0 → 130/4 after P0 → 247/4 after P1).
+Every phase gate is measured against this number — a phase that ends with fewer
+passing tests than it started with has regressed something, regardless of what
+its own new tests say.
 
-Verification commands (all clean at `a8692a1`):
+**No existing test has been edited in either phase.** The plan permits edits for
+v2 config field names and bundle artifact paths (§8.6); P1 needed neither, because
+the v1 artifacts stay at the bundle root until P3 rewrites the loader.
+
+Verification commands (all clean):
 
 ```
-pytest                        # 130 passed, 4 skipped
+pytest                        # 247 passed, 4 skipped
 ruff check src tests
 black --check src tests
 isort --check-only src tests
@@ -76,17 +80,65 @@ These look like omissions and are not. Do not "fix" them out of order.
    importing the wider ones from `core/types.py`. Switching in P0 would have widened
    what validates — a behavior change. **P2** does it as part of the schema rewrite.
 
-## P1 notes
+## What P1 landed
 
-The plan calls P1 the highest-risk phase: it changes the data layer and the fit loop
-simultaneously. §5 offers a split, and it is worth taking:
+Split as the plan suggests, each half independently revertible.
 
-- **P1a** — introduce `DataBundle` + `BundleDataModule`, feeding the *existing*
-  `train()`.
-- **P1b** — extract `LightningBackend`; `pipeline/train.py` becomes pure
-  orchestration.
+**P1a — the data layer** (`95c4359`). `DataBundle` (arrays + schema, no torch) with
+`data/sources/`, `data/preprocess/`, `data/splitters.py` and one `BundleDataModule`
+replacing the two v1 datamodules and their verbatim-duplicated dataloader methods.
+The existing `pl.Trainer` path kept running unchanged.
 
-Each half is independently revertible against `a8692a1`.
+**P1b — the fit loop.** `backends/lightning.py` owns `pl.Trainer`, its callbacks,
+checkpoint recovery and the Optuna pruning import. `pipeline/train.py` is
+orchestration through protocols. `core/evaluate.py` consumes `Predictions` arrays
+and imports no torch. Bundle v2 is written. `utils/logging.py` tracks handlers per
+output directory.
 
-Mechanical gate for P1: `grep pytorch_lightning src/ml_framework/pipeline/train.py`
-returns **0 hits**.
+### Gates met
+
+- `grep pytorch_lightning src/ml_framework/pipeline/train.py` → **0 hits**
+  (`import torch` → 0 as well). The file must not spell the module name even in
+  prose, which its docstring notes.
+- Integration tests pass **unedited** — the plan allowed artifact-path edits and
+  none were needed.
+- End-to-end run at seed 42 against `b195f77` produces byte-identical
+  `predictions.csv`, `report.txt`, `confusion_matrix.txt`, `metrics.json` and
+  fitted scaler. `RandomSplitter` additionally has a test running the inlined v1
+  split body as an oracle across both branches, three tasks and two seeds.
+
+### Deliberate loose ends P2/P3 must close
+
+1. **`_write_v1_artifacts` in `pipeline/train.py`** writes `model.ckpt`,
+   `scaler.pkl` and `metadata.json` at the bundle root beside the v2 layout.
+   `Inferencer`, `serving/api.py` and `mlflow_utils.log_and_register` still read
+   them. **Removal owner: P3**, which rewrites the loader to be manifest-driven and
+   torch-free — the same edit. Doing half of it here would be churn P3 undoes.
+2. **`LightningBackend.load` reads `config.json`** to rebuild an architecture,
+   because v1's `BaseModel.__init__` takes a whole `ExperimentConfig`. **P2** makes
+   `ModelSpec.build` take a `BuildContext`, after which the manifest signature is
+   sufficient alone.
+3. **`ModelSpec.build` is still called with the legacy kwargs**
+   (`input_dim`, `output_dim`, `config`, `class_weights`) from
+   `LightningBackend.fit`. Same owner: **P2**.
+4. **`search_space()` keys are dotted paths against the v2 schema**
+   (`fit.params.lr`), which does not exist yet. Declared, unused, correct —
+   consumed by **P4**.
+5. **`pipeline/hpo.py` and `lr_finder.py` still build their own `pl.Trainer`.**
+   `hpo.py` is deleted in **P4**; `lr_finder.py` gains a capability gate in P3/P5.
+   Neither is on the P1 gate.
+6. **`mlflow_utils.log_and_register` still logs a hardcoded 4-filename list.**
+   `train()` now also logs the whole bundle dir through the `RunLogger`, so the
+   registered bundle is complete; collapsing the two belongs with **P3**'s serving
+   work.
+7. **`TemporalSplitter`/`GroupSplitter` have no config path to reach them.** That
+   needs `split.strategy` in the v2 schema (**P2**) and, for the leakage guard,
+   **P6**. `RollingOriginSplitter` waits for the time-series CV that consumes it.
+
+### Note on tracking
+
+`train()` now holds a backend-neutral `RunLogger` and the Lightning logger lives
+inside the backend. For MLflow the two are bound to the **same run** via `run_id`:
+the orchestrator creates the run, the backend attaches to it. v1 had the Lightning
+logger own the run, which is why `log_and_register` reached into it for a `run_id`
+that a GBDT run would never have.
