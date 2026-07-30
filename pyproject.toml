@@ -53,6 +53,10 @@ gbdt = ["xgboost>=2.0", "lightgbm>=4.0", "catboost>=1.2"]
 timeseries = ["statsmodels>=0.14", "prophet>=1.1"]
 nlp = ["transformers>=4.40", "tokenizers", "datasets"]
 export = ["onnx", "onnxruntime", "skl2onnx"]
+# Parquet ingestion. Declared even though `mlflow` happens to require pyarrow
+# unconditionally: relying on that is a hidden coupling, and it breaks exactly
+# where it matters most — a slim serving image built without the mlops extra.
+parquet = ["pyarrow>=10.0.1"]
 diagnostics = ["torch-lr-finder>=0.2.1", "matplotlib>=3.7.0"]
 logging = ["wandb>=0.15.0"]
 # Production MLOps stack. (Airflow is installed separately with its own
@@ -89,6 +93,7 @@ dev = [
     "slowapi>=0.1.9",
     "scipy>=1.11.0",
     "pandera>=0.18.0",
+    "pyarrow>=10.0.1",  # so the parquet tests run rather than importorskip away
 ]
 
 [project.scripts]

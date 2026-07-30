@@ -25,12 +25,21 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from ...core.types import FrameworkError
+from ...core.plugins import check_requirements
+from ...core.types import FrameworkError, Requirement
 from ..preprocess.tabular import TabularPreprocessor, resolve_imbalance
 from ..splitters import RandomSplitter
 from ..types import DataBundle, FeatureSchema, Split
 
 log = logging.getLogger(__name__)
+
+
+# pandas needs an engine to read parquet, and it is not a pandas dependency.
+# Declaring it here rather than leaning on `mlflow` (which happens to require
+# pyarrow) keeps the coupling visible: the parquet path must fail with a pip
+# command, not with a pandas ImportError, in exactly the environment where the
+# dependency is most likely absent — a serving image built without the mlops extra.
+PARQUET_REQUIREMENT = Requirement("pyarrow", extra="parquet", min_version="10.0.1")
 
 
 def read_table(path: str) -> pd.DataFrame:
@@ -42,6 +51,7 @@ def read_table(path: str) -> pd.DataFrame:
     """
     p = Path(path)
     if p.is_dir() or p.suffix.lower() in (".parquet", ".pq"):
+        check_requirements((PARQUET_REQUIREMENT,), what=f"reading parquet from '{path}'")
         return pd.read_parquet(path)
     return pd.read_csv(path)
 

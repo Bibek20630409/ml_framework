@@ -3,6 +3,9 @@ import pandas as pd
 import pytest
 
 from ml_framework.core import read_table
+from ml_framework.core.plugins import MissingExtraError
+from ml_framework.core.types import Requirement
+from ml_framework.data.sources import tabular
 
 
 @pytest.mark.unit
@@ -36,3 +39,35 @@ def test_read_table_parquet_dir(tmp_path):
     pd.DataFrame({"f0": [3.0, 4.0], "label": [1, 0]}).to_parquet(d / "part-1.parquet")
     out = read_table(str(d))
     assert len(out) == 4
+
+
+@pytest.mark.unit
+def test_missing_parquet_engine_names_the_extra_not_a_pandas_import_error(monkeypatch, tmp_path):
+    """Parquet needs an engine that is not a pandas dependency.
+
+    The failure a user actually hits is on a lean install — a serving image built
+    without the mlops extra, where pyarrow no longer arrives via mlflow. They
+    should get the pip command, not `ImportError: Unable to find a usable engine`.
+    """
+    monkeypatch.setattr(
+        tabular,
+        "PARQUET_REQUIREMENT",
+        Requirement("definitely_not_pyarrow_xyz", extra="parquet", min_version="10.0.1"),
+    )
+    with pytest.raises(MissingExtraError) as excinfo:
+        read_table(str(tmp_path / "d.parquet"))
+    assert "pip install 'ml-framework[parquet]'" in str(excinfo.value)
+
+
+@pytest.mark.unit
+def test_csv_reading_never_consults_the_parquet_engine(monkeypatch, tmp_path):
+    """The guard must gate only the parquet branch — a CSV-only install stays free
+    of pyarrow entirely."""
+    monkeypatch.setattr(
+        tabular,
+        "PARQUET_REQUIREMENT",
+        Requirement("definitely_not_pyarrow_xyz", extra="parquet"),
+    )
+    p = tmp_path / "d.csv"
+    pd.DataFrame({"a": [1], "label": [0]}).to_csv(p, index=False)
+    assert len(read_table(str(p))) == 1

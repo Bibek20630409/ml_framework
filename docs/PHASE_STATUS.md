@@ -18,13 +18,13 @@ Tracks progress against [ml_framework_architecture_plan.md](../ml_framework_arch
 
 ## Test baseline
 
-**256 passed, 1 skipped** with every declared extra installed except DVC
-(46/4 before P0 → 130/4 after P0 → 249/4 after P1 → 257/0 → **256/1**). Every
+**258 passed, 1 skipped** with every declared extra installed except DVC
+(46/4 before P0 → 130/4 after P0 → 249/4 after P1 → 257/0 → **258/1**). Every
 phase gate is measured against this number — a phase that ends with fewer passing
 tests than it started with has regressed something, regardless of what its own new
 tests say.
 
-**Read the 257 → 256 step carefully: it is not a regression.** Installing
+**Read the 257 → 256 step carefully: it was not a regression** (2 parquet-guard tests then took it to 258). Installing
 `torchvision` makes `MODELS.is_available("cnn")` true, so
 `test_validate_combination_raises_missing_extra_for_a_sound_but_uninstalled_model`
 self-skips ("torchvision installed — nothing to refuse") because the condition it
@@ -53,7 +53,7 @@ because the v1 artifacts stay at the bundle root until P3 rewrites the loader.
 Verification commands (all clean):
 
 ```
-pytest                        # 256 passed, 1 skipped
+pytest                        # 258 passed, 1 skipped
 ruff check src tests
 black --check src tests
 isort --check-only src tests
@@ -77,13 +77,13 @@ mypy src
   — so `dvc repro` does not run locally. CI installs its own.
 - **pyspark is installed but cannot run**: no JVM on PATH. `spark_preprocess.py`
   imports and type-checks; a real `SparkSession` needs Java.
-- **`pyarrow` is undeclared but not actually missing**: `mlflow` requires it
-  unconditionally (`pyarrow<25,>=4.0.0`), and every environment that runs the suite
-  installs `.[dev]`, which includes mlflow. So parquet support and
-  `test_read_table.py` work here and in CI today. The hidden coupling is worth
-  fixing before **P3**, whose whole point is a serving image without the heavy
-  deps: drop mlflow from such an image and `read_table`'s parquet branch loses its
-  engine with no declaration to explain why.
+- **Parquet now declares its own engine.** It used to arrive only because mlflow
+  requires pyarrow unconditionally — a coupling that breaks precisely where it
+  matters, in a **P3** serving image built without the mlops extra. There is now a
+  `parquet` extra, and `read_table` gates that branch with the framework's own
+  `check_requirements`, so a lean install gets
+  `pip install 'ml-framework[parquet]'` instead of a pandas "unable to find a
+  usable engine" ImportError. CSV reading never consults it.
 
 ## What P0 landed
 
