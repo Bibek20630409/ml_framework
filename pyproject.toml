@@ -26,7 +26,13 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-image = ["torchvision>=0.15.0", "Pillow>=9.0.0"]
+# torchvision is pinned to a *range*, not just a floor. Each torchvision release
+# hard-requires one torch minor (torch 2.N pairs with torchvision 0.(N+15): 2.10 ->
+# 0.25, 2.11 -> 0.26, ...), so an unbounded `torchvision>=0.15.0` resolves to the
+# newest one and silently REPLACES a working torch — a ~2.5 GB reinstall that
+# `pip install -e '.[image]'` gives no warning about. Raise both bounds together
+# when moving to a newer torch.
+image = ["torchvision>=0.25.0,<0.26.0", "Pillow>=9.0.0"]
 serve = [
     "fastapi>=0.110.0",
     "uvicorn>=0.27.0",
@@ -72,7 +78,7 @@ dev = [
     "mypy>=1.8.0",
     "pre-commit>=3.6.0",
     "fastapi>=0.110.0",
-    "torchvision>=0.15.0",
+    "torchvision>=0.25.0,<0.26.0",  # keep in step with the `image` extra above
     "mlflow>=2.9.0",
     "prometheus-fastapi-instrumentator>=6.1.0",
     "slowapi>=0.1.9",

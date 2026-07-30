@@ -18,17 +18,32 @@ Tracks progress against [ml_framework_architecture_plan.md](../ml_framework_arch
 
 ## Test baseline
 
-**257 passed, 0 skipped** with every optional extra installed
-(46/4 before P0 → 130/4 after P0 → 249/4 after P1 → 257/0 once the extras were
-installed). Every phase gate is measured against this number — a phase that ends
-with fewer passing tests than it started with has regressed something, regardless
-of what its own new tests say.
+**256 passed, 1 skipped** with every declared extra installed except DVC
+(46/4 before P0 → 130/4 after P0 → 249/4 after P1 → 257/0 → **256/1**). Every
+phase gate is measured against this number — a phase that ends with fewer passing
+tests than it started with has regressed something, regardless of what its own new
+tests say.
 
-The 4 skips carried since before P0 were module-level `importorskip` guards, not
-gaps in the code: `pandera`, `mlflow`, `slowapi` and
-`prometheus-fastapi-instrumentator` were simply absent. Installing them turns 4
-skips into 8 passing tests. **The suite must also stay green without them** — that
-is the CI guardrail the plan sets from P0 onward, so do not convert an
+**Read the 257 → 256 step carefully: it is not a regression.** Installing
+`torchvision` makes `MODELS.is_available("cnn")` true, so
+`test_validate_combination_raises_missing_extra_for_a_sound_but_uninstalled_model`
+self-skips ("torchvision installed — nothing to refuse") because the condition it
+exists to test no longer holds. The companion
+`test_models_for_lists_only_installed_compatible_models` simply took its `["cnn"]`
+branch instead of `[]`. Both tests are availability-aware by design; do **not**
+pin them to either world.
+
+The one expected skip is therefore `tests/unit/test_plugins.py:253`. Any *other*
+skip means a package went missing.
+
+### The bare-install guardrail still holds
+
+The plan's §5 guardrail — the suite must pass on an install *without* the extras —
+can no longer be exercised locally now that the extras are present. It is still
+enforced in CI, and the design guardrail itself does not depend on torchvision
+being absent: `test_plugins.py::test_get_refuses_a_plugin_whose_extra_is_missing`
+and `test_bundle.py::test_bundle_requirements_are_checked_before_any_import_is_attempted`
+both use synthetic package names that are never installed. Do not convert an
 `importorskip` into a hard import.
 
 **No existing test has been edited in any phase so far.** The plan permits edits
@@ -38,12 +53,29 @@ because the v1 artifacts stay at the bundle root until P3 rewrites the loader.
 Verification commands (all clean):
 
 ```
-pytest                        # 257 passed, 0 skipped (with extras)
+pytest                        # 256 passed, 1 skipped
 ruff check src tests
 black --check src tests
 isort --check-only src tests
 mypy src
 ```
+
+### Environment notes
+
+- **torch is pinned by proxy.** Each torchvision release hard-requires one torch
+  minor, so the `image`/`dev` extras carry a *range* (`>=0.25,<0.26` for torch
+  2.10). An unbounded floor resolves to the newest torchvision and silently
+  replaces torch with a ~2.5 GB reinstall. Raise both bounds together.
+- **DVC is deliberately not installed.** It is the only declared dependency that
+  forces major upgrades of shared libraries (`urllib3` 1.26→2.7,
+  `cryptography` 46→49) in a user site-packages shared with unrelated projects. No
+  Python code imports it — only `Makefile`, `ci.yml`, `dvc.yaml` and `docs/MLOPS.md`
+  — so `dvc repro` does not run locally. CI installs its own.
+- **pyspark is installed but cannot run**: no JVM on PATH. `spark_preprocess.py`
+  imports and type-checks; a real `SparkSession` needs Java.
+- **`pyarrow` is used but undeclared.** `read_table` advertises parquet and
+  `test_read_table.py` exercises it via `importorskip`, yet no extra declares it.
+  It happens to be installed. Worth declaring.
 
 ## What P0 landed
 
