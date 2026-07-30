@@ -238,6 +238,48 @@ def test_backend_load_refuses_a_bundle_without_its_config(tmp_path, tabular_csv,
         get_backend("lightning").load(out, manifest)
 
 
+# ── Logger wiring ─────────────────────────────────────────
+@pytest.mark.unit
+def test_mlflow_logger_attaches_to_the_orchestrators_run(monkeypatch, tabular_csv, make_config):
+    """The orchestrator creates the MLflow run; the backend joins it.
+
+    v1 had the Lightning logger own the run, which is why `log_and_register` read
+    a `run_id` off it — an attribute a GBDT run would never have. Getting this
+    backwards would silently produce two runs per training.
+
+    Exercised with a stub because the real path needs the [mlops] extra, and
+    tests/integration/test_mlflow.py skips without it.
+    """
+    import pytorch_lightning.loggers as pl_loggers
+
+    captured: dict[str, object] = {}
+
+    class _FakeMLFlowLogger:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(pl_loggers, "MLFlowLogger", _FakeMLFlowLogger)
+
+    class _RunLogger:
+        run_id = "run-abc123"
+
+    cfg = make_config(tabular_csv, "multiclass", **{"logging.backend": "mlflow"})
+    run = RunContext(output_dir=Path(cfg.output_dir), run_logger=_RunLogger())
+    logger = LightningBackend()._build_logger(cfg, run)
+
+    assert isinstance(logger, _FakeMLFlowLogger)
+    assert captured["run_id"] == "run-abc123"
+    assert captured["log_model"] is False  # the bundle is logged instead
+    assert captured["experiment_name"] == cfg.logging.mlflow_experiment
+
+
+@pytest.mark.unit
+def test_no_lightning_logger_when_tracking_is_disabled(tabular_csv, make_config):
+    cfg = make_config(tabular_csv, "multiclass")  # logging.backend == "none"
+    run = RunContext(output_dir=Path(cfg.output_dir))
+    assert LightningBackend()._build_logger(cfg, run) is False
+
+
 # ── HPO surface ───────────────────────────────────────────
 @pytest.mark.unit
 def test_search_space_declares_loop_knobs_as_dotted_v2_paths():

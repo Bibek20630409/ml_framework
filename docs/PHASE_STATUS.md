@@ -18,7 +18,7 @@ Tracks progress against [ml_framework_architecture_plan.md](../ml_framework_arch
 
 ## Test baseline
 
-**247 passed, 4 skipped** after P1 (46/4 before P0 → 130/4 after P0 → 247/4 after P1).
+**249 passed, 4 skipped** after P1 (46/4 before P0 → 130/4 after P0 → 249/4 after P1).
 Every phase gate is measured against this number — a phase that ends with fewer
 passing tests than it started with has regressed something, regardless of what
 its own new tests say.
@@ -30,7 +30,7 @@ the v1 artifacts stay at the bundle root until P3 rewrites the loader.
 Verification commands (all clean):
 
 ```
-pytest                        # 247 passed, 4 skipped
+pytest                        # 249 passed, 4 skipped
 ruff check src tests
 black --check src tests
 isort --check-only src tests
@@ -134,6 +134,15 @@ output directory.
 7. **`TemporalSplitter`/`GroupSplitter` have no config path to reach them.** That
    needs `split.strategy` in the v2 schema (**P2**) and, for the leakage guard,
    **P6**. `RollingOriginSplitter` waits for the time-series CV that consumes it.
+
+### Coverage caveat
+
+The 4 skips are pre-existing and unchanged: `pandera`, `mlflow`, `slowapi` and
+`prometheus_fastapi_instrumentator` are not installed here, so
+`tests/integration/test_mlflow.py` does **not** run in this environment. The
+MLflow run-ownership change is therefore covered by a stubbed unit test of the
+wiring (`test_mlflow_logger_attaches_to_the_orchestrators_run`) rather than by an
+end-to-end MLflow run. Install the `[mlops]` extra to exercise the real path.
 
 ### Note on tracking
 
