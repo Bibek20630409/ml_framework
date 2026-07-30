@@ -21,7 +21,11 @@ jobs:
       - name: Install (CPU torch)
         run: |
           python -m pip install --upgrade pip
-          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          # torch and torchvision must come from the SAME index in ONE resolution:
+          # each torchvision pins one torch patch exactly (0.25.0 -> torch==2.10.0).
+          # Installing torch alone here and letting `.[dev]` pull torchvision from
+          # PyPI afterwards lets the second step decide the torch build.
+          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
           pip install -e ".[dev,serve]"
       - name: Lint
         run: |

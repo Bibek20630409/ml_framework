@@ -62,10 +62,14 @@ mypy src
 
 ### Environment notes
 
-- **torch is pinned by proxy.** Each torchvision release hard-requires one torch
-  minor, so the `image`/`dev` extras carry a *range* (`>=0.25,<0.26` for torch
-  2.10). An unbounded floor resolves to the newest torchvision and silently
-  replaces torch with a ~2.5 GB reinstall. Raise both bounds together.
+- **torch and torchvision must be installed together, from one index.** Every
+  torchvision release pins one torch patch *exactly* (0.25.0 requires
+  torch==2.10.0). The extras therefore keep an unbounded floor — an upper bound
+  there would pin the user's torch and contradict `torch>=2.0.0`. The constraint
+  lives in CI instead, which installs both from the CPU index in a single
+  resolution. Locally, install the pair: a bare `pip install -e '.[image]'`
+  resolves the newest torchvision and replaces torch to match it, silently and
+  expensively. Here that is torch 2.10.0+cpu / torchvision 0.25.0+cpu.
 - **DVC is deliberately not installed.** It is the only declared dependency that
   forces major upgrades of shared libraries (`urllib3` 1.26→2.7,
   `cryptography` 46→49) in a user site-packages shared with unrelated projects. No
@@ -73,9 +77,13 @@ mypy src
   — so `dvc repro` does not run locally. CI installs its own.
 - **pyspark is installed but cannot run**: no JVM on PATH. `spark_preprocess.py`
   imports and type-checks; a real `SparkSession` needs Java.
-- **`pyarrow` is used but undeclared.** `read_table` advertises parquet and
-  `test_read_table.py` exercises it via `importorskip`, yet no extra declares it.
-  It happens to be installed. Worth declaring.
+- **`pyarrow` is undeclared but not actually missing**: `mlflow` requires it
+  unconditionally (`pyarrow<25,>=4.0.0`), and every environment that runs the suite
+  installs `.[dev]`, which includes mlflow. So parquet support and
+  `test_read_table.py` work here and in CI today. The hidden coupling is worth
+  fixing before **P3**, whose whole point is a serving image without the heavy
+  deps: drop mlflow from such an image and `read_table`'s parquet branch loses its
+  engine with no declaration to explain why.
 
 ## What P0 landed
 

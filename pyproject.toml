@@ -26,13 +26,18 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# torchvision is pinned to a *range*, not just a floor. Each torchvision release
-# hard-requires one torch minor (torch 2.N pairs with torchvision 0.(N+15): 2.10 ->
-# 0.25, 2.11 -> 0.26, ...), so an unbounded `torchvision>=0.15.0` resolves to the
-# newest one and silently REPLACES a working torch — a ~2.5 GB reinstall that
-# `pip install -e '.[image]'` gives no warning about. Raise both bounds together
-# when moving to a newer torch.
-image = ["torchvision>=0.25.0,<0.26.0", "Pillow>=9.0.0"]
+# Deliberately an unbounded floor, despite the sharp edge: every torchvision
+# release pins ONE torch patch exactly (0.25.0 requires torch==2.10.0; the pairing
+# is torch 2.N <-> torchvision 0.(N+15)). An upper bound here would therefore pin
+# the *user's* torch too, contradicting `torch>=2.0.0` above and making the package
+# uninstallable next to any other torch.
+#
+# The consequence to know about: `pip install -e '.[image]'` resolves the newest
+# torchvision and will replace an older torch to match it, with no warning and a
+# multi-GB download. Install torch and torchvision together from the same index
+# when you care which build you get — that is what CI does, and it is an
+# environment concern, not something package metadata can express.
+image = ["torchvision>=0.15.0", "Pillow>=9.0.0"]
 serve = [
     "fastapi>=0.110.0",
     "uvicorn>=0.27.0",
@@ -78,7 +83,7 @@ dev = [
     "mypy>=1.8.0",
     "pre-commit>=3.6.0",
     "fastapi>=0.110.0",
-    "torchvision>=0.25.0,<0.26.0",  # keep in step with the `image` extra above
+    "torchvision>=0.15.0",  # see the pairing note on the `image` extra above
     "mlflow>=2.9.0",
     "prometheus-fastapi-instrumentator>=6.1.0",
     "slowapi>=0.1.9",
