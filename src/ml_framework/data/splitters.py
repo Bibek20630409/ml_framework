@@ -280,11 +280,97 @@ class CrossValidationSplitter:
         return out
 
 
+@dataclass(frozen=True, slots=True)
+class RollingOriginSplitter:
+    """Time-series cross-validation: k origins, each forecasting the next horizon.
+
+    The temporal counterpart of :class:`CrossValidationSplitter`, and **not**
+    interchangeable with it. Shuffled k-fold puts future rows in training and past
+    rows in test; the resulting score is not an estimate of anything you can
+    deploy. Here every fold's training data precedes its test window, so each fold
+    is a rehearsal of the thing you will actually do — stand at a point in time and
+    forecast forward.
+
+    ``expanding=True`` (the default) grows the training set with each origin, which
+    is what a production retrain does. ``expanding=False`` slides a fixed window,
+    which is what you want when old data is actively misleading (a regime change,
+    a changed measurement process).
+
+    ``gap`` drops observations between train and test. With lag features the last
+    training rows and the first test rows share source observations, so a zero gap
+    leaks even though the split is chronological.
+    """
+
+    name: ClassVar[str] = "rolling_origin"
+
+    folds: int = 3
+    horizon: int = 1
+    gap: int = 0
+    expanding: bool = True
+    # Rows before the first origin. None → derived so the folds fit.
+    min_train: int | None = None
+
+    def split(self, n: int, *, y: np.ndarray | None = None, **_: Any) -> list[SplitIndices]:
+        if self.folds < 1:
+            raise SplitError(f"rolling-origin needs at least 1 fold, got {self.folds}")
+        if self.horizon < 1:
+            raise SplitError(f"horizon must be >= 1, got {self.horizon}")
+
+        # Each fold consumes `horizon` rows for test and `horizon` for validation,
+        # plus two gaps. Everything before the first origin is the initial train.
+        per_fold = self.horizon
+        needed = self.folds * per_fold + per_fold + 2 * self.gap
+        min_train = self.min_train if self.min_train is not None else max(per_fold, n - needed)
+        if min_train < 1:
+            raise SplitError(
+                f"n={n} is too short for {self.folds} folds of horizon {self.horizon} "
+                f"(needs at least {needed + 1} rows)"
+            )
+
+        order = np.arange(n)
+        out: list[SplitIndices] = []
+        for fold in range(self.folds):
+            train_end = min_train + fold * per_fold
+            val_start = train_end + self.gap
+            val_end = val_start + per_fold
+            test_start = val_end + self.gap
+            test_end = test_start + per_fold
+            if test_end > n:
+                log.warning(
+                    "rolling-origin: stopping after %d folds — the series ends at %d", fold, n
+                )
+                break
+            train_start = 0 if self.expanding else max(0, train_end - min_train)
+            out.append(
+                SplitIndices(
+                    order[train_start:train_end],
+                    order[val_start:val_end],
+                    order[test_start:test_end],
+                )
+            )
+
+        if not out:
+            raise SplitError(
+                f"n={n} produced no rolling-origin folds at horizon {self.horizon}; "
+                f"shorten the horizon or the fold count"
+            )
+        log.info(
+            "rolling-origin: %d folds, horizon %d, %s window",
+            len(out),
+            self.horizon,
+            "expanding" if self.expanding else "sliding",
+        )
+        return out
+
+
 # ── Registry ──────────────────────────────────────────────
 # A plain name → class map rather than a PluginRegistry: splitters take no
 # optional dependencies and need no capability metadata, so a spec-carrying
-# registry would be ceremony. `RollingOriginSplitter` (time-series CV) arrives
-# with the forecasting work that consumes it.
+# registry would be ceremony.
+#
+# Only the single-partition splitters are here. `CrossValidationSplitter` and
+# `RollingOriginSplitter` return a *list* of partitions, so they do not satisfy
+# the same protocol and are selected by `split.folds` rather than by name.
 SPLITTERS: dict[str, type] = {
     RandomSplitter.name: RandomSplitter,
     TemporalSplitter.name: TemporalSplitter,

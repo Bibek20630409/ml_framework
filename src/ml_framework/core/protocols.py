@@ -365,3 +365,18 @@ DEFAULT_PAYLOAD: Mapping[DataKind, Payload] = {
     "text": "dataset",
     "timeseries": "series",
 }
+
+# Every payload a kind can be materialized as. Usually one — but a data *kind* is
+# a statement about the data, not about the shape a model wants it in, and time
+# series make the difference visible: Prophet is handed the ordered values
+# (``series``), an LSTM the same data cut into sliding windows (``arrays``). The
+# source produces whichever the selected model declares it accepts.
+#
+# `validate_combination` checks against this set rather than the single default,
+# so a model is refused only when it can consume *none* of what its kind offers.
+KIND_PAYLOADS: Mapping[DataKind, frozenset[Payload]] = {
+    "tabular": frozenset({"arrays", "frame"}),
+    "image": frozenset({"dataset"}),
+    "text": frozenset({"dataset"}),
+    "timeseries": frozenset({"series", "arrays"}),
+}

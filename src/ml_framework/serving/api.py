@@ -47,6 +47,8 @@ from ..core.types import UnsupportedCapability
 from .metrics import get_collectors, instrument
 from .schemas import (
     ConfidenceResponse,
+    ForecastRequest,
+    ForecastResponse,
     PayloadError,
     ProbaResponse,
     request_model,
@@ -198,8 +200,40 @@ def create_app(
             "n_features": inf.n_features,
         }
 
+    def _forecast(body: dict[str, Any]) -> Any:
+        """The timeseries branch of ``/predict``.
+
+        A forecaster is not scored on rows: it continues from where it was fitted
+        and is asked for a horizon. Routing it through ``_parse`` would demand a
+        feature matrix that does not exist — which is why the payload varies by
+        data kind rather than pretending every model takes one.
+        """
+        inf = _get_inferencer()
+        # Named directly rather than looked up: this branch runs only for
+        # timeseries, and going through `request_model` would hand back a
+        # `type[BaseModel]` that has no `horizon` as far as a type checker is
+        # concerned — silenced only by ignores that would also hide a real mistake.
+        assert request_model(inf.data_kind) is ForecastRequest
+        try:
+            req = ForecastRequest.model_validate(body)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if req.horizon > max_instances:
+            raise HTTPException(status_code=413, detail=f"horizon {req.horizon} > {max_instances}")
+
+        values = inf.predict(req.horizon)
+        lower, upper = inf.forecast_interval(req.horizon)
+        return ForecastResponse(
+            forecast=[float(v) for v in values],
+            index=None,
+            lower=None if lower is None else [float(v) for v in lower],
+            upper=None if upper is None else [float(v) for v in upper],
+        )
+
     @app.post("/predict", dependencies=auth)
     def predict(body: dict[str, Any]) -> Any:
+        if _get_inferencer().data_kind == "timeseries":
+            return _forecast(body)
         inf, _, arr = _parse(body)
         preds = inf.predict(arr)
         if supports_drift(inf.data_kind):
@@ -210,8 +244,25 @@ def create_app(
         model = response_model(inf.data_kind)
         return model(predictions=[float(p) for p in preds], labels=_labels(inf, preds))
 
+    def _require_proba() -> Inferencer:
+        """Refuse before parsing.
+
+        Whether a model produces probabilities is a property of the *manifest*, not
+        of the request body — so a forecasting bundle must answer 400 ("this
+        produces values over a horizon") rather than 501 ("that payload is not
+        implemented"). Checking after parsing gave the second, less accurate reason.
+        """
+        inf = _get_inferencer()
+        if not inf.produces_proba:
+            raise HTTPException(
+                status_code=400,
+                detail=(f"this model produces {inf.signature.output.kind}, not probabilities"),
+            )
+        return inf
+
     @app.post("/predict_proba", response_model=ProbaResponse, dependencies=auth)
     def predict_proba(body: dict[str, Any]) -> ProbaResponse:
+        _require_proba()
         inf, _, arr = _parse(body)
         try:
             probs = inf.predict_proba(arr)
@@ -226,6 +277,7 @@ def create_app(
     @app.post("/predict_with_confidence", response_model=ConfidenceResponse, dependencies=auth)
     def predict_with_confidence(body: dict[str, Any]) -> ConfidenceResponse:
         """``Inferencer.predict_with_confidence`` exposed over HTTP."""
+        _require_proba()
         inf, _, arr = _parse(body)
         try:
             preds, conf = inf.predict_with_confidence(arr)

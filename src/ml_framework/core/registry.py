@@ -44,7 +44,7 @@ from .plugins import (
     SourceSpec,
     check_requirements,
 )
-from .protocols import DEFAULT_PAYLOAD
+from .protocols import DEFAULT_PAYLOAD, KIND_PAYLOADS
 from .types import DataKind, Payload, Task
 
 T = TypeVar("T")
@@ -195,10 +195,25 @@ def validate_combination(
             f"model '{spec.name}' cannot consume data kind '{data_kind}' "
             f"(supports: {sorted(spec.data_kinds)})"
         )
-    resolved = payload or DEFAULT_PAYLOAD.get(data_kind)  # type: ignore[arg-type]
-    if resolved is not None and not spec.capabilities.can_accept(resolved):  # type: ignore[arg-type]
+    if payload is not None:
+        # An explicit payload is a question about one concrete shape.
+        offered: frozenset = frozenset({payload})  # type: ignore[arg-type]
+    else:
+        # Otherwise: every shape this kind can be materialized as. A kind is a
+        # statement about the *data*, not about the shape a model wants it in —
+        # time series are handed to Prophet as an ordered series and to an LSTM as
+        # sliding windows, from one source. Refuse only when the model can consume
+        # none of them.
+        offered = KIND_PAYLOADS.get(data_kind, frozenset())  # type: ignore[arg-type]
+        if not offered:
+            fallback = DEFAULT_PAYLOAD.get(data_kind)  # type: ignore[arg-type]
+            offered = frozenset({fallback}) if fallback else frozenset()
+
+    if offered and not (offered & spec.capabilities.accepts):
+        wanted = sorted(offered)
         raise IncompatibleCombinationError(
-            f"model '{spec.name}' cannot consume a '{resolved}' payload "
+            f"model '{spec.name}' cannot consume a "
+            f"'{wanted[0] if len(wanted) == 1 else ' or '.join(wanted)}' payload "
             f"(accepts: {sorted(spec.capabilities.accepts)})"
         )
     check_requirements(spec.requires, what=f"model '{spec.name}'", dist=MODELS.dist)

@@ -139,6 +139,14 @@ class SplitConfig(BaseModel):
     # data — and being driven by the Splitter is what gives GBDT and forecasting
     # cross-validation too, rather than it being a Lightning feature.
     folds: int = Field(default=0, ge=0)
+    # Steps ahead each fold forecasts, for rolling-origin cross-validation.
+    horizon: int = Field(default=1, ge=1)
+    # Expanding window (a production retrain) vs sliding (old data is misleading).
+    expanding: bool = True
+    # The deliberate friction point. Shuffling a time series is the most damaging
+    # silent failure in this domain — it produces a suspiciously good score rather
+    # than an error — so the escape hatch requires typing the word "leakage".
+    allow_temporal_leakage: bool = False
 
     @model_validator(mode="after")
     def _check_sizes(self) -> SplitConfig:
@@ -194,7 +202,36 @@ class DataConfig(BaseModel):
         elif self.kind == "image":
             if not self.path or not self.params.get("test_dir"):
                 raise ValueError("image data requires 'path' (train dir) and 'params.test_dir'")
+        elif self.kind == "timeseries":
+            if not self.path or not self.target:
+                raise ValueError("timeseries data requires 'path' and 'target' (the value column)")
+        self._check_temporal_leakage()
         return self
+
+    def _check_temporal_leakage(self) -> None:
+        """Refuse a shuffled split on time-ordered data.
+
+        The most damaging silent failure in this domain: a random split puts future
+        rows in training and past rows in test, and reports a *better* score for it.
+        Nothing crashes, so nothing tells you. Warning and proceeding would be the
+        conventional choice and the wrong one — the whole point is that the number
+        looks fine.
+
+        The escape hatch exists because there are legitimate reasons (a
+        cross-sectional model that happens to carry a date column), but it costs
+        typing the word "leakage", which is roughly the amount of deliberation the
+        decision deserves.
+        """
+        if self.kind != "timeseries" or self.split.strategy != "random":
+            return
+        if self.split.allow_temporal_leakage:
+            return
+        raise ValueError(
+            "data.split.strategy: random on kind: timeseries shuffles the future into "
+            "training and reports a score that is not an estimate of anything. Use "
+            "strategy: temporal (or auto), or set "
+            "data.split.allow_temporal_leakage: true if you genuinely mean it."
+        )
 
 
 class ModelConfig(BaseModel):

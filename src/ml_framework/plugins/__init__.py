@@ -45,10 +45,11 @@ from ..core.types import Capabilities, Requirement
 # so a failure here is a real defect and must not be hidden behind an
 # optional-dependency excuse.
 from . import gbdt as _gbdt  # registers xgboost / lightgbm / catboost
+from . import ts as _ts  # registers ts.naive / ts.arima / ts.prophet / ts.lstm
 from .params import CNNParams, MLPParams
 
 # The explicit builtin list, in registration order.
-BUILTINS: tuple[str, ...] = ("mlp", "cnn", *_gbdt.BUILTINS)
+BUILTINS: tuple[str, ...] = ("mlp", "cnn", *_gbdt.BUILTINS, *_ts.BUILTINS)
 
 __all__ = ["BUILTINS", "CNNParams", "MLPParams", "model_class"]
 
@@ -79,8 +80,9 @@ def model_class(name: str) -> type:
     from ..core.registry import get_model_class
 
     key = name.lower()
-    if key in {"mlp", "cnn"}:
-        importlib.import_module(f".{key}", __name__)
+    lazy = {"mlp": ".mlp", "cnn": ".cnn", "ts.lstm": ".ts.lstm"}
+    if key in lazy:
+        importlib.import_module(lazy[key], __name__)
     return get_model_class(key)
 
 

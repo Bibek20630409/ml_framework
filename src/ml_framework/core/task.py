@@ -137,3 +137,20 @@ register_task_spec(
         description="Continuous target, single output.",
     )
 )
+register_task_spec(
+    TaskSpec(
+        name="forecasting",
+        # MASE rather than MAE: a scale-free number whose 1.0 is a *meaning* — the
+        # seasonal-naive forecast. "MAE 4.2" says nothing without knowing the
+        # series; "MASE 0.8" says the model beats doing nothing.
+        primary_metric="mase",
+        direction="min",
+        output_kind="series",
+        postprocess="identity",
+        metric_names=("mase", "smape", "mae", "rmse"),
+        description="Predict future values of a series over a horizon.",
+        # Seasonality is a property of the data, not of the task, so the source
+        # sets it. Recorded here as the default for a non-seasonal series.
+        meta={"seasonality": 1},
+    )
+)

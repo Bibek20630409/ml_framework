@@ -40,7 +40,7 @@ from ..core.plugins import SourceSpec
 from ..core.protocols import BuildContext
 from ..core.registry import MODELS, register_source
 from ..core.types import Requirement
-from .sources import build_image_bundle, build_tabular_bundle
+from .sources import build_image_bundle, build_tabular_bundle, build_timeseries_bundle
 from .types import DataBundle
 
 if TYPE_CHECKING:
@@ -49,6 +49,7 @@ if TYPE_CHECKING:
 _BUNDLE_BUILDERS = {
     "tabular": build_tabular_bundle,
     "image": build_image_bundle,
+    "timeseries": build_timeseries_bundle,
 }
 
 
@@ -83,29 +84,48 @@ def build_cv_bundles(config: ExperimentConfig) -> Iterator[DataBundle]:
     cross-validating something else.
     """
     from .sources.tabular import read_table
-    from .splitters import CrossValidationSplitter
+    from .splitters import CrossValidationSplitter, RollingOriginSplitter
 
-    if config.data.kind != "tabular":
+    if config.data.kind not in ("tabular", "timeseries"):
         raise NotImplementedError(
-            f"cross-validation is implemented for tabular data; got '{config.data.kind}'. "
-            f"Set data.split.folds to 0 for a single holdout split."
+            f"cross-validation is implemented for tabular and timeseries data; got "
+            f"'{config.data.kind}'. Set data.split.folds to 0 for a single holdout split."
         )
 
     split_cfg = config.data.split
     frame = read_table(str(config.data.path))
-    labels = frame[config.data.target].to_numpy()
-    if config.task != "regression":
-        labels = labels.astype("int64")
+    # Only the sources that accept injected indices are reachable here; the guard
+    # above is what keeps that true, and naming them explicitly is what lets a type
+    # checker agree.
+    build = build_tabular_bundle if config.data.kind == "tabular" else build_timeseries_bundle
 
-    folds = CrossValidationSplitter(
-        folds=split_cfg.folds,
-        seed=config.runtime.seed,
-        task=config.task,
-        val_size=split_cfg.val_size,
-    ).split(len(frame), y=labels)
+    if (
+        config.data.kind == "timeseries"
+        or split_cfg.resolved_strategy(config.data.kind) == "temporal"
+    ):
+        # **Not** k-fold. Shuffled folds put future rows in training and past rows
+        # in test, which is the leakage the config validator refuses elsewhere;
+        # doing it here under the name "cross-validation" would be the same bug
+        # wearing a different hat.
+        folds = RollingOriginSplitter(
+            folds=split_cfg.folds,
+            horizon=split_cfg.horizon,
+            gap=split_cfg.gap,
+            expanding=split_cfg.expanding,
+        ).split(len(frame))
+    else:
+        labels = frame[config.data.target].to_numpy()
+        if config.task != "regression":
+            labels = labels.astype("int64")
+        folds = CrossValidationSplitter(
+            folds=split_cfg.folds,
+            seed=config.runtime.seed,
+            task=config.task,
+            val_size=split_cfg.val_size,
+        ).split(len(frame), y=labels)
 
     for indices in folds:
-        yield build_tabular_bundle(config, indices=indices)
+        yield build(config, indices=indices)
 
 
 def build_datamodule(config: ExperimentConfig) -> Any:
@@ -162,6 +182,19 @@ register_source(
         payload="arrays",
         requires=(),
         description="CSV/Parquet table with a target column.",
+    )
+)
+register_source(
+    SourceSpec(
+        name="timeseries",
+        data_kind="timeseries",
+        build=build_timeseries_bundle,
+        # The *declared* payload is the one a forecaster takes. The source emits
+        # windowed arrays instead when the selected model asks for them, which is a
+        # per-model decision rather than a property of the source.
+        payload="series",
+        requires=(),
+        description="Time-ordered table with a value column; ordered by split.time_col.",
     )
 )
 register_source(

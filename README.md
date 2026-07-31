@@ -1,9 +1,10 @@
 # ML Framework
 
-Production-grade training + serving framework for **tabular**, **image**, and mixed
-data. Supports binary classification, multi-class classification, and regression
-across neural networks (PyTorch Lightning) and gradient-boosted trees (XGBoost,
-LightGBM, CatBoost) — driven end-to-end by a single validated YAML config and a
+Production-grade training + serving framework for **tabular**, **image** and
+**time-series** data. Supports binary/multi-class classification, regression and
+forecasting across neural networks (PyTorch Lightning), gradient-boosted trees
+(XGBoost, LightGBM, CatBoost) and statistical forecasters (Prophet, ARIMA,
+seasonal-naive) — driven end-to-end by a single validated YAML config and a
 `mlf` CLI.
 
 ```
@@ -111,13 +112,13 @@ src/ml_framework/
 │   ├── inference.py     Inferencer.from_artifacts(dir)
 │   └── registry.py      MODELS / BACKENDS / SOURCES
 ├── backends/            one per fit-loop shape — lightning.py owns pl.Trainer
-├── plugins/             mlp.py (tabular), cnn.py (image transfer learning)
+├── plugins/             mlp · cnn · gbdt/ (xgboost…) · ts/ (naive, arima, prophet, lstm)
 ├── data/                sources · preprocess · splitters · lightning_adapter
-├── pipeline/            train · hpo · lr_finder
+├── pipeline/            train · tune · lr_finder
 ├── serving/api.py       FastAPI: /health /predict /predict_proba
 ├── utils/               logging, seed, platform-aware workers
 └── cli.py               `mlf` entry point
-configs/                 example_tabular.yaml · example_image.yaml
+configs/                 example_tabular · example_gbdt · example_image · example_timeseries
 tests/                   unit · integration · serving · backends · data
 ```
 
@@ -170,16 +171,16 @@ way with `SourceSpec`.
 - Metrics + CSV/WandB logging; final report, predictions, confusion matrix
 - Self-contained artifact bundle v2: `manifest.json` (the only file a loader must
   understand) · `config.json` · `model/` · `preprocessor/` · `metrics.json` ·
-  `report.txt` · `predictions.csv`. The v1 root files (`model.ckpt`, `scaler.pkl`,
-  `metadata.json`) are still written for the current loader
+  `report.txt` · `predictions.csv` · `hpo.json` (and `cv.json` when cross-validating)
 
 ## Task reference
 
 | task | loss | metrics |
 |---|---|---|
-| `binary` | `BCEWithLogitsLoss` (scalar `pos_weight`) | acc, F1 |
-| `multiclass` | `CrossEntropyLoss` (class weights) | acc, macro-F1 |
-| `regression` | `MSELoss` | MAE, RMSE |
+| `binary` | `BCEWithLogitsLoss` (scalar `pos_weight`) | acc, F1, ROC-AUC |
+| `multiclass` | `CrossEntropyLoss` (class weights) | acc, macro-F1, ROC-AUC |
+| `regression` | `MSELoss` | MAE, RMSE, R² |
+| `forecasting` | `MSELoss` (windowed) / per-model | **MASE**, sMAPE, MAE, RMSE |
 
 ## Backends
 
@@ -189,9 +190,9 @@ implementations — and adding CatBoost was ~40 lines, not a new backend.
 
 | backend | shape | models |
 |---|---|---|
-| `lightning` | epoch loop + validation callbacks | `mlp`, `cnn` |
+| `lightning` | epoch loop + validation callbacks | `mlp`, `cnn`, `ts.lstm` |
 | `gbdt` | one-shot `fit(X, y, eval_set=…)` + native early stopping | `xgboost`, `lightgbm`, `catboost` |
-| `forecast` | fit-per-series, predict-by-horizon | *(time-series work)* |
+| `forecast` | fit-per-series, no X/y, predict-by-horizon | `ts.naive`, `ts.arima`, `ts.prophet` |
 
 Switching families is a config edit — compare `configs/example_tabular.yaml` with
 `configs/example_gbdt.yaml`: same task, same data, same blocks, different
@@ -311,3 +312,52 @@ make cov       # pytest with coverage
 ```
 
 CI runs lint + type-check + tests on Python 3.10–3.12. Licensed MIT.
+
+## Forecasting
+
+```bash
+mlf train --config configs/example_timeseries.yaml
+```
+
+**Shuffling a time series is refused, not warned about.** `strategy: random` on
+`kind: timeseries` raises at config-load time:
+
+```
+data.split.strategy: random on kind: timeseries shuffles the future into
+training and reports a score that is not an estimate of anything.
+```
+
+That is the most damaging silent failure in this domain — nothing crashes, the
+score simply comes back *better*. Warning and proceeding is the conventional
+choice and the wrong one, so the escape hatch
+(`data.split.allow_temporal_leakage: true`) costs typing the word.
+
+Cross-validation follows the same rule: `folds: 3` on a series runs
+**rolling-origin** validation, where each fold's training data precedes its test
+window, not shuffled k-fold.
+
+| model | backend | needs |
+|---|---|---|
+| `ts.naive` | forecast | nothing — the baseline MASE is measured against |
+| `ts.arima` | forecast | `[timeseries]`; explicit (p,d,q), prediction intervals |
+| `ts.prophet` | forecast | `[timeseries]`; interpretable trend + seasonality |
+| `ts.lstm` | **lightning** | `[lightning]`; recurrent, over sliding windows |
+
+That last row is the backend split earning its keep: an LSTM forecaster trains in
+mini-batches over epochs exactly as an MLP does, so it rides the loop that already
+exists. One source serves both — it emits the raw ordered values for Prophet and
+sliding windows for the LSTM, chosen by what each model declares it `accepts`.
+
+Forecasts are served **by horizon**, not by rows, because `predict(X)` is a lying
+signature for a model that continues from where it was fitted:
+
+```bash
+curl -X POST localhost:8000/predict -d '{"horizon": 7}'
+# {"forecast": [...], "lower": [...], "upper": [...]}
+```
+
+> **On MASE.** It scales the error by the series' average step change, so it is
+> comparable across series. It is **not** a pass mark: over a multi-step horizon
+> values above 1 are normal. To judge whether a model earns its keep, train
+> `ts.naive` on the same split and compare. `report.txt` deliberately prints no
+> verdict for this reason.

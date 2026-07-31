@@ -165,7 +165,17 @@ def test_builtin_model_specs_are_registered():
     import ml_framework.plugins as plugins  # noqa: F401  (population is a side effect)
     from ml_framework.core import available_models
 
-    expected = {"mlp", "cnn", "xgboost", "lightgbm", "catboost"}
+    expected = {
+        "mlp",
+        "cnn",
+        "xgboost",
+        "lightgbm",
+        "catboost",
+        "ts.naive",
+        "ts.arima",
+        "ts.prophet",
+        "ts.lstm",
+    }
     assert set(MODELS.names()) == set(available_models()) == expected
     assert set(plugins.BUILTINS) == expected
 
@@ -196,7 +206,9 @@ def test_builtin_source_specs_are_registered():
     import ml_framework.data  # noqa: F401
     from ml_framework.core import available_datamodules
 
-    assert set(SOURCES.names()) == set(available_datamodules()) == {"tabular", "image"}
+    assert (
+        set(SOURCES.names()) == set(available_datamodules()) == {"tabular", "image", "timeseries"}
+    )
 
 
 @pytest.mark.unit

@@ -47,13 +47,13 @@ def test_invalid_task_rejected():
 
 @pytest.mark.unit
 def test_a_task_in_the_vocabulary_without_a_taskspec_row_is_refused():
-    """`forecasting` is a valid Task literal but has no TaskSpec yet.
+    """`seq2seq` is a valid Task literal but has no TaskSpec yet.
 
     The Literal is only a key; the table is what makes a task runnable, so
     accepting one with no row would defer the failure to mid-training.
     """
     with pytest.raises(UnknownTaskError, match="No TaskSpec"):
-        ExperimentConfig.model_validate(_tabular() | {"task": "forecasting"})
+        ExperimentConfig.model_validate(_tabular() | {"task": "seq2seq"})
 
 
 @pytest.mark.unit

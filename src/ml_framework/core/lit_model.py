@@ -45,6 +45,12 @@ import torch.nn as nn
 from pydantic import BaseModel as PydanticModel
 from torchmetrics import Accuracy, F1Score, MeanAbsoluteError, MeanSquaredError
 
+# Tasks whose head is a single continuous output. `forecasting` joins `regression`
+# here rather than getting its own branch: predicting the next value of a series
+# and predicting a target from features are the same *loop* — what differs is the
+# data the source hands over, which is the source's business.
+CONTINUOUS_TASKS = frozenset({"regression", "forecasting"})
+
 
 @dataclass(frozen=True, slots=True)
 class OptimSettings:
@@ -168,7 +174,7 @@ class BaseModel(pl.LightningModule):
             return nn.BCEWithLogitsLoss(pos_weight=pos_weight)
         if self.task == "multiclass":
             return nn.CrossEntropyLoss(weight=w)
-        if self.task == "regression":
+        if self.task in CONTINUOUS_TASKS:
             return nn.MSELoss()
         raise ValueError(f"Unknown task: {self.task}")
 
@@ -187,7 +193,7 @@ class BaseModel(pl.LightningModule):
             self.test_acc = Accuracy(task="multiclass", num_classes=nc)
             self.val_f1 = F1Score(task="multiclass", num_classes=nc, average="macro")
             self.test_f1 = F1Score(task="multiclass", num_classes=nc, average="macro")
-        elif self.task == "regression":
+        elif self.task in CONTINUOUS_TASKS:
             self.train_mae = MeanAbsoluteError()
             self.val_mae = MeanAbsoluteError()
             self.test_mae = MeanAbsoluteError()
@@ -224,7 +230,7 @@ class BaseModel(pl.LightningModule):
                 getattr(self, f"{stage}_f1")(preds, y.long())
                 self.log(f"{stage}/f1", getattr(self, f"{stage}_f1"), prog_bar=True)
 
-        elif self.task == "regression":
+        elif self.task in CONTINUOUS_TASKS:
             logits = logits.squeeze(1)
             loss = self.criterion(logits, y.float())
             getattr(self, f"{stage}_mae")(logits, y.float())
@@ -309,4 +315,4 @@ class BaseModel(pl.LightningModule):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
 
-__all__ = ["BaseModel", "OptimSettings"]
+__all__ = ["CONTINUOUS_TASKS", "BaseModel", "OptimSettings"]

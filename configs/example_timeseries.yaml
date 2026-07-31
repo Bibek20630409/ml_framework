@@ -1,0 +1,67 @@
+# ── Example time-series forecasting config (schema v2) ───────────────
+# Load with:  mlf train --config configs/example_timeseries.yaml
+# Needs the timeseries extra for arima/prophet:  pip install -e '.[timeseries]'
+# `ts.naive` needs nothing at all — it is the baseline MASE is measured against.
+#
+# The split block is where forecasting differs from everything else. Leaving
+# `strategy: auto` on `kind: timeseries` resolves to a temporal split; writing
+# `strategy: random` here is **refused**, because shuffling a series puts the
+# future into training and reports a better score for it. The escape hatch is
+# `allow_temporal_leakage: true`, which costs typing the word.
+
+task: forecasting
+
+runtime:
+  seed: 42
+  output_dir: outputs
+  num_workers: -1
+  deterministic: true
+
+data:
+  kind: timeseries
+  path: data/series.csv
+  target: value                  # the column being forecast
+  split:
+    strategy: auto               # auto → temporal for a series. `random` raises.
+    time_col: date               # rows are sorted by this before anything else
+    val_size: 0.15
+    test_size: 0.15
+    gap: 0                       # rows dropped between segments; > 0 with lag features
+    # Rolling-origin cross-validation. Not k-fold: shuffled folds would be the
+    # same leakage the validator refuses above.
+    folds: 0                     # >= 2 → k origins, each forecasting `horizon` ahead
+    horizon: 1
+    expanding: true              # true = production retrain; false = sliding window
+  params:
+    seasonality: 7               # 7 daily-with-weekly-cycle, 12 monthly-with-annual
+    horizon: 1                   # steps ahead
+    window: 24                   # past observations per row — windowed models only
+    exog: []                     # columns known for future periods (holidays…)
+    stationarity_test: false     # report ADF/KPSS at build time
+
+model:
+  # ts.naive   — seasonal naive. No dependencies. The MASE reference.
+  # ts.arima   — explicit (p,d,q); prediction intervals. [timeseries]
+  # ts.prophet — interpretable trend + seasonality decomposition. [timeseries]
+  # ts.lstm    — recurrent, over sliding windows. Runs on the LIGHTNING backend.
+  name: ts.prophet
+  params:
+    changepoint_prior_scale: 0.05
+    seasonality_mode: additive
+
+fit:
+  # The forecast backend has no epochs, batches or learning rate — there is no
+  # iterative loop. These apply only when `model.name` is ts.lstm.
+  budget:
+    max_epochs: 100
+  patience: 10
+  batch_size: 32
+  params: {}
+
+tune:
+  enabled: true
+  max_trials: 8
+  max_seconds: 180
+
+logging:
+  backend: csv

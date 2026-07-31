@@ -288,6 +288,15 @@ class Inferencer:
             )
         return np.asarray(self.estimator.predict_proba(self._prepare(x)))
 
+    def forecast_interval(self, horizon: Any) -> tuple[Any, Any]:
+        """Prediction bounds for a forecast, or ``(None, None)``.
+
+        Optional on purpose: the seasonal-naive baseline has no uncertainty model,
+        and inventing one would be worse than reporting that it has none.
+        """
+        bounds = getattr(self.estimator, "interval", None)
+        return bounds(horizon) if bounds is not None else (None, None)
+
     def predict_with_confidence(self, x: Any) -> tuple[np.ndarray, np.ndarray]:
         """``(predicted class, max probability)`` per row."""
         probs = self.predict_proba(x)

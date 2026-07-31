@@ -10,8 +10,8 @@ Tracks progress against [ml_framework_architecture_plan.md](../ml_framework_arch
 | P2 — v2 config | **done** | `5bddf2a` |
 | P3 — GBDT | **done** | `3b46f4a` |
 | P4 — AutoML | **done** | `a300c38` |
-| P5 — DL hardening | **done** | this branch |
-| P6 — Time-series | not started | — |
+| P5 — DL hardening | **done** | `3296920` |
+| P6 — Time-series | **done** | this branch |
 | P7 — NLP | not started | — |
 | P8 — Zero-config | not started | — |
 | P9 — Deployment polish | not started | — |
@@ -30,9 +30,9 @@ v1 *bundles* still load (`test_v1_bundle_compat.py`); v1 *configs* do not, and
 
 ## Test baseline
 
-**429 passed, 1 skipped** with every declared extra installed except DVC
-(46/4 before P0 → 130/4 after P0 → 249/4 after P1 → 258/1 → 284/1 after P2 → 355/1 after P3 → 395/1 after P4 →
-**429/1**). Every phase gate is measured against this number — a phase that ends
+**458 passed, 1 skipped** with every declared extra installed except DVC
+(46/4 before P0 → 130/4 after P0 → 249/4 after P1 → 258/1 → 284/1 after P2 → 355/1 after P3 → 395/1 after P4 → 429/1 after P5 →
+**458/1**). Every phase gate is measured against this number — a phase that ends
 with fewer passing tests than it started with has regressed something, regardless
 of what its own new tests say.
 
@@ -88,7 +88,7 @@ build *function* rather than a class — see `available_models` below).
 Verification commands (all clean):
 
 ```
-pytest                        # 429 passed, 1 skipped
+pytest                        # 458 passed, 1 skipped
 ruff check src tests
 black --check src tests
 isort --check-only src tests
@@ -564,3 +564,83 @@ wants the last optimizer state. Both live in `model/`.
    budget is enforced; a single overrunning fit is not.
 4. **`ddp` is wired but untested here** — this machine has one CPU device, so the
    strategy field is passed through and never exercised against real multi-GPU.
+
+## What P6 landed
+
+Forecasting: the task row, the temporal splitters, four models across two
+backends, and the guard that makes the whole thing trustworthy.
+
+- **`forecasting` TaskSpec** with MASE as its objective, plus `mase`/`smape` in
+  `core/metrics.py`.
+- **`RollingOriginSplitter`** — k origins, each training only on its past.
+  Expanding (a production retrain) or sliding (old data is misleading).
+- **The leakage guard** — `strategy: random` on `kind: timeseries` raises.
+- **`data/sources/timeseries.py`** — one source, two payloads.
+- **`backends/forecast.py`** — the third fit-loop shape.
+- **`plugins/ts/`** — `ts.naive`, `ts.arima`, `ts.prophet`, `ts.lstm`.
+- **Forecast serving** — `POST /predict {"horizon": 7}` through the schema that
+  had been declared since P3.
+
+### Gates met
+
+**`strategy: random` on `kind: timeseries` raises.** Refusing rather than warning
+is the decision: nothing crashes on a shuffled series, the score simply comes back
+*better*. The escape hatch is `allow_temporal_leakage: true`, which costs typing
+the word — roughly the deliberation the decision deserves.
+
+**A temporal split scores honestly where a shuffled one flatters.** Demonstrated
+rather than asserted: a one-nearest-neighbour forecast scores *better* under a
+shuffled split, because training points sit interleaved among the test points and
+the "nearest neighbour" is often the adjacent timestamp. That is the leak, and it
+is why the guard exists.
+
+### Decisions worth knowing
+
+**One source, two payloads.** `ts.prophet` declares `accepts={"series"}` and gets
+the ordered values; `ts.lstm` declares `accepts={"arrays"}` and gets sliding
+windows. The source reads the declaration — no config flag. This required
+generalizing `DEFAULT_PAYLOAD` (kind → one payload) into `KIND_PAYLOADS` (kind →
+the set it can be materialized as), because a data *kind* is a statement about the
+data, not about the shape a model wants it in.
+
+**`ts.lstm` rides the `lightning` backend, not `forecast`.** An LSTM forecaster
+trains in mini-batches over epochs exactly as an MLP does. Putting it on the
+forecast backend would have meant reimplementing the Lightning loop for one model
+— the outcome the per-shape split exists to avoid.
+
+**`ts.naive` declares no requirements.** MASE is defined against it, so it has to
+run wherever forecasting does, including an install with neither prophet nor
+statsmodels. It is also the baseline the zero-config work will use.
+
+**Time-series CV is rolling-origin, never k-fold.** Shuffled folds here would be
+the same leakage the validator refuses, wearing a different hat.
+
+**Fit-per-series with one series.** `ForecastEstimator` holds `{series_id: model}`
+and the backend iterates. With one series the mapping has one entry — but
+multi-series then becomes a *source* change rather than a backend rewrite.
+
+### A correction I made to my own work
+
+The first draft of `mase()` documented "1.0 is the line: below it the model beats
+doing nothing". The smoke test then scored **every** model above 1, including the
+seasonal-naive baseline itself — which that reading says is impossible.
+
+The reading is wrong for multi-step horizons. MASE scales by the average *one-step*
+change; a model forecasting 45 steps ahead is being asked a harder question than
+the denominator measures, so values above 1 are normal. The docstring now says
+what the function computes, and `report.txt` deliberately prints **no verdict** —
+it points at the honest comparison instead (train `ts.naive` on the same split).
+Shipping the confident-sounding version would have been worse than shipping
+nothing.
+
+### Deliberate loose ends P7+ must close
+
+1. **Multi-series is not wired.** The backend iterates, but the source emits one
+   series; a `series_col` is the missing piece.
+2. **`exog` is carried, not consumed.** The source validates and passes exogenous
+   columns; none of the four models currently uses them.
+3. **Prophet synthesizes a daily date range** when the index is positional. It
+   needs *a* time axis; that affects the labels of the seasonality it finds, not
+   whether it finds one.
+4. **`native_categorical` still has no consumer** (from P4).
+5. **CV remains unimplemented for image data** (from P5).

@@ -9,7 +9,7 @@ not-yet-installed ``gbdt`` on a bare install, and what keeps
     gbdt        XGBoost, LightGBM, CatBoost, sklearn  (one-shot fit(X, y))
     forecast    Prophet, statsmodels, seasonal-naive  (fit-per-series)
 
-``forecast`` arrives with the model family that needs it.
+All three exist as of the time-series work.
 """
 
 from __future__ import annotations
@@ -84,6 +84,31 @@ register_backend(
         ),
         requires=(),
         description="One-shot fit(X, y, eval_set=) with library-native early stopping.",
+    )
+)
+
+# Like `gbdt`, no `requires`: the backend is pure-python dispatch and *which*
+# library it needs depends on the model. `ts.naive` needs nothing at all, which is
+# what lets the baseline forecaster run on a bare install.
+register_backend(
+    BackendSpec(
+        name="forecast",
+        factory=_lazy_factory(".forecast"),
+        capabilities=Capabilities(
+            accepts=frozenset({"series"}),
+            needs_scaling=False,
+            native_categorical=False,
+            native_missing=False,
+            supports_sample_weight=False,
+            produces_proba=False,
+            supports_pruning=False,
+            supports_gpu=False,
+            supports_mixed_precision=False,
+            supports_lr_range_test=False,
+            supports_resume=False,
+        ),
+        requires=(),
+        description="Fit-per-series, no X/y, predict-by-horizon.",
     )
 )
 

@@ -18,20 +18,21 @@ from ml_framework.core.task import (
 
 # ── The table ─────────────────────────────────────────────
 @pytest.mark.unit
-def test_the_three_currently_runnable_tasks_have_rows():
-    assert available_tasks() == ["binary", "multiclass", "regression"]
+def test_the_currently_runnable_tasks_have_rows():
+    assert available_tasks() == ["binary", "forecasting", "multiclass", "regression"]
 
 
 @pytest.mark.unit
 def test_unregistered_task_says_so_instead_of_defaulting():
     """A task in the Literal but without a row must fail loudly.
 
-    `forecasting` gets its row in P6; until then silently treating it as
+    The text tasks get their rows with the NLP work; until then silently treating
+    one as
     regression would produce plausible-looking wrong metrics.
     """
-    assert not has_task_spec("forecasting")
-    with pytest.raises(UnknownTaskError, match="No TaskSpec for task 'forecasting'"):
-        get_task_spec("forecasting")
+    assert not has_task_spec("seq2seq")
+    with pytest.raises(UnknownTaskError, match="No TaskSpec for task 'seq2seq'"):
+        get_task_spec("seq2seq")
 
 
 @pytest.mark.unit

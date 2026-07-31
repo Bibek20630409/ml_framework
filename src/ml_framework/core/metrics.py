@@ -97,9 +97,72 @@ def r2(y_true, y_pred) -> float:
     return float(1.0 - ((yt - yp) ** 2).sum() / denom)
 
 
+# ── Forecasting ───────────────────────────────────────────
+def smape(y_true, y_pred) -> float:
+    """Symmetric MAPE, as a percentage.
+
+    Scale-free, so it compares across series whose magnitudes differ — which is
+    the whole reason plain MAE is a poor primary metric for forecasting.
+
+    Terms where both the actual and the prediction are zero contribute 0 rather
+    than NaN: they are exactly right, and a division-by-zero that poisons the mean
+    would make a *perfect* forecast unscoreable.
+    """
+    yt, yp = _as_1d(y_true).astype("float64"), _as_1d(y_pred).astype("float64")
+    if yt.size == 0:
+        return float("nan")
+    denominator = np.abs(yt) + np.abs(yp)
+    terms = np.where(
+        denominator == 0.0,
+        0.0,
+        2.0 * np.abs(yp - yt) / np.where(denominator == 0.0, 1.0, denominator),
+    )
+    return float(100.0 * terms.mean())
+
+
+def mase(y_true, y_pred, *, seasonality: int = 1) -> float:
+    """Mean Absolute Scaled Error: MAE divided by the series' average step change.
+
+    The denominator is ``mean|y_t - y_{t-m}|`` over the evaluation window, which
+    makes the result **unit-free and comparable across series** — the reason it is
+    the primary metric here rather than MAE, whose "4.2" means nothing without
+    knowing whether the series runs in single digits or millions.
+
+    **1.0 is not a pass mark.** It is often quoted that way, and for *one-step*
+    forecasts the reading holds: an error equal to the average step change is what
+    you would get by predicting no change. Over a multi-step horizon, values above
+    1 are entirely normal — the model is being asked a harder question than the
+    one the denominator measures. Use it to rank models on the same split, not as
+    an absolute verdict. (A verdict needs a baseline forecast over the *same*
+    horizon; ``ts.naive`` is that baseline, and comparing against it is a
+    deliberate act rather than something a metric can do on its own.)
+
+    Two further departures from the textbook definition, both deliberate:
+
+    * The denominator is computed on the **evaluation** window rather than the
+      training series, because ``compute()`` receives only ``(y_true, y_pred)`` and
+      threading the training series through every metric call to serve one metric
+      would distort the interface.
+    * ``seasonality`` defaults to 1 (consecutive differences) since the metric
+      table calls metrics positionally. A seasonal scaling is available by calling
+      this directly.
+
+    The consequence of both: comparable between models on one split, not with
+    published MASE figures.
+    """
+    yt, yp = _as_1d(y_true).astype("float64"), _as_1d(y_pred).astype("float64")
+    if yt.size <= seasonality:
+        return float("nan")
+    naive_error = np.abs(yt[seasonality:] - yt[:-seasonality]).mean()
+    if naive_error == 0.0:
+        # A constant series: the naive forecast is perfect, so the ratio is
+        # undefined. NaN says so; 0 or inf would both be read as a result.
+        return float("nan")
+    return float(np.abs(yp - yt).mean() / naive_error)
+
+
 # ── Name → function table ─────────────────────────────────
-# `TaskSpec.metric_names` indexes into this. Forecasting metrics (MASE/sMAPE)
-# land here in P6 alongside the forecasting TaskSpec row.
+# `TaskSpec.metric_names` indexes into this.
 _LABEL_METRICS: dict[str, MetricFn] = {
     "acc": accuracy,
     "f1": f1,
@@ -109,6 +172,8 @@ _LABEL_METRICS: dict[str, MetricFn] = {
     "mae": mae,
     "rmse": rmse,
     "r2": r2,
+    "mase": mase,
+    "smape": smape,
 }
 # Metrics that consume probabilities rather than hard predictions.
 _PROBA_METRICS: dict[str, MetricFn] = {
