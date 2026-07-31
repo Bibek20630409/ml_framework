@@ -49,17 +49,18 @@ from ..core.bundle import (
     write_bundle,
 )
 from ..core.evaluate import evaluate
-from ..core.protocols import RunContext
+from ..core.protocols import FitResult, RunContext
 from ..core.registry import get_backend, validate_combination
 from ..core.task import get_task_spec
 from ..data import build_bundle
 from ..tracking import build_run_logger
 from ..utils import seed_everything, setup_logging
+from .tune import HPO_FILE, tune
 
 log = logging.getLogger(__name__)
 
 
-def train(config: ExperimentConfig) -> dict:
+def train(config: ExperimentConfig, *, emit_config: str | Path | None = None) -> dict:
     out = Path(config.runtime.output_dir)
     out.mkdir(parents=True, exist_ok=True)
     setup_logging(out)
@@ -70,6 +71,16 @@ def train(config: ExperimentConfig) -> dict:
     # cannot work — rather than 40 seconds into data loading.
     spec = validate_combination(config.task, config.data.kind, config.model.name)
     backend = get_backend(spec.backend)
+
+    # Search first, then fit the winner. `tune` returns the *config* rather than a
+    # fitted model precisely so this stays one code path: whether tuning ran or was
+    # skipped, everything below fits a config and writes a bundle.
+    tuning = tune(config)
+    config = tuning.config
+    if tuning.ran:
+        seed_everything(config.runtime.seed, workers=True)  # trials advanced the RNG
+    if emit_config is not None:
+        _emit_config(config, emit_config)
 
     bundle = build_bundle(config)
     log.info("input_dim=%d output_dim=%d", bundle.input_dim, bundle.output_dim)
@@ -95,7 +106,14 @@ def train(config: ExperimentConfig) -> dict:
     )
 
     try:
-        result = backend.fit(spec, bundle, config, run=run)
+        if tuning.ran and config.tune.refit == "reuse" and tuning.estimator is not None:
+            # `reuse` keeps the winning trial's model. Cheap, but it was trained
+            # under the *reduced* trial budget — which is why `best` (refit at full
+            # budget) is the default and both are spelled out in the config.
+            log.info("refit=reuse — keeping the winning trial's estimator")
+            result = FitResult(estimator=tuning.estimator, val_metrics={})
+        else:
+            result = backend.fit(spec, bundle, config, run=run)
         size = backend.model_size(result.estimator)
         if size:
             log.info("model size: %s", size)
@@ -110,8 +128,15 @@ def train(config: ExperimentConfig) -> dict:
 
         artifact = backend.save(result.estimator, out / MODEL_DIR)
         preprocessor_ref = _save_preprocessor(bundle, out)
-        manifest = _build_manifest(config, bundle, spec, artifact, preprocessor_ref, metrics, size)
+        manifest = _build_manifest(
+            config, bundle, spec, artifact, preprocessor_ref, metrics, size, tuning
+        )
+        # `config` here is the *tuned* config, so config.json is the record of what
+        # actually trained — which is what closes v1's copy-paste gap.
         write_bundle(out, manifest, config=config.model_dump(), metrics=metrics)
+        (out / HPO_FILE).write_text(
+            json.dumps(tuning.to_dict(), indent=2, default=str), encoding="utf-8"
+        )
         if bundle.reference_stats:
             (out / "reference_stats.json").write_text(
                 json.dumps(bundle.reference_stats), encoding="utf-8"
@@ -172,6 +197,25 @@ def _save_preprocessor(bundle: Any, out: Path) -> dict[str, Any] | None:
     return bundle.preprocessor.save(out / PREPROCESSOR_DIR)
 
 
+def _emit_config(config: ExperimentConfig, dest: str | Path) -> None:
+    """Write the effective config as YAML, for committing back to ``configs/``.
+
+    ``bundle/config.json`` is the audit record of one run; this is the file you
+    keep. Writing it is what makes a tuned result reproducible without rerunning
+    the search.
+    """
+    import yaml
+
+    path = Path(dest)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "# Effective config after tuning, written by `mlf train --emit-config`.\n"
+        + yaml.safe_dump(config.model_dump(), sort_keys=False, default_flow_style=False),
+        encoding="utf-8",
+    )
+    log.info("effective config written to %s", path)
+
+
 def _build_manifest(
     config: ExperimentConfig,
     bundle: Any,
@@ -180,6 +224,7 @@ def _build_manifest(
     preprocessor_ref: dict[str, Any] | None,
     metrics: dict[str, float],
     size: dict[str, Any],
+    tuning: Any,
 ) -> Manifest:
     """The serving contract.
 
@@ -219,4 +264,7 @@ def _build_manifest(
         preprocessor=PreprocessorRef(**preprocessor_ref) if preprocessor_ref else None,
         requires=[RequirementRef.from_requirement(r) for r in spec.requires],
         metrics=metrics,
+        # The winner and the space it came from, so a served model can answer "how
+        # were these numbers chosen?" without the training directory.
+        hpo=tuning.to_dict() if tuning.ran else None,
     )

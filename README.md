@@ -46,16 +46,19 @@ Extras: `lightning`, `gbdt`, `image`, `serve`, `hpo`, `parquet`, `diagnostics`,
    mlf lr --config configs/example_tabular.yaml
    ```
 
-3. **HPO** — search architecture, paste the printed `model.params.*` / `fit.params.*`:
-   ```bash
-   mlf hpo --config configs/example_tabular.yaml
-   ```
-
-4. **Train** — final run, writes the artifact bundle:
+3. **Train** — **tunes by default**, then fits the winner and writes the bundle:
    ```bash
    mlf train --config configs/example_tabular.yaml
    # override anything inline:
    mlf train -c configs/example_tabular.yaml --set fit.budget.max_epochs=5 --set fit.params.lr=3e-4
+   ```
+
+4. **Control the search** — turning it up is as easy as turning it off:
+   ```bash
+   mlf train -c configs/example_gbdt.yaml --no-tune                    # skip it
+   mlf train -c configs/example_gbdt.yaml --tune-budget 10m            # spend longer
+   mlf train -c configs/example_gbdt.yaml --tune-trials 100
+   mlf tune  -c configs/example_gbdt.yaml --emit-config configs/tuned.yaml   # search only
    ```
 
 5. **Serve**:
@@ -206,6 +209,43 @@ interpolates synthetic neighbours an axis-aligned splitter uses poorly.
 on `manifest.model.backend`, so nothing in the serving path imports a checkpoint
 loader; `docker build --target serve-gbdt` is roughly 500 MB lighter than the
 deep-learning image, with a cold start to match.
+
+## Tuning
+
+`mlf train` searches before it fits. The budget is **per backend**, because a
+boosting trial costs seconds and a neural trial costs minutes — one uniform trial
+count would either waste the cheap case or make the expensive one feel broken:
+
+| backend | trials | wall clock | per-trial cap |
+|---|---|---|---|
+| `gbdt` | 30 | 300 s | — |
+| `lightning` | 10 | 900 s | 25 epochs |
+
+The space is assembled, not hardcoded: `model.search_space | backend.search_space()
+| tune.overrides`. A plugin declares its tree shape or architecture; the backend
+declares the loop's knobs (`lr`, `batch_size`, `learning_rate`, `n_estimators`)
+once for everything that rides it. Keys are dotted config paths, so **applying a
+trial is exactly `config.with_overrides(values)`**.
+
+Narrow a space from YAML without touching code:
+
+```yaml
+tune:
+  max_trials: 50
+  metric: null            # null → the task's primary metric
+  refit: best             # best = retrain at full budget | reuse = keep the trial model
+  overrides:
+    model.params.max_depth: {type: int, low: 3, high: 8}
+    fit.params.learning_rate: {type: float, low: 0.05, high: 0.2, log: true}
+    fit.params.subsample: 0.9        # a bare value pins it
+```
+
+The result is **applied, not printed**: the winner lands in `bundle/config.json`,
+the full record (winner, ranges searched, every trial) in `bundle/hpo.json` and
+`manifest.hpo`, and `--emit-config` writes a YAML you can commit. A search that
+does not run — tuning off, an empty space, optuna not installed — still writes
+`hpo.json` saying which, because a missing file is indistinguishable from an old
+bundle.
 
 ## Production MLOps
 

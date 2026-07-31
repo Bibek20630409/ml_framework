@@ -102,7 +102,11 @@ class _Adapter:
     load: Callable[[Path, Any], Any]
     # (estimator, eval_set, early_stopping_rounds) -> kwargs for .fit()
     fit_kwargs: Callable[[Any, Any, int], dict[str, Any]]
-    pruning_callback: Callable[[Any, str], Any] | None = None
+    # (estimator, fit_kwargs, callback) -> None. Where a pruning callback goes is
+    # itself per-library: xgboost >= 2.0 takes `callbacks` on the *constructor*,
+    # lightgbm and catboost take it on `fit`. Discovered the hard way — passing it
+    # to XGBClassifier.fit() is a TypeError.
+    attach_pruning: Callable[[Any, dict[str, Any], Any], None] | None = None
     size: Callable[[Any], dict[str, Any]] | None = None
 
 
@@ -125,10 +129,9 @@ def _xgboost_adapter() -> _Adapter:
             est.set_params(early_stopping_rounds=rounds)
         return {"eval_set": [eval_set], "verbose": False} if eval_set is not None else {}
 
-    def pruning(trial: Any, metric: str) -> Any:
-        from optuna.integration import XGBoostPruningCallback
-
-        return XGBoostPruningCallback(trial, f"validation_0-{metric}")
+    def attach_pruning(est: Any, kwargs: dict[str, Any], callback: Any) -> None:
+        # xgboost >= 2.0 moved callbacks to the constructor; fit() rejects them.
+        est.set_params(callbacks=[callback])
 
     def size(est: Any) -> dict[str, Any]:
         booster = est.get_booster()
@@ -142,7 +145,7 @@ def _xgboost_adapter() -> _Adapter:
         save=save,
         load=load,
         fit_kwargs=fit_kwargs,
-        pruning_callback=pruning,
+        attach_pruning=attach_pruning,
         size=size,
     )
 
@@ -214,10 +217,8 @@ def _lightgbm_adapter() -> _Adapter:
             callbacks.append(lgb.early_stopping(rounds, verbose=False))
         return {"eval_set": [eval_set], "callbacks": callbacks}
 
-    def pruning(trial: Any, metric: str) -> Any:
-        from optuna.integration import LightGBMPruningCallback
-
-        return LightGBMPruningCallback(trial, metric)
+    def attach_pruning(est: Any, kwargs: dict[str, Any], callback: Any) -> None:
+        kwargs.setdefault("callbacks", []).append(callback)
 
     def size(est: Any) -> dict[str, Any]:
         booster = est.booster_
@@ -230,7 +231,7 @@ def _lightgbm_adapter() -> _Adapter:
         save=save,
         load=load,
         fit_kwargs=fit_kwargs,
-        pruning_callback=pruning,
+        attach_pruning=attach_pruning,
         size=size,
     )
 
@@ -255,6 +256,9 @@ def _catboost_adapter() -> _Adapter:
             kwargs["early_stopping_rounds"] = rounds
         return kwargs
 
+    def attach_pruning(est: Any, kwargs: dict[str, Any], callback: Any) -> None:
+        kwargs.setdefault("callbacks", []).append(callback)
+
     def size(est: Any) -> dict[str, Any]:
         return {"trees": int(est.tree_count_ or 0)}
 
@@ -265,9 +269,7 @@ def _catboost_adapter() -> _Adapter:
         save=save,
         load=load,
         fit_kwargs=fit_kwargs,
-        # CatBoost has no Optuna integration callback; the trial reports through
-        # `TrialHooks.report` instead of pretending otherwise.
-        pruning_callback=None,
+        attach_pruning=attach_pruning,
         size=size,
     )
 
@@ -314,6 +316,55 @@ _FORMATS: dict[str, str] = {
     "catboost-cbm": "catboost",
     "sklearn-joblib": "sklearn",
 }
+
+
+# The library's own name for the validation metric it reports, per task. The
+# pruning callback watches this string, and each library spells it differently —
+# pruning on a name the library never emits would silently do nothing.
+_PRUNING_METRICS: dict[str, dict[str, str]] = {
+    "xgboost": {
+        "binary": "validation_0-logloss",
+        "multiclass": "validation_0-mlogloss",
+        "regression": "validation_0-rmse",
+    },
+    "lightgbm": {
+        "binary": "binary_logloss",
+        "multiclass": "multi_logloss",
+        "regression": "l2",
+    },
+    "catboost": {
+        "binary": "Logloss",
+        "multiclass": "MultiClass",
+        "regression": "RMSE",
+    },
+}
+
+
+def pruning_callback(library: str, trial: Any, task: str) -> Any | None:
+    """The library's Optuna pruning callback, or ``None`` if unavailable.
+
+    Returning ``None`` rather than raising is deliberate: tuning is on by default,
+    so an install without ``optuna-integration`` should tune *without* pruning
+    rather than refuse to train.
+    """
+    metric = _PRUNING_METRICS.get(library, {}).get(task)
+    if metric is None:
+        log.debug("no pruning metric for %s/%s; tuning without pruning", library, task)
+        return None
+    attr = {
+        "xgboost": "XGBoostPruningCallback",
+        "lightgbm": "LightGBMPruningCallback",
+        "catboost": "CatBoostPruningCallback",
+    }[library]
+    for module in (f"optuna_integration.{library}", "optuna_integration", "optuna.integration"):
+        try:
+            import importlib
+
+            return getattr(importlib.import_module(module), attr)(trial, metric)
+        except (ImportError, AttributeError):
+            continue
+    log.debug("no %s pruning callback available; tuning without pruning", library)
+    return None
 
 
 def adapter_for_estimator(est: Any) -> _Adapter:
@@ -427,9 +478,13 @@ class GbdtBackend(BaseBackend):
         if sample_weight is not None:
             kwargs["sample_weight"] = sample_weight
 
-        hooks = self.trial_hooks(run.trial) if run.trial is not None else None
-        if hooks and hooks.callbacks and adapter.library != "catboost":
-            kwargs.setdefault("callbacks", []).extend(hooks.callbacks)
+        if run.trial is not None and eval_set is not None and adapter.attach_pruning:
+            # Attached here rather than in `trial_hooks` because the callback needs
+            # the library, which is only known once the model exists — and *where*
+            # it attaches differs per library too.
+            callback = pruning_callback(adapter.library, run.trial, bundle.task)
+            if callback is not None:
+                adapter.attach_pruning(model, kwargs, callback)
 
         model.fit(_as_matrix(x_train), y_train, **kwargs)
 
@@ -540,15 +595,24 @@ class GbdtBackend(BaseBackend):
             "fit.params.colsample_bytree": Float(0.6, 1.0),
         }
 
-    def trial_hooks(self, trial: Any, *, monitor: str = "logloss") -> TrialHooks:
+    def trial_hooks(self, trial: Any, *, monitor: str | None = None) -> TrialHooks:
         """Per-library Optuna pruning, so the driver never imports an integration.
 
-        CatBoost has no pruning callback in optuna-integration; returning an empty
-        hook set is the honest answer, and the driver falls back to a non-pruning
-        sampler rather than silently doing nothing it claimed to do.
+        Pruning here is worth less than on the Lightning path — a boosting trial
+        costs seconds, so there is less to abandon — but the intermediate value
+        exists (one per boosting round) and using it costs nothing.
+
+        The callback needs the library's *own* name for the eval metric, which
+        differs per library and per task; :data:`_PRUNING_METRICS` holds that map.
+        Getting it wrong would silently prune on a metric the library never
+        reports, so an unresolvable name returns empty hooks instead.
         """
         if trial is None:
             return TrialHooks.empty()
+        # The library is only known once the model is built, so the callback is
+        # attached inside `fit` where the estimator exists — see
+        # `pruning_callback` and each adapter's `attach_pruning`. What this method
+        # returns is the report channel a caller can push values through.
         return TrialHooks(report=lambda value, step: trial.report(value, step))
 
     def params_model(self) -> type[PydanticModel]:

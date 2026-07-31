@@ -219,12 +219,19 @@ class FitConfig(BaseModel):
 
 
 class TuneConfig(BaseModel):
-    """Hyperparameter search.
+    """Hyperparameter search, consumed by ``pipeline/tune.py``.
 
-    Declared here in full so ``tune.*`` is a stable config path from v2 onward.
-    The driver that consumes it — including the per-backend budget defaults that
-    make "on by default" finish in minutes rather than hours — is
-    ``pipeline/tune.py``, which replaces ``pipeline/hpo.py``.
+    **These defaults are mostly not what runs.** ``max_trials``/``max_seconds``
+    carry values only so the fields have a type and a documented shape; the driver
+    treats a value equal to the default as "unset" and substitutes the *per-backend*
+    budget from ``config/defaults.py`` — 30 trials / 300 s for trees, 10 / 900 s for
+    neural nets. A uniform default here would either waste the cheap case or make
+    the expensive one feel broken.
+
+    Setting either field to anything else makes it authoritative. That rule is what
+    lets one schema serve backends whose per-trial cost differs by two orders of
+    magnitude; the alternative, defaulting every field to ``None``, would push the
+    same ambiguity into the YAML where it reads worse.
     """
 
     model_config = _FROZEN

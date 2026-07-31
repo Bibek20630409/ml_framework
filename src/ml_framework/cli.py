@@ -5,10 +5,16 @@ cli.py
 accept dotted ``--set key=value`` overrides.
 
     mlf lr             --config configs/example_tabular.yaml
-    mlf hpo            --config configs/example_tabular.yaml
+    mlf tune           --config configs/example_tabular.yaml --emit-config configs/tuned.yaml
     mlf train          --config configs/example_tabular.yaml --set fit.budget.max_epochs=5
+    mlf train          --config configs/example_gbdt.yaml --no-tune
+    mlf train          --config configs/example_gbdt.yaml --tune-budget 10m --tune-trials 50
     mlf serve          --artifacts outputs --host 0.0.0.0 --port 8000
     mlf migrate-config -i configs/old.yaml -o configs/new.yaml
+
+``mlf train`` **tunes by default**, under a per-backend budget (see
+``config/defaults.py``) — 300 s for trees, 900 s for neural nets. ``--no-tune``
+skips it; ``--tune-budget``/``--tune-trials`` turn it up just as easily.
 """
 
 from __future__ import annotations
@@ -55,13 +61,77 @@ def _add_config_args(sub: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_tune_args(sub: argparse.ArgumentParser) -> None:
+    """Tuning controls. Turning it *up* is as easy as turning it off, by design."""
+    sub.add_argument(
+        "--no-tune",
+        dest="tune",
+        action="store_false",
+        default=None,
+        help="Skip hyperparameter search and train the configured parameters",
+    )
+    sub.add_argument(
+        "--tune-trials",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Trials to run (default: per-backend, see config/defaults.py)",
+    )
+    sub.add_argument(
+        "--tune-budget",
+        default=None,
+        metavar="DURATION",
+        help="Wall-clock budget for the search: 900, 30s, 10m, 2h",
+    )
+
+
+def _apply_tune_args(cfg: ExperimentConfig, args: argparse.Namespace) -> ExperimentConfig:
+    """Fold the tuning flags into the config, so there is one source of truth.
+
+    Flags default to ``None`` rather than to the schema's values: that is what
+    distinguishes "the user asked for this" from "nobody said", which is exactly
+    the distinction the per-backend budget defaults need.
+    """
+    from .config.defaults import parse_duration
+
+    overrides: dict[str, Any] = {}
+    if getattr(args, "tune", None) is False:
+        overrides["tune.enabled"] = False
+    if getattr(args, "tune_trials", None) is not None:
+        overrides["tune.max_trials"] = args.tune_trials
+    if getattr(args, "tune_budget", None) is not None:
+        overrides["tune.max_seconds"] = parse_duration(args.tune_budget)
+    return cfg.with_overrides(overrides) if overrides else cfg
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="mlf", description="ML Framework CLI")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    for name in ("lr", "hpo", "train"):
-        p = sub.add_parser(name, help=f"Run the {name} stage")
+    lr = sub.add_parser("lr", help="Run the LR range test")
+    _add_config_args(lr)
+
+    train_p = sub.add_parser("train", help="Tune (unless disabled) and train")
+    _add_config_args(train_p)
+    _add_tune_args(train_p)
+    train_p.add_argument(
+        "--emit-config",
+        default=None,
+        metavar="PATH",
+        help="Write the effective (post-tuning) config as YAML, for committing back",
+    )
+
+    # `tune` searches and reports without fitting the winner at full budget.
+    # `hpo` is kept as an alias: removing a verb people have in scripts is a
+    # gratuitous break, and the new driver answers the same question.
+    for name, help_text in (
+        ("tune", "Search hyperparameters and report the best config"),
+        ("hpo", "Alias for `tune` (the v1 name)"),
+    ):
+        p = sub.add_parser(name, help=help_text)
         _add_config_args(p)
+        _add_tune_args(p)
+        p.add_argument("--emit-config", default=None, metavar="PATH", help="Write the winner")
 
     serve = sub.add_parser("serve", help="Serve a trained model via FastAPI")
     serve.add_argument("--artifacts", "-a", default="outputs", help="Artifact bundle dir")
@@ -166,14 +236,34 @@ def main(argv: list[str] | None = None) -> int:
         from .pipeline import find_lr
 
         find_lr(cfg)
-    elif args.command == "hpo":
-        from .pipeline import run_hpo
+        return 0
 
-        run_hpo(cfg)
-    elif args.command == "train":
+    cfg = _apply_tune_args(cfg, args)
+    if args.command in ("tune", "hpo"):
+        if args.command == "hpo":
+            log.warning("`mlf hpo` is the v1 name; use `mlf tune`")
+        from .pipeline import tune
+
+        result = tune(cfg)
+        if not result.ran:
+            log.warning("no search ran: %s", result.skipped)
+            return 1
+        print(f"\nbest {result.metric} = {result.best_value:.4f}  ({result.n_trials} trials)")
+        for path, value in sorted(result.best_params.items()):
+            print(f"  {path}: {value}")
+        if args.emit_config:
+            from .pipeline.train import _emit_config
+
+            _emit_config(result.config, args.emit_config)
+            print(f"\nwrote {args.emit_config}")
+        else:
+            print("\nRe-run `mlf train` to apply these, or pass --emit-config to save them.")
+        return 0
+
+    if args.command == "train":
         from .pipeline import train
 
-        train(cfg)
+        train(cfg, emit_config=args.emit_config)
     return 0
 
 

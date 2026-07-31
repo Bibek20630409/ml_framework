@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import logging
 import shutil
+from datetime import timedelta
 from pathlib import Path
 from typing import Any, ClassVar, cast
 
@@ -72,6 +73,29 @@ class LightningFitParams(PydanticModel):
     lr_patience: int = Field(default=_OPTIM_DEFAULTS.lr_patience, ge=1)
     lr_factor: float = Field(default=_OPTIM_DEFAULTS.lr_factor, gt=0.0, lt=1.0)
     gradient_clip_val: float = Field(default=1.0, ge=0.0)
+
+
+def _pruning_callback(trial: Any, monitor: str) -> Any | None:
+    """``PyTorchLightningPruningCallback``, or ``None`` if unavailable.
+
+    ``optuna_integration`` moved the callback out of ``optuna.integration``; both
+    paths are tried. Returning ``None`` rather than raising is deliberate: tuning
+    is on by default, so an install without the integration package should tune
+    *without* pruning rather than refuse to train.
+    """
+    for module, attr in (
+        ("optuna_integration.pytorch_lightning", "PyTorchLightningPruningCallback"),
+        ("optuna_integration", "PyTorchLightningPruningCallback"),
+        ("optuna.integration", "PyTorchLightningPruningCallback"),
+    ):
+        try:
+            import importlib
+
+            return getattr(importlib.import_module(module), attr)(trial, monitor=monitor)
+        except (ImportError, AttributeError):
+            continue
+    log.debug("no Lightning pruning callback available; tuning without pruning")
+    return None
 
 
 CHECKPOINT_DIR = "checkpoints"
@@ -227,7 +251,16 @@ class LightningBackend(BaseBackend):
             callbacks.append(LearningRateMonitor(logging_interval="epoch"))
         if cfg.logging.backend == "wandb" and logger:
             logger.watch(model, log="gradients", log_freq=50)
-        hooks = self.trial_hooks(run.trial) if run.trial is not None else None
+        if run.budget.max_seconds:
+            # `fit.budget.max_seconds` enforced, not merely carried. Lightning's
+            # Timer stops at an epoch boundary, so the cap is a floor on when
+            # training ends rather than a hard kill — which is the right trade for
+            # a budget: a half-finished epoch produces no usable checkpoint.
+            from pytorch_lightning.callbacks import Timer
+
+            callbacks.append(Timer(duration=timedelta(seconds=run.budget.max_seconds)))
+
+        hooks = self.trial_hooks(run.trial, monitor=task_spec.monitor) if run.trial else None
         if hooks:
             callbacks.extend(hooks.callbacks)
 
@@ -449,23 +482,25 @@ class LightningBackend(BaseBackend):
 
         The dual-import fallback moves here from ``hpo.py``: ``optuna_integration``
         is the current home of the callback and ``optuna.integration`` the legacy
-        one. Keeping it inside the backend is what lets the HPO driver stay free of
-        integration packages entirely.
+        one. Keeping it inside the backend is what lets the tuning driver stay free
+        of integration packages entirely — it asks for hooks and never learns which
+        package supplied them.
+
+        Pruning matters most here of the three backends: a neural trial costs
+        minutes, so abandoning a bad one early is the difference between exploring
+        the space and sampling it once. A missing integration package degrades to
+        no pruning rather than failing the run.
 
         ``monitor`` defaults to the value every registered ``TaskSpec`` currently
-        uses; the tuning driver passes ``TaskSpec.monitor`` explicitly once a task
+        uses; the driver passes ``TaskSpec.monitor`` explicitly once a task
         disagrees.
         """
         from ..core.protocols import TrialHooks
 
         if trial is None:
             return TrialHooks.empty()
-        try:  # current package
-            from optuna_integration import PyTorchLightningPruningCallback
-        except ImportError:  # pragma: no cover - legacy fallback
-            from optuna.integration import PyTorchLightningPruningCallback
-
-        return TrialHooks(callbacks=(PyTorchLightningPruningCallback(trial, monitor=monitor),))
+        callback = _pruning_callback(trial, monitor)
+        return TrialHooks(callbacks=(callback,) if callback else ())
 
     def params_model(self) -> type[PydanticModel]:
         """Pydantic schema for ``fit.params`` on this backend."""

@@ -80,6 +80,10 @@ def make_config(tmp_path: Path):
             "data": {"kind": "tabular", "path": str(csv), "target": "label"},
             "model": {"name": model},
             "fit": {"budget": {"max_epochs": 2}, "batch_size": 16},
+            # Tuning is on by default for users and off by default for tests: a
+            # test of the bundle layout should not spend 300 s searching. The
+            # tuning path has its own tests, which opt back in explicitly.
+            "tune": {"enabled": False},
             "logging": {"backend": "none"},
         }
         cfg = ExperimentConfig.model_validate(raw)

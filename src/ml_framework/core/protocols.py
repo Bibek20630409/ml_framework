@@ -94,6 +94,27 @@ class FitResult:
     # Extra files the backend wants in the bundle: {relative_path: source_path}.
     extra_files: Mapping[str, Path] = field(default_factory=dict)
 
+    # The two backends spell validation metrics differently, and neither is wrong:
+    # Lightning's logger convention is `val/acc` (the slash groups them in
+    # TensorBoard), while metrics computed from arrays come back as `val_acc`.
+    # Normalizing at the source would rename keys the trackers already publish, so
+    # the *lookup* absorbs the difference instead — in one place, here, rather than
+    # in every consumer.
+    _METRIC_PREFIXES: ClassVar[tuple[str, ...]] = ("", "val_", "val/")
+
+    def metric(self, name: str) -> float | None:
+        """This result's value for ``name``, whichever convention produced it.
+
+        ``metric("acc")`` finds ``acc``, ``val_acc`` or ``val/acc``. Returns
+        ``None`` when the backend did not report it, so a caller can say which
+        metric is missing rather than raising a bare ``KeyError``.
+        """
+        for prefix in self._METRIC_PREFIXES:
+            key = f"{prefix}{name}"
+            if key in self.val_metrics:
+                return float(self.val_metrics[key])
+        return None
+
 
 @dataclass(frozen=True, slots=True)
 class Budget:

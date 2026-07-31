@@ -8,8 +8,8 @@ Tracks progress against [ml_framework_architecture_plan.md](../ml_framework_arch
 | P0 — Foundations | **done** | `a8692a1` |
 | P1 — Data + backend extraction | **done** | `95c4359` (P1a) · `2ac9d45` (P1b) |
 | P2 — v2 config | **done** | `5bddf2a` |
-| P3 — GBDT | **done** | this branch |
-| P4 — AutoML | not started | — |
+| P3 — GBDT | **done** | `3b46f4a` |
+| P4 — AutoML | **done** | this branch |
 | P5 — DL hardening | not started | — |
 | P6 — Time-series | not started | — |
 | P7 — NLP | not started | — |
@@ -30,9 +30,9 @@ v1 *bundles* still load (`test_v1_bundle_compat.py`); v1 *configs* do not, and
 
 ## Test baseline
 
-**355 passed, 1 skipped** with every declared extra installed except DVC
-(46/4 before P0 → 130/4 after P0 → 249/4 after P1 → 258/1 → 284/1 after P2 →
-**355/1**). Every phase gate is measured against this number — a phase that ends
+**395 passed, 1 skipped** with every declared extra installed except DVC
+(46/4 before P0 → 130/4 after P0 → 249/4 after P1 → 258/1 → 284/1 after P2 → 355/1 after P3 →
+**395/1**). Every phase gate is measured against this number — a phase that ends
 with fewer passing tests than it started with has regressed something, regardless
 of what its own new tests say.
 
@@ -88,7 +88,7 @@ build *function* rather than a class — see `available_models` below).
 Verification commands (all clean):
 
 ```
-pytest                        # 355 passed, 1 skipped
+pytest                        # 395 passed, 1 skipped
 ruff check src tests
 black --check src tests
 isort --check-only src tests
@@ -413,3 +413,81 @@ than papered over:
 5. **`lr_finder.py` has no capability gate.** `mlf lr` on a GBDT config will still
    crash inside `torch_lr_finder` rather than refusing politely.
    `supports_lr_range_test` is declared `False` and unread — **P5**.
+
+## What P4 landed
+
+Hyperparameter search that is declared by plugins, driven by the task table, and
+**applied** rather than printed.
+
+- **`pipeline/tune.py`** replaces `pipeline/hpo.py`, which is deleted. The old
+  module had three defects and each was silent: its space was hardcoded to the
+  MLP's shape (running it on a CNN tuned `hidden_dims`, a parameter that model
+  does not have, and reported a meaningless "best"); its objective read
+  `val/loss` off `trainer.callback_metrics`, an object no non-Lightning backend
+  produces; and it `print()`ed the winner for copy-paste.
+- **`config/defaults.py`** — per-backend budgets. Trees get 30 trials / 300 s;
+  neural nets 10 / 900 s with a 25-epoch per-trial cap. Without that cap one slow
+  trial consumes the whole wall budget and the search degenerates to one sample.
+- **Write-back** — the winner lands in `bundle/config.json`, `bundle/hpo.json`
+  and `manifest.hpo`; `--emit-config` writes a committable YAML.
+- **`FitResult.metric()`** absorbs a real wart: Lightning reports `val/acc` (its
+  logger convention groups with a slash) and array-computed metrics come back as
+  `val_acc`. Normalizing at the source would rename keys the trackers already
+  publish, so the *lookup* handles it — in one place.
+- **`fit.budget.max_seconds` is enforced**, not merely carried (P3 loose end 3),
+  via Lightning's `Timer`. It stops at an epoch boundary: a half-finished epoch
+  produces no usable checkpoint, so a hard kill would be worse.
+
+### Gates met
+
+```
+mlf train --config configs/example_gbdt.yaml
+  tuning xgboost/gbdt on 'acc' (max): 30 trials, 300s budget, 7 parameters
+  best acc=0.9000 after 30 trials (0 pruned) in 22s
+  Test accuracy: 0.9250            # untuned was 0.9000
+  total elapsed 41s                # default budget 300s
+```
+
+`bundle/config.json` holds `max_depth: 11` against the YAML's `6`, and
+`hpo.json` records the range it came from (`Int(low=3, high=12)`) alongside all
+30 trials — "max_depth=11" is uninterpretable without knowing what was searched,
+and a winner sitting at a boundary is telling you the range was wrong.
+
+### Decisions worth knowing
+
+**Tuning is on for users and off for tests.** `conftest.make_config` sets
+`tune.enabled: false`: a test of the bundle layout should not spend 300 s
+searching. The tuning path has its own tests, which opt back in explicitly.
+
+**A skipped search still writes `hpo.json`.** Tuning off, an empty space, optuna
+absent — each is recorded with its reason. An absent file would be
+indistinguishable from a bundle written before P4.
+
+**Optuna missing degrades to a plain fit with a warning**, rather than failing.
+Tuning is on by default, so a hard failure would break every install without the
+`[hpo]` extra.
+
+**Pruning attachment is per-library, not just the callback.** xgboost ≥ 2.0 takes
+`callbacks` on the *constructor*; lightgbm and catboost take it on `fit`. Passing
+it to `XGBClassifier.fit()` is a `TypeError` — found by the torch-free training
+test, which exercises the default (tuning) path. It now lives in the adapter
+table alongside the other per-library differences.
+
+**Correction to a P3 note:** that entry claimed CatBoost has no Optuna pruning
+callback. `optuna_integration.catboost.CatBoostPruningCallback` exists and is now
+wired; all three tree libraries prune.
+
+### Deliberate loose ends P5+ must close
+
+1. **`native_categorical` still has no consumer.** All three tree plugins declare
+   it, but the tabular source builds a float matrix via `.values.astype`. Passing
+   a pandas `category` dtype through is a data-layer change with its own tests.
+2. **`lr_finder.py` has no capability gate.** `mlf lr` on a GBDT config still
+   crashes inside `torch_lr_finder`; `supports_lr_range_test` is declared `False`
+   and unread — **P5**.
+3. **`max_seconds` is unenforced on the GBDT path.** A one-shot `fit` cannot be
+   interrupted at a round boundary without a callback per library. The *search*
+   budget is enforced (Optuna's `timeout`); a single overrunning fit is not.
+4. **Cross-validation is not a `train()` mode yet** — **P5** owns it, and the
+   plan is explicit that it belongs to the orchestrator so GBDT and forecasting
+   get it too rather than it being a Lightning feature.
