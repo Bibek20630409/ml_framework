@@ -219,6 +219,67 @@ class GroupSplitter:
         return out
 
 
+# ── Cross-validation ──────────────────────────────────────
+@dataclass(frozen=True, slots=True)
+class CrossValidationSplitter:
+    """k folds, each a complete ``SplitIndices``.
+
+    Yields *whole* train/val/test partitions rather than the usual (train, test)
+    pairs, because everything downstream — early stopping, the preprocessor fitted
+    on train only, the per-fold metrics — needs a validation set. Fold *i* is the
+    test set; a ``val_size`` slice of what remains becomes validation; the rest is
+    training.
+
+    Deliberately not a ``Splitter``: the protocol returns one partition and this
+    returns k. Making it fit would have meant either a lying signature or a
+    protocol that returns a list nobody else wants.
+
+    Stratified for classification, plain KFold for regression — stratifying a
+    continuous target is what crashed the original framework, and the same guard
+    applies here.
+    """
+
+    name: ClassVar[str] = "cv"
+
+    folds: int = 5
+    seed: int = 42
+    task: str = "multiclass"
+    val_size: float = 0.15
+
+    def split(self, n: int, *, y: np.ndarray | None = None, **_: Any) -> list[SplitIndices]:
+        from sklearn.model_selection import KFold, StratifiedKFold, train_test_split
+
+        if self.folds < 2:
+            raise SplitError(f"cross-validation needs at least 2 folds, got {self.folds}")
+        if n < self.folds:
+            raise SplitError(f"cannot make {self.folds} folds from {n} rows")
+
+        is_reg = self.task == "regression"
+        if not is_reg and y is None:
+            raise SplitError(f"task '{self.task}' requires labels to stratify the folds")
+
+        idx = np.arange(n)
+        splitter = (
+            KFold(n_splits=self.folds, shuffle=True, random_state=self.seed)
+            if is_reg
+            else StratifiedKFold(n_splits=self.folds, shuffle=True, random_state=self.seed)
+        )
+
+        out: list[SplitIndices] = []
+        for rest, test in splitter.split(idx, y):
+            # `val_size` is a fraction of the *whole* dataset, so the validation
+            # set stays the size the config asked for rather than shrinking with k.
+            rel_val = min(0.5, max(1.0 / len(rest), self.val_size * n / len(rest)))
+            stratify = None if is_reg else y[rest]  # type: ignore[index]
+            train, val = train_test_split(
+                rest, test_size=rel_val, random_state=self.seed, stratify=stratify
+            )
+            out.append(SplitIndices(np.asarray(train), np.asarray(val), np.asarray(test)))
+
+        log.info("cross-validation: %d folds over %d rows", self.folds, n)
+        return out
+
+
 # ── Registry ──────────────────────────────────────────────
 # A plain name → class map rather than a PluginRegistry: splitters take no
 # optional dependencies and need no capability metadata, so a spec-carrying

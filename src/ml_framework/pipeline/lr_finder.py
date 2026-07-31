@@ -26,8 +26,31 @@ _CRITERION = {
 }
 
 
+def _check_supported(config: ExperimentConfig) -> None:
+    """Refuse politely instead of crashing inside ``torch_lr_finder``.
+
+    The consumer of ``Capabilities.supports_lr_range_test``. An LR range test
+    sweeps the learning rate across mini-batches and watches the loss — there is
+    no such thing for a model with no gradient descent in it, so ``mlf lr`` on an
+    XGBoost config used to fail somewhere deep inside a library that had been
+    handed something it could not use.
+    """
+    from ..core.registry import MODELS
+    from ..core.types import UnsupportedCapability
+
+    spec = MODELS.get_spec(config.model.name)
+    if not spec.capabilities.supports_lr_range_test:
+        raise UnsupportedCapability(
+            f"model '{spec.name}' has no learning rate to range-test "
+            f"(backend '{spec.backend}' does not train by gradient descent). "
+            f"`mlf lr` applies to the lightning backend; use `mlf tune` instead."
+        )
+
+
 def find_lr(config: ExperimentConfig) -> float:
     from torch_lr_finder import LRFinder  # optional dep
+
+    _check_supported(config)
 
     out = Path(config.runtime.output_dir)
     out.mkdir(parents=True, exist_ok=True)

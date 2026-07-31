@@ -65,6 +65,9 @@ if TYPE_CHECKING:
 
 SplitStrategy = Literal["auto", "random", "temporal", "group"]
 Refit = Literal["best", "reuse"]
+# `16`/`bf16` are the shorthand people type; the backend normalizes them to
+# Lightning's `-mixed` spellings rather than rejecting them.
+Precision = Literal["16", "16-mixed", "bf16", "bf16-mixed", "32", "32-true", "64"]
 
 # Dotted prefixes under which `with_overrides` may *create* a key. Everything
 # else keeps v1's "the key must already exist" rule, because a typo in a fixed
@@ -95,9 +98,14 @@ class RuntimeConfig(BaseModel):
     num_workers: int = -1  # -1 → auto (0 on Windows, else 4)
     accelerator: str = "auto"
     devices: str | int = "auto"
-    # Carried into RunContext and honoured by the backends that declare
-    # `supports_mixed_precision`. P5 wires it into the Trainer.
-    precision: str = "32"
+    # Honoured by backends that declare `supports_mixed_precision`, and **warned
+    # about** by the ones that do not — silently training in fp32 after being asked
+    # for fp16 is the kind of thing you discover from a wall-clock number months
+    # later. `16`/`bf16` are accepted and normalized to Lightning's `-mixed` names.
+    precision: Precision = "32"
+    # Multi-device strategy. "auto" lets Lightning choose, which is right until you
+    # have a reason it is not.
+    strategy: str = "auto"
     deterministic: bool = True
 
 
@@ -124,12 +132,25 @@ class SplitConfig(BaseModel):
     # Rows dropped between segments. Not cosmetic: with lag features the last
     # train rows and the first val rows share source observations.
     gap: int = Field(default=0, ge=0)
+    # 0 or 1 → a single holdout split (the default). >= 2 → k-fold
+    # cross-validation, which `train()` runs as an orchestration mode: k fits to
+    # *estimate* performance honestly, then the usual single fit to produce the
+    # bundle. It belongs in the split block because k-fold is a way of cutting the
+    # data — and being driven by the Splitter is what gives GBDT and forecasting
+    # cross-validation too, rather than it being a Lightning feature.
+    folds: int = Field(default=0, ge=0)
 
     @model_validator(mode="after")
     def _check_sizes(self) -> SplitConfig:
         if self.val_size + self.test_size >= 1.0:
             raise ValueError("val_size + test_size must be < 1.0")
+        if self.folds == 1:
+            raise ValueError("split.folds must be 0 (holdout) or >= 2; 1 fold is not a split")
         return self
+
+    @property
+    def cross_validate(self) -> bool:
+        return self.folds >= 2
 
     def resolved_strategy(self, data_kind: str) -> str:
         """``auto`` made concrete: temporal whenever time ordering matters."""

@@ -48,6 +48,7 @@ register_backend(
             supports_gpu=True,
             supports_mixed_precision=True,
             supports_lr_range_test=True,
+            supports_resume=True,
             supports_sample_weight=False,
         ),
         requires=(

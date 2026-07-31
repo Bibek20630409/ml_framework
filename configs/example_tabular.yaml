@@ -11,7 +11,8 @@ runtime:
   num_workers: -1                   # -1 → auto (0 on Windows, 4 elsewhere)
   accelerator: auto
   devices: auto
-  precision: "32"
+  precision: "32"                   # 32 | 16-mixed | bf16-mixed (16/bf16 also accepted)
+  strategy: auto                    # auto | ddp | ddp_spawn
   deterministic: true
 
 data:
@@ -26,6 +27,7 @@ data:
     # time_col: date                # set → `auto` becomes a temporal split
     # group_col: patient_id         # set → `auto` becomes a grouped split
     gap: 0
+    folds: 0                        # >= 2 → k-fold CV before the final fit
   params:                           # validated by the tabular source
     imbalance_strategy: smote       # smote | class_weights | none
     imbalance_threshold: 0.3
@@ -46,9 +48,12 @@ fit:
   params:                           # validated by the backend (lightning)
     lr: 0.001                       # paste tuned value from `mlf lr`
     weight_decay: 0.0001
+    optimizer: adam                 # adam | adamw | sgd
+    scheduler: plateau              # plateau | cosine | step | none
     lr_patience: 10                 # ReduceLROnPlateau
     lr_factor: 0.5
     gradient_clip_val: 1.0
+    accumulate_grad_batches: 1      # effective batch = batch_size * this
 
 tune:
   enabled: true

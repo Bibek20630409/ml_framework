@@ -120,6 +120,21 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="PATH",
         help="Write the effective (post-tuning) config as YAML, for committing back",
     )
+    train_p.add_argument(
+        "--resume",
+        nargs="?",
+        const=True,
+        default=False,
+        metavar="CKPT",
+        help="Continue from a checkpoint (default: <output_dir>/model/last.ckpt)",
+    )
+    train_p.add_argument(
+        "--folds",
+        type=int,
+        default=None,
+        metavar="K",
+        help="Cross-validate over K folds before the final fit (0 = holdout only)",
+    )
 
     # `tune` searches and reports without fitting the winner at full budget.
     # `hpo` is kept as an alias: removing a verb people have in scripts is a
@@ -263,7 +278,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "train":
         from .pipeline import train
 
-        train(cfg, emit_config=args.emit_config)
+        if args.folds is not None:
+            cfg = cfg.with_overrides({"data.split.folds": args.folds})
+        train(cfg, emit_config=args.emit_config, resume=args.resume)
     return 0
 
 

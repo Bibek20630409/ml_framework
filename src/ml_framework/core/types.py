@@ -227,5 +227,10 @@ class Capabilities:
     # `mlf lr`: refuse politely instead of crashing inside torch_lr_finder.
     supports_lr_range_test: bool = False
 
+    # `train(resume=...)`: warn and continue from scratch rather than silently
+    # ignoring the flag. A one-shot `fit(X, y)` has no partial state to resume
+    # from, so this is False for everything but an epoch loop.
+    supports_resume: bool = False
+
     def can_accept(self, payload: Payload) -> bool:
         return payload in self.accepts

@@ -325,6 +325,15 @@ def test_fit_params_model_keeps_the_scheduler_configuration():
         "lr_patience",
         "lr_factor",
         "gradient_clip_val",
+        # P5: v1's hardcoded Adam + ReduceLROnPlateau became defaults rather than
+        # the only option, and gradient accumulation joined them.
+        "optimizer",
+        "scheduler",
+        "accumulate_grad_batches",
     }
+    # The v1 behaviour is still what you get by default.
+    defaults = params()
+    assert (defaults.optimizer, defaults.scheduler) == ("adam", "plateau")
+    assert defaults.accumulate_grad_batches == 1
     with pytest.raises(Exception, match="extra_forbidden|Extra inputs"):
         params(lr=1e-3, typo=1)

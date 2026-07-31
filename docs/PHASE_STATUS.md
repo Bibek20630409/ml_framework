@@ -9,8 +9,8 @@ Tracks progress against [ml_framework_architecture_plan.md](../ml_framework_arch
 | P1 — Data + backend extraction | **done** | `95c4359` (P1a) · `2ac9d45` (P1b) |
 | P2 — v2 config | **done** | `5bddf2a` |
 | P3 — GBDT | **done** | `3b46f4a` |
-| P4 — AutoML | **done** | this branch |
-| P5 — DL hardening | not started | — |
+| P4 — AutoML | **done** | `a300c38` |
+| P5 — DL hardening | **done** | this branch |
 | P6 — Time-series | not started | — |
 | P7 — NLP | not started | — |
 | P8 — Zero-config | not started | — |
@@ -30,9 +30,9 @@ v1 *bundles* still load (`test_v1_bundle_compat.py`); v1 *configs* do not, and
 
 ## Test baseline
 
-**395 passed, 1 skipped** with every declared extra installed except DVC
-(46/4 before P0 → 130/4 after P0 → 249/4 after P1 → 258/1 → 284/1 after P2 → 355/1 after P3 →
-**395/1**). Every phase gate is measured against this number — a phase that ends
+**429 passed, 1 skipped** with every declared extra installed except DVC
+(46/4 before P0 → 130/4 after P0 → 249/4 after P1 → 258/1 → 284/1 after P2 → 355/1 after P3 → 395/1 after P4 →
+**429/1**). Every phase gate is measured against this number — a phase that ends
 with fewer passing tests than it started with has regressed something, regardless
 of what its own new tests say.
 
@@ -88,7 +88,7 @@ build *function* rather than a class — see `available_models` below).
 Verification commands (all clean):
 
 ```
-pytest                        # 395 passed, 1 skipped
+pytest                        # 429 passed, 1 skipped
 ruff check src tests
 black --check src tests
 isort --check-only src tests
@@ -491,3 +491,76 @@ wired; all three tree libraries prune.
 4. **Cross-validation is not a `train()` mode yet** — **P5** owns it, and the
    plan is explicit that it belongs to the orchestrator so GBDT and forecasting
    get it too rather than it being a Lightning feature.
+
+## What P5 landed
+
+The deep-learning capabilities the Lightning path was missing, plus the one
+"DL feature" that deliberately is not one.
+
+- **Mixed precision** — `runtime.precision`, resolved once in
+  `backends/base.resolve_precision`. `16`/`bf16` are normalized to Lightning's
+  `-mixed` spellings rather than rejected.
+- **Multi-device strategy** — `runtime.strategy` (`auto`/`ddp`/`ddp_spawn`).
+- **Resume** — `ModelCheckpoint(save_last=True)`, `last.ckpt` copied into the
+  bundle, `train(resume=...)` / `mlf train --resume`.
+- **Gradient accumulation** — `fit.params.accumulate_grad_batches`.
+- **Configurable optimizer/scheduler** — `adam|adamw|sgd` ×
+  `plateau|cosine|step|none`. v1's Adam + ReduceLROnPlateau are the defaults, so
+  an existing config trains exactly as it did.
+- **Cross-validation** — `data.split.folds`, run by `train()`.
+- **`mlf lr` is capability-gated** (P3/P4 loose end), so it refuses a GBDT config
+  instead of crashing inside `torch_lr_finder`.
+
+### Gates met
+
+**AMP matches FP32 within tolerance.** `test_amp_matches_fp32_within_tolerance`
+trains the same config twice, once at `bf16-mixed`. bf16 rather than fp16 because
+this machine is CPU-only and fp16 has no gradient scaler there — which the
+resolution logic detects and downgrades, with its own test.
+
+**`--resume` continues rather than restarting.** The obvious assertion does not
+work: a resumed run and a fresh one *end* at the same epoch, so the final number
+proves nothing. The test resumes into an **already-exhausted** budget and asserts
+zero further steps ran — true only if the epoch counter, optimizer and scheduler
+all came back. A restart would have trained the full 2 epochs again.
+
+**Cross-validation works for GBDT.** `--folds 3` on an xgboost config produces
+`cv_acc_mean`/`cv_acc_std` and a normal GBDT bundle, because CV drives the
+splitter and the same `fit`/`predict_split` calls every backend implements.
+
+### Decisions worth knowing
+
+**`data.split.folds`, not `fit.cv`.** k-fold is a way of *cutting the data*, and
+putting it in the split block avoids a second `strategy` field that would have to
+be kept in step with the first.
+
+**CV estimates; it does not produce the model.** k folds run first, then the usual
+single fit writes the bundle. So there is one bundle-writing path regardless of
+how the score was estimated, and `cv_*` metrics sit *beside* `test_acc` rather
+than replacing it — they answer different questions.
+
+**Each fold re-fits its own preprocessor.** `build_cv_bundles` re-runs the whole
+source pipeline per fold. Fitting a scaler once and sharing it would leak every
+fold's test set into every other fold's preprocessing, producing a CV estimate
+that looks better than the model is.
+
+**`cv.json` records per-fold scores, not just the mean.** A mean of 0.85 across
+0.84/0.86 and across 0.70/1.00 are the same number and completely different
+results.
+
+**`last.ckpt` is not the manifest's artifact.** The manifest still points at the
+*best* checkpoint: a loader wants the best weights, and only a resuming trainer
+wants the last optimizer state. Both live in `model/`.
+
+### Deliberate loose ends P6+ must close
+
+1. **Cross-validation is tabular-only.** `build_cv_bundles` raises
+   `NotImplementedError` for other kinds rather than silently cross-validating
+   something else; threading fold indices through `ImageFolder` is its own change.
+2. **`native_categorical` still has no consumer.** All three tree plugins declare
+   it, but the tabular source builds a float matrix via `.values.astype`.
+3. **`max_seconds` is unenforced on the GBDT path.** A one-shot `fit` cannot be
+   interrupted at a round boundary without a per-library callback. The *search*
+   budget is enforced; a single overrunning fit is not.
+4. **`ddp` is wired but untested here** — this machine has one CPU device, so the
+   strategy field is passed through and never exercised against real multi-GPU.

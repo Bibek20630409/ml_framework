@@ -179,8 +179,16 @@ def _apply_imbalance(
     return x_res, y_res, class_weights, None
 
 
-def build_tabular_bundle(config) -> DataBundle:
-    """Materialize a tabular :class:`DataBundle` from a validated config."""
+def build_tabular_bundle(config, *, indices: Any = None) -> DataBundle:
+    """Materialize a tabular :class:`DataBundle` from a validated config.
+
+    ``indices`` overrides the configured splitter with a ready-made partition,
+    which is how cross-validation gets one bundle per fold. Everything after the
+    split — the drift reference, the scaler, the imbalance correction — is then
+    recomputed *for that fold*, which is the entire point: a preprocessor fitted
+    once on the full data and reused across folds leaks the test set into every
+    one of them.
+    """
     if config.data.path is None:
         raise ValueError("tabular data requires data.path")
     params = TabularSourceParams.model_validate(dict(config.data.params))
@@ -206,7 +214,7 @@ def build_tabular_bundle(config) -> DataBundle:
     y = df[target].values
     y = y.astype("int64") if config.task != "regression" else y.astype("float32")
 
-    parts = build_splitter(config, params).split(
+    parts = indices or build_splitter(config, params).split(
         len(x),
         y=y,
         time=df[split_cfg.time_col].values if split_cfg.time_col else None,

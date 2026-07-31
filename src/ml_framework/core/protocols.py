@@ -141,9 +141,14 @@ class RunContext:
     accelerator: str = "auto"
     devices: str | int = "auto"
     precision: str = "32"
+    strategy: str = "auto"
     deterministic: bool = True
     # Set during HPO so a backend can shorten its own loop / install pruning.
     trial: Any | None = None
+    # A checkpoint to continue from. Resolved and existence-checked by the
+    # orchestrator, so a backend that supports resuming can use it directly and one
+    # that does not is never handed a path it would have to explain away.
+    resume_from: Path | None = None
 
 
 @dataclass(frozen=True, slots=True)

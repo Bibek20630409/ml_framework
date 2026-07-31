@@ -57,12 +57,21 @@ class OptimSettings:
     ``lr_patience``/``lr_factor`` configure ``ReduceLROnPlateau``. They are listed
     explicitly because dropping them in the v1→v2 move would silently change the
     schedule rather than fail.
+
+    ``optimizer``/``scheduler`` make v1's hardcoded Adam + ReduceLROnPlateau a
+    *default* rather than the only option. Both keep their v1 values, so an
+    existing config trains exactly as it did.
     """
 
     lr: float = 1e-3
     weight_decay: float = 1e-4
     lr_patience: int = 10
     lr_factor: float = 0.5
+    optimizer: str = "adam"
+    scheduler: str = "plateau"
+    # Cosine/step need to know the horizon; supplied by the backend, which is the
+    # only thing that knows how long the loop will run.
+    max_epochs: int = 100
 
     @classmethod
     def from_mapping(cls, params: Any) -> OptimSettings:
@@ -237,22 +246,64 @@ class BaseModel(pl.LightningModule):
         return self._shared_step(batch, "test")
 
     # ── Optimizer ─────────────────────────────────────────
+    def _build_optimizer(self) -> torch.optim.Optimizer:
+        """Adam by default, because that is what v1 used and it is a fine default.
+
+        The point of the table is that adding AdamW or SGD is a row, not a branch
+        in every model.
+        """
+        name = self.optim.optimizer.lower()
+        lr, decay = self.optim.lr, self.optim.weight_decay
+        if name == "adam":
+            return torch.optim.Adam(self.parameters(), lr=lr, weight_decay=decay)
+        if name == "adamw":
+            return torch.optim.AdamW(self.parameters(), lr=lr, weight_decay=decay)
+        if name == "sgd":
+            # Momentum is not optional in practice: plain SGD at these learning
+            # rates does not converge in a comparable number of epochs.
+            return torch.optim.SGD(self.parameters(), lr=lr, weight_decay=decay, momentum=0.9)
+        raise ValueError(f"Unknown optimizer '{self.optim.optimizer}'. Use adam | adamw | sgd")
+
+    def _build_scheduler(self, opt: torch.optim.Optimizer) -> dict | None:
+        """The LR schedule, in the dict shape Lightning expects, or ``None``.
+
+        ``plateau`` is the v1 behaviour and stays the default. It is the only one
+        that needs a ``monitor``, which is why the return shape is a dict rather
+        than a bare scheduler.
+        """
+        name = self.optim.scheduler.lower()
+        if name in ("none", "off"):
+            return None
+        if name == "plateau":
+            plateau = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                opt,
+                mode="min",
+                patience=self.optim.lr_patience,
+                factor=self.optim.lr_factor,
+            )
+            # The only one that needs a `monitor`, which is why the return shape is
+            # a dict rather than a bare scheduler.
+            return {"scheduler": plateau, "monitor": "val/loss"}
+        if name == "cosine":
+            cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+                opt, T_max=max(1, self.optim.max_epochs)
+            )
+            return {"scheduler": cosine}
+        if name == "step":
+            # A third of the run per step is the conventional starting point when
+            # nothing more specific is known about the schedule.
+            step = torch.optim.lr_scheduler.StepLR(
+                opt, step_size=max(1, self.optim.max_epochs // 3), gamma=self.optim.lr_factor
+            )
+            return {"scheduler": step}
+        raise ValueError(
+            f"Unknown scheduler '{self.optim.scheduler}'. Use plateau | cosine | step | none"
+        )
+
     def configure_optimizers(self):
-        opt = torch.optim.Adam(
-            self.parameters(),
-            lr=self.optim.lr,
-            weight_decay=self.optim.weight_decay,
-        )
-        sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            opt,
-            mode="min",
-            patience=self.optim.lr_patience,
-            factor=self.optim.lr_factor,
-        )
-        return {
-            "optimizer": opt,
-            "lr_scheduler": {"scheduler": sched, "monitor": "val/loss"},
-        }
+        opt = self._build_optimizer()
+        sched = self._build_scheduler(opt)
+        return {"optimizer": opt, "lr_scheduler": sched} if sched else opt
 
     def count_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters() if p.requires_grad)

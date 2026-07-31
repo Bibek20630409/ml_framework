@@ -17,6 +17,7 @@ part of a backend that can be reasoned about — and tested — without one.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, ClassVar
@@ -32,6 +33,8 @@ from ..core.protocols import (
     TrialHooks,
 )
 from ..core.types import Capabilities
+
+log = logging.getLogger(__name__)
 
 
 def clean_metrics(metrics: Mapping[str, Any]) -> dict[str, float]:
@@ -49,6 +52,56 @@ def clean_metrics(metrics: Mapping[str, Any]) -> dict[str, float]:
         except (TypeError, ValueError):
             continue
     return out
+
+
+# The shorthand people type, and what Lightning actually wants.
+_PRECISION_ALIASES: Mapping[str, str] = {
+    "16": "16-mixed",
+    "bf16": "bf16-mixed",
+    "32": "32-true",
+}
+_MIXED_PRECISIONS = frozenset({"16-mixed", "bf16-mixed"})
+
+
+def resolve_precision(
+    requested: str, capabilities: Capabilities, *, accelerator: str = "auto", has_gpu: bool = False
+) -> str:
+    """The precision that will actually be used, having said so if it differs.
+
+    This is the consumer of ``Capabilities.supports_mixed_precision``. Asking for
+    fp16 and silently getting fp32 is the kind of thing you discover months later
+    from a wall-clock number that never improved, so every downgrade is logged at
+    WARNING with the reason.
+
+    Two conditions force a downgrade: a backend that cannot do mixed precision at
+    all (a GBDT has no autocast to enter), and fp16 on CPU — where torch's
+    gradient scaler has nothing to scale on. ``bf16`` needs no scaler and is left
+    alone, which is why it is the one that works on a laptop.
+    """
+    normalized = _PRECISION_ALIASES.get(str(requested), str(requested))
+    if normalized not in _MIXED_PRECISIONS:
+        return normalized
+
+    if not capabilities.supports_mixed_precision:
+        log.warning(
+            "precision=%s requested but this backend does not support mixed precision "
+            "— training at 32-true",
+            requested,
+        )
+        return "32-true"
+
+    if normalized == "16-mixed" and not has_gpu and accelerator in ("auto", "cpu"):
+        # fp16 autocast on CPU has no gradient scaler behind it; Lightning will
+        # construct the Trainer and then train badly or not at all.
+        log.warning(
+            "precision=%s needs a GPU (fp16 gradient scaling is GPU-only) "
+            "— training at 32-true. Use bf16-mixed for mixed precision on CPU.",
+            requested,
+        )
+        return "32-true"
+
+    log.info("mixed precision: %s", normalized)
+    return normalized
 
 
 def resolve_budget(config: Any) -> Budget:

@@ -240,6 +240,45 @@ tune:
     fit.params.subsample: 0.9        # a bare value pins it
 ```
 
+## Deep-learning knobs
+
+All of these resolve in one place and say what they did:
+
+```yaml
+runtime:
+  precision: bf16-mixed    # 32 | 16-mixed | bf16-mixed  (16/bf16 also accepted)
+  strategy: ddp            # auto | ddp | ddp_spawn
+fit:
+  params:
+    optimizer: adamw       # adam | adamw | sgd
+    scheduler: cosine      # plateau | cosine | step | none
+    accumulate_grad_batches: 4
+```
+
+Asking for mixed precision on a backend that cannot do it — or fp16 on a CPU,
+where there is no gradient scaler — **downgrades with a WARNING** rather than
+silently training in fp32. That is the failure you otherwise discover months
+later from a wall-clock number that never improved.
+
+```bash
+mlf train -c configs/example_tabular.yaml --resume        # from model/last.ckpt
+mlf train -c configs/example_tabular.yaml --folds 5       # cross-validate first
+```
+
+`--resume` continues the epoch counter, optimizer and scheduler — not just the
+weights. `last.ckpt` is what it reads; the manifest still points at the *best*
+checkpoint, because a loader wants the best weights and only a resuming trainer
+wants the last state.
+
+**Cross-validation is an orchestration mode, not a Lightning feature.** It drives
+the splitter and the same protocol calls every backend implements, so
+`--folds 5` works for XGBoost too. Each fold re-fits its own scaler and imbalance
+correction — sharing one across folds would leak every fold's test set into every
+other fold's preprocessing. `cv.json` records the per-fold scores as well as the
+mean, because a mean of 0.85 across 0.84/0.86 and across 0.70/1.00 are the same
+number and completely different results. The CV estimate sits *beside* the
+holdout score rather than replacing it.
+
 The result is **applied, not printed**: the winner lands in `bundle/config.json`,
 the full record (winner, ranges searched, every trial) in `bundle/hpo.json` and
 `manifest.hpo`, and `--emit-config` writes a YAML you can commit. A search that

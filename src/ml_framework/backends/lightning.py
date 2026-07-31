@@ -28,7 +28,7 @@ import logging
 import shutil
 from datetime import timedelta
 from pathlib import Path
-from typing import Any, ClassVar, cast
+from typing import Any, ClassVar, Literal, cast
 
 import numpy as np
 import torch
@@ -48,7 +48,7 @@ from ..core.protocols import (
 from ..core.task import get_task_spec
 from ..core.types import Capabilities, UnsupportedCapability
 from ..data.lightning_adapter import BundleDataModule
-from .base import BaseBackend, clean_metrics
+from .base import BaseBackend, clean_metrics, resolve_precision
 
 log = logging.getLogger(__name__)
 
@@ -73,6 +73,14 @@ class LightningFitParams(PydanticModel):
     lr_patience: int = Field(default=_OPTIM_DEFAULTS.lr_patience, ge=1)
     lr_factor: float = Field(default=_OPTIM_DEFAULTS.lr_factor, gt=0.0, lt=1.0)
     gradient_clip_val: float = Field(default=1.0, ge=0.0)
+    # v1's hardcoded Adam + ReduceLROnPlateau become the *defaults*, so an existing
+    # config trains exactly as it did while the choice is now expressible.
+    optimizer: Literal["adam", "adamw", "sgd"] = _OPTIM_DEFAULTS.optimizer  # type: ignore[assignment]
+    scheduler: Literal["plateau", "cosine", "step", "none"] = _OPTIM_DEFAULTS.scheduler  # type: ignore[assignment]
+    # Simulates a larger batch than fits in memory: gradients accumulate over N
+    # batches before stepping. The effective batch size is `batch_size * N`, which
+    # is worth knowing when comparing runs.
+    accumulate_grad_batches: int = Field(default=1, ge=1)
 
 
 def _pruning_callback(trial: Any, monitor: str) -> Any | None:
@@ -100,6 +108,8 @@ def _pruning_callback(trial: Any, monitor: str) -> Any | None:
 
 CHECKPOINT_DIR = "checkpoints"
 MODEL_FILE = "model.ckpt"
+# The resumable state: last epoch's weights *plus* optimizer and scheduler.
+LAST_FILE = "last.ckpt"
 ARTIFACT_FORMAT = "lightning-checkpoint"
 # Evaluation batching does not change results — the module is in eval mode, so
 # BatchNorm uses running statistics and dropout is off — but a default keeps
@@ -191,6 +201,9 @@ class LightningBackend(BaseBackend):
         supports_gpu=True,
         supports_mixed_precision=True,
         supports_lr_range_test=True,
+        # An epoch loop has partial state worth continuing from, which is what
+        # makes `--resume` meaningful here and nowhere else yet.
+        supports_resume=True,
         # Sample weights are not plumbed through the Lightning loop; imbalance is
         # handled by class weights in the loss or by resampling.
         supports_sample_weight=False,
@@ -225,7 +238,12 @@ class LightningBackend(BaseBackend):
                 # property exists for the loss, not for the build contract.
                 class_weights=bundle.class_weights,
                 params=cfg.model.params,
-                optim=fit_params.model_dump(),
+                # `max_epochs` reaches the model so cosine/step schedules know
+                # their horizon — the only thing that knows it is the loop.
+                optim={
+                    **fit_params.model_dump(),
+                    "max_epochs": run.budget.max_epochs or cfg.fit.budget.max_epochs or 100,
+                },
                 seed=run.seed,
             )
         )
@@ -244,6 +262,11 @@ class LightningBackend(BaseBackend):
                 monitor=task_spec.monitor,
                 mode=task_spec.monitor_mode,
                 save_top_k=1,
+                # `last.ckpt` is what `--resume` continues from. The *best*
+                # checkpoint is the wrong thing to resume: it holds the weights
+                # from whichever epoch scored highest, not the optimizer and
+                # scheduler state the loop stopped with.
+                save_last=True,
             ),
         ]
         # LearningRateMonitor requires an active logger.
@@ -268,6 +291,11 @@ class LightningBackend(BaseBackend):
             max_epochs=run.budget.max_epochs or cfg.fit.budget.max_epochs,
             accelerator=run.accelerator,
             devices=run.devices,
+            strategy=run.strategy,
+            # Lightning types this as a closed Literal; `resolve_precision` already
+            # narrowed the string to one of those members.
+            precision=self._precision(run),  # type: ignore[arg-type]
+            accumulate_grad_batches=fit_params.accumulate_grad_batches,
             callbacks=callbacks,
             logger=logger,
             gradient_clip_val=fit_params.gradient_clip_val,
@@ -276,7 +304,12 @@ class LightningBackend(BaseBackend):
         )
 
         log.info("training…")
-        trainer.fit(model, dm)
+        # `ckpt_path` restores weights *and* optimizer/scheduler/epoch state, which
+        # is the difference between resuming and re-initialising from weights.
+        resume = str(run.resume_from) if run.resume_from else None
+        if resume:
+            log.info("resuming from %s", resume)
+        trainer.fit(model, dm, ckpt_path=resume)
         val_metrics = clean_metrics(trainer.callback_metrics)
         # Tests the in-memory (last) model, as v1 did — this populates the
         # tracker's test/* series. The reported metrics come from the *best*
@@ -301,6 +334,15 @@ class LightningBackend(BaseBackend):
             batch_size=cfg.fit.batch_size,
         )
         return FitResult(estimator=estimator, val_metrics=val_metrics)
+
+    def _precision(self, run: RunContext) -> str:
+        """Resolved once, here, so every downgrade is logged with its reason."""
+        return resolve_precision(
+            run.precision,
+            self.capabilities,
+            accelerator=run.accelerator,
+            has_gpu=torch.cuda.is_available(),
+        )
 
     def _best_checkpoint(self, trainer: Any, out: Path) -> Path:
         """The best checkpoint, or a freshly written one if there is none.
@@ -373,6 +415,15 @@ class LightningBackend(BaseBackend):
                 "LightningEstimator has no checkpoint to save; it was not produced by fit()"
             )
         shutil.copyfile(source, target_dir / MODEL_FILE)
+
+        # `last.ckpt` rides along beside the model so `--resume` has something to
+        # continue from after the run directory is cleaned. It is *not* the
+        # manifest's artifact — that stays the best checkpoint — because a loader
+        # wants the best weights and only a resuming trainer wants the last state.
+        last = Path(source).parent / LAST_FILE
+        if last.exists():
+            shutil.copyfile(last, target_dir / LAST_FILE)
+
         return ArtifactRef(path=f"{target_dir.name}/{MODEL_FILE}", format=ARTIFACT_FORMAT)
 
     def load(self, bundle_dir: str | Path, manifest: Any) -> LightningEstimator:

@@ -59,8 +59,19 @@ from .tune import HPO_FILE, tune
 
 log = logging.getLogger(__name__)
 
+CV_FILE = "cv.json"
+# Named here rather than imported from the Lightning backend: this module must not
+# import a backend, which is the whole point of the orchestration split. The
+# backend writes the file; the orchestrator only needs to know what it is called.
+LAST_CHECKPOINT = "last.ckpt"
 
-def train(config: ExperimentConfig, *, emit_config: str | Path | None = None) -> dict:
+
+def train(
+    config: ExperimentConfig,
+    *,
+    emit_config: str | Path | None = None,
+    resume: bool | str | Path = False,
+) -> dict:
     out = Path(config.runtime.output_dir)
     out.mkdir(parents=True, exist_ok=True)
     setup_logging(out)
@@ -82,6 +93,11 @@ def train(config: ExperimentConfig, *, emit_config: str | Path | None = None) ->
     if emit_config is not None:
         _emit_config(config, emit_config)
 
+    # k-fold *estimates* performance; it does not produce the shipped model. Run it
+    # first, then fall through to the single fit that writes the bundle — so there
+    # is one bundle-writing path regardless of how the score was estimated.
+    cv_metrics = _cross_validate(config, spec, backend, out) if config.data.split.folds else {}
+
     bundle = build_bundle(config)
     log.info("input_dim=%d output_dim=%d", bundle.input_dim, bundle.output_dim)
 
@@ -102,7 +118,9 @@ def train(config: ExperimentConfig, *, emit_config: str | Path | None = None) ->
         accelerator=config.runtime.accelerator,
         devices=config.runtime.devices,
         precision=config.runtime.precision,
+        strategy=config.runtime.strategy,
         deterministic=config.runtime.deterministic,
+        resume_from=_resolve_resume(resume, out, spec, backend),
     )
 
     try:
@@ -125,6 +143,10 @@ def train(config: ExperimentConfig, *, emit_config: str | Path | None = None) ->
             output_dir=out,
             class_names=config.data.class_names,
         )
+        # The CV estimate sits beside the holdout score rather than replacing it:
+        # they answer different questions, and a single held-out number on a small
+        # dataset is exactly the one worth distrusting.
+        metrics.update(cv_metrics)
 
         artifact = backend.save(result.estimator, out / MODEL_DIR)
         preprocessor_ref = _save_preprocessor(bundle, out)
@@ -154,6 +176,104 @@ def train(config: ExperimentConfig, *, emit_config: str | Path | None = None) ->
     log.info("final metrics: %s", metrics)
     log.info("artifacts written to %s (manifest.json, %s/, %s/)", out, MODEL_DIR, PREPROCESSOR_DIR)
     return metrics
+
+
+# ── Resume ────────────────────────────────────────────────
+def _resolve_resume(resume: bool | str | Path, out: Path, spec: Any, backend: Any) -> Path | None:
+    """The checkpoint to continue from, or ``None`` — with the reason logged.
+
+    ``True`` means "the last checkpoint of the bundle in ``output_dir``"; a path
+    means that file. Both are resolved and existence-checked *here* rather than in
+    a backend, so a backend that cannot resume is never handed a path it would
+    have to explain away, and the user hears about a missing file before training
+    starts rather than after.
+    """
+    if not resume:
+        return None
+
+    caps = backend.capabilities
+    if not caps.supports_resume:
+        # The consumer of `Capabilities.supports_resume`. A one-shot fit(X, y) has
+        # no partial state; saying so beats ignoring the flag.
+        log.warning(
+            "backend '%s' cannot resume (a one-shot fit has no partial state) — training fresh",
+            spec.backend,
+        )
+        return None
+
+    candidate = Path(resume) if not isinstance(resume, bool) else out / MODEL_DIR / LAST_CHECKPOINT
+    if not candidate.exists():
+        raise FileNotFoundError(
+            f"--resume found no checkpoint at {candidate}. "
+            f"A run only leaves one behind after completing at least one epoch."
+        )
+    log.info("resuming from %s", candidate)
+    return candidate
+
+
+# ── Cross-validation ──────────────────────────────────────
+def _cross_validate(
+    config: ExperimentConfig, spec: Any, backend: Any, out: Path
+) -> dict[str, float]:
+    """Fit every fold, and return the aggregate as ``cv_<metric>_mean|_std``.
+
+    An **orchestration** mode, not a Lightning one: it drives the splitter and the
+    same ``fit``/``predict_split`` protocol calls every backend implements, so
+    GBDT gets cross-validation for free and forecasting will too.
+
+    The per-fold detail goes to ``cv.json`` because the *spread* is the point. A
+    mean of 0.85 across folds of 0.84/0.86 and a mean of 0.85 across 0.70/1.00 are
+    the same number and completely different results; reporting only the mean
+    hides which one you have.
+    """
+    from ..data.builders import build_cv_bundles
+
+    folds = config.data.split.folds
+    log.info("cross-validating: %d folds", folds)
+    per_fold: list[dict[str, float]] = []
+
+    for i, fold in enumerate(build_cv_bundles(config)):
+        run = RunContext(
+            output_dir=out / "cv" / f"fold_{i}",
+            seed=config.runtime.seed,
+            budget=resolve_budget(config),
+            accelerator=config.runtime.accelerator,
+            devices=config.runtime.devices,
+            precision=config.runtime.precision,
+            strategy=config.runtime.strategy,
+            deterministic=config.runtime.deterministic,
+        )
+        result = backend.fit(spec, fold, config, run=run)
+        predictions = backend.predict_split(result.estimator, fold, "test")
+        scores = get_task_spec(config.task).compute(
+            predictions.y_true, predictions.y_pred, predictions.y_prob
+        )
+        log.info("fold %d/%d: %s", i + 1, folds, scores)
+        per_fold.append(scores)
+
+    aggregate = _aggregate_folds(per_fold)
+    (out / CV_FILE).write_text(
+        json.dumps({"folds": folds, "per_fold": per_fold, "aggregate": aggregate}, indent=2),
+        encoding="utf-8",
+    )
+    log.info("cross-validation: %s", aggregate)
+    return aggregate
+
+
+def _aggregate_folds(per_fold: list[dict[str, float]]) -> dict[str, float]:
+    """Mean and standard deviation per metric, prefixed ``cv_``."""
+    import statistics
+
+    if not per_fold:
+        return {}
+    out: dict[str, float] = {}
+    for name in per_fold[0]:
+        values = [f[name] for f in per_fold if name in f]
+        if not values:
+            continue
+        out[f"cv_{name}_mean"] = float(statistics.fmean(values))
+        out[f"cv_{name}_std"] = float(statistics.pstdev(values)) if len(values) > 1 else 0.0
+    return out
 
 
 # ── Tracking ──────────────────────────────────────────────

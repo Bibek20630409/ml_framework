@@ -31,6 +31,7 @@ config depend on the data package being importable first.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from typing import TYPE_CHECKING, Any
 
 # Side-effect import: registers mlp/cnn in both registries.
@@ -66,6 +67,45 @@ def build_bundle(config: ExperimentConfig) -> DataBundle:
     if builder is None:
         raise KeyError(f"Unknown data kind '{config.data.kind}'. Known: {SOURCES.names()}")
     return builder(config)
+
+
+def build_cv_bundles(config: ExperimentConfig) -> Iterator[DataBundle]:
+    """One :class:`DataBundle` per cross-validation fold.
+
+    Each fold re-runs the *whole* source pipeline against its own partition, so
+    the scaler, the drift reference and the imbalance correction are all fitted on
+    that fold's training rows. Fitting them once and reusing them across folds
+    would leak every fold's test set into every other fold's preprocessing —
+    which produces a CV estimate that looks better than the model is.
+
+    Tabular only for now. An image source would need the same indices threaded
+    through ``ImageFolder``, and raising here is better than silently
+    cross-validating something else.
+    """
+    from .sources.tabular import read_table
+    from .splitters import CrossValidationSplitter
+
+    if config.data.kind != "tabular":
+        raise NotImplementedError(
+            f"cross-validation is implemented for tabular data; got '{config.data.kind}'. "
+            f"Set data.split.folds to 0 for a single holdout split."
+        )
+
+    split_cfg = config.data.split
+    frame = read_table(str(config.data.path))
+    labels = frame[config.data.target].to_numpy()
+    if config.task != "regression":
+        labels = labels.astype("int64")
+
+    folds = CrossValidationSplitter(
+        folds=split_cfg.folds,
+        seed=config.runtime.seed,
+        task=config.task,
+        val_size=split_cfg.val_size,
+    ).split(len(frame), y=labels)
+
+    for indices in folds:
+        yield build_tabular_bundle(config, indices=indices)
 
 
 def build_datamodule(config: ExperimentConfig) -> Any:
