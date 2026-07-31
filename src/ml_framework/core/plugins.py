@@ -37,7 +37,7 @@ from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
-from .protocols import SearchSpace
+from .protocols import BuildContext, SearchSpace
 from .types import (
     DIST_NAME,
     Capabilities,
@@ -137,12 +137,12 @@ class ModelSpec:
     name: str
     # Which fit-loop shape trains this model: "lightning" | "gbdt" | "forecast".
     backend: str
-    build: Callable[..., Any]
-    """Constructs the model.
+    build: Callable[[BuildContext], Any]
+    """Constructs the model from one :class:`BuildContext`.
 
-    P0: the legacy model class, called ``(input_dim, output_dim, config,
-    class_weights)``. P2 switches this to ``build(BuildContext) -> Any`` once the
-    v2 config lands; the signature is loose here only for that transition.
+    A single frozen argument rather than a keyword explosion, so adding a field
+    later does not touch every plugin. Heavy imports belong *inside* this
+    callable — registering a spec must never import the library it wraps.
     """
     tasks: frozenset[Task] = frozenset()
     data_kinds: frozenset[DataKind] = frozenset()
@@ -155,7 +155,9 @@ class ModelSpec:
     # dimensions: n_layers → n_units_l{i}). Overrides `search_space` when set.
     suggest: Callable[..., Mapping[str, Any]] | None = None
     # Pydantic model validating `model.params`; frozen + extra="forbid" so typos
-    # still error at config-load time. Resolved lazily in P2.
+    # still error at config-load time. Run by `ExperimentConfig`'s after-validator,
+    # which also writes the defaulted values back so `config.json` records the
+    # fully-materialized effective params.
     params_model: type[PydanticModel] | None = None
     # Tie-break for zero-config model selection (higher wins).
     auto_priority: int = 0
@@ -196,10 +198,12 @@ class SourceSpec:
     name: str
     data_kind: DataKind
     build: Callable[..., Any]
-    """Materializes the data.
+    """``build(config) -> DataBundle``: materializes the data.
 
-    P0: returns the legacy ``FrameworkDataModule`` for ``data.kind``. P1 switches
-    this to ``build(config) -> DataBundle``.
+    Source-specific knobs come from ``data.params`` and are validated by the
+    source itself, for the reason spelled out in ``config/schema.py``: resolving a
+    source's params model from the config validator would mean importing the whole
+    data layer to validate a YAML file.
     """
     payload: Payload = "arrays"
     requires: tuple[Requirement, ...] = ()

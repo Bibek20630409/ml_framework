@@ -31,14 +31,48 @@ from typing import Any, ClassVar, cast
 
 import numpy as np
 import torch
+from pydantic import BaseModel as PydanticModel
+from pydantic import Field
 
-from ..core.protocols import ArtifactRef, Categorical, FitResult, Float, Predictions, RunContext
+from ..core.lit_model import OptimSettings
+from ..core.protocols import (
+    ArtifactRef,
+    BuildContext,
+    Categorical,
+    FitResult,
+    Float,
+    Predictions,
+    RunContext,
+)
 from ..core.task import get_task_spec
 from ..core.types import Capabilities, UnsupportedCapability
 from ..data.lightning_adapter import BundleDataModule
 from .base import BaseBackend, clean_metrics
 
 log = logging.getLogger(__name__)
+
+_OPTIM_DEFAULTS = OptimSettings()
+
+
+class LightningFitParams(PydanticModel):
+    """Schema for ``fit.params`` on this backend.
+
+    The optimizer defaults are read off :class:`OptimSettings` rather than
+    restated, so a model constructed directly and one configured through YAML
+    cannot drift apart. ``lr_patience``/``lr_factor`` configure
+    ``ReduceLROnPlateau``: dropping them in the v1→v2 move would silently change
+    the schedule rather than fail. ``gradient_clip_val`` is a Trainer argument and
+    therefore correctly a *backend* param — a GBDT has no use for it.
+    """
+
+    model_config = {"frozen": True, "extra": "forbid"}
+
+    lr: float = Field(default=_OPTIM_DEFAULTS.lr, gt=0.0)
+    weight_decay: float = Field(default=_OPTIM_DEFAULTS.weight_decay, ge=0.0)
+    lr_patience: int = Field(default=_OPTIM_DEFAULTS.lr_patience, ge=1)
+    lr_factor: float = Field(default=_OPTIM_DEFAULTS.lr_factor, gt=0.0, lt=1.0)
+    gradient_clip_val: float = Field(default=1.0, ge=0.0)
+
 
 CHECKPOINT_DIR = "checkpoints"
 MODEL_FILE = "model.ckpt"
@@ -149,14 +183,27 @@ class LightningBackend(BaseBackend):
 
         out = Path(run.output_dir)
         task_spec = get_task_spec(bundle.task)
+        # The backend validates its own `fit.params` — the config layer resolves
+        # only `model.params`, because doing the same for every backend would mean
+        # importing all of them to validate a YAML file.
+        fit_params = LightningFitParams.model_validate(dict(cfg.fit.params))
 
         dm = BundleDataModule.from_bundle(bundle, cfg)
         dm.setup()
         model = spec.build(
-            input_dim=bundle.input_dim,
-            output_dim=bundle.output_dim,
-            config=cfg,
-            class_weights=dm.class_weights,
+            BuildContext(
+                task=bundle.task,
+                input_dim=bundle.input_dim,
+                output_dim=bundle.output_dim,
+                n_classes=bundle.n_classes,
+                feature_schema=bundle.schema,
+                # numpy from the bundle; BaseModel converts. The adapter's tensor
+                # property exists for the loss, not for the build contract.
+                class_weights=bundle.class_weights,
+                params=cfg.model.params,
+                optim=fit_params.model_dump(),
+                seed=run.seed,
+            )
         )
         log.info("trainable params: %d", model.count_parameters())
 
@@ -164,7 +211,7 @@ class LightningBackend(BaseBackend):
         callbacks: list[Any] = [
             EarlyStopping(
                 monitor=task_spec.monitor,
-                patience=run.budget.patience or cfg.train.patience,
+                patience=run.budget.patience or cfg.fit.patience,
                 mode=task_spec.monitor_mode,
             ),
             ModelCheckpoint(
@@ -185,12 +232,12 @@ class LightningBackend(BaseBackend):
             callbacks.extend(hooks.callbacks)
 
         trainer = pl.Trainer(
-            max_epochs=run.budget.max_epochs or cfg.train.epochs,
+            max_epochs=run.budget.max_epochs or cfg.fit.budget.max_epochs,
             accelerator=run.accelerator,
             devices=run.devices,
             callbacks=callbacks,
             logger=logger,
-            gradient_clip_val=cfg.train.gradient_clip_val,
+            gradient_clip_val=fit_params.gradient_clip_val,
             deterministic=run.deterministic,
             log_every_n_steps=10,
         )
@@ -209,14 +256,16 @@ class LightningBackend(BaseBackend):
             str(best_path),
             input_dim=bundle.input_dim,
             output_dim=bundle.output_dim,
-            config=cfg,
+            task=bundle.task,
+            params=cfg.model.params,
+            optim=fit_params.model_dump(),
             class_weights=None,
         )
         estimator = LightningEstimator(
             best_model,
             bundle.task,
             checkpoint_path=best_path,
-            batch_size=cfg.train.batch_size,
+            batch_size=cfg.fit.batch_size,
         )
         return FitResult(estimator=estimator, val_metrics=val_metrics)
 
@@ -273,7 +322,7 @@ class LightningBackend(BaseBackend):
         if backend == "csv":
             from pytorch_lightning.loggers import CSVLogger
 
-            return CSVLogger(save_dir=cfg.output_dir, name="metrics")
+            return CSVLogger(save_dir=cfg.runtime.output_dir, name="metrics")
         return False
 
     # ── persistence ──
@@ -294,41 +343,37 @@ class LightningBackend(BaseBackend):
         return ArtifactRef(path=f"{target_dir.name}/{MODEL_FILE}", format=ARTIFACT_FORMAT)
 
     def load(self, bundle_dir: str | Path, manifest: Any) -> LightningEstimator:
-        """Rebuild an estimator from a bundle.
+        """Rebuild an estimator from a bundle — **manifest only**.
 
         ``load`` lives on the backend rather than the estimator because it needs
         registry access to reconstruct an architecture before weights can go into
-        it — making every estimator a registry client would drag the training
+        it; making every estimator a registry client would drag the training
         dependencies into the serving image.
 
-        The ``config.json`` read here is a transitional detail: v1's ``BaseModel``
-        takes a whole ``ExperimentConfig``. Once ``ModelSpec.build`` takes a
-        ``BuildContext``, the manifest's signature block is sufficient on its own.
+        v1's ``BaseModel`` took a whole ``ExperimentConfig``, so P1's version of
+        this method had to read ``config.json`` back and re-validate it — which
+        made loading a bundle depend on a populated plugin registry *and* on the
+        training config still being parseable by the current schema. Now the
+        manifest carries everything the architecture needs (``model.params`` and
+        the signature), and ``config.json`` is purely the audit record the plan
+        says it is.
         """
-        import json
+        import ml_framework.plugins  # noqa: F401  (a serving process may not have registered them)
 
-        from ..config import ExperimentConfig
-        from ..core.bundle import CONFIG_NAME
+        from ..core.lit_model import BaseModel
         from ..core.registry import get_model_class
 
         root = Path(bundle_dir)
-        config_path = root / CONFIG_NAME
-        if not config_path.exists():
-            raise FileNotFoundError(f"No {CONFIG_NAME} in {root}; cannot rebuild the architecture")
-        config = ExperimentConfig.model_validate(
-            json.loads(config_path.read_text(encoding="utf-8"))
-        )
-
-        import ml_framework.models  # noqa: F401  (a serving process may not have registered them)
-
-        from ..core.lit_model import BaseModel
-
         model_cls = cast("type[BaseModel]", get_model_class(manifest.model.name))
         module = model_cls.load_from_checkpoint(
             str(root / manifest.model.artifact),
             input_dim=manifest.signature.input.n_features,
             output_dim=self._output_dim(manifest),
-            config=config,
+            task=manifest.task,
+            params=manifest.model.params,
+            # Optimizer settings are a training concern; a loaded estimator only
+            # predicts, so the defaults are never consulted.
+            optim=None,
             class_weights=None,
             map_location="cpu",
         )
@@ -420,24 +465,8 @@ class LightningBackend(BaseBackend):
 
         return TrialHooks(callbacks=(PyTorchLightningPruningCallback(trial, monitor=monitor),))
 
-    def params_model(self) -> type | None:
-        """Pydantic schema for ``fit.params`` on this backend.
-
-        Includes ``lr_patience``/``lr_factor``: the ``ReduceLROnPlateau``
-        configuration is part of the fit loop, and dropping it in the v2 move
-        would silently change the schedule.
-        """
-        from pydantic import BaseModel, Field
-
-        class LightningFitParams(BaseModel):
-            model_config = {"frozen": True, "extra": "forbid"}
-
-            lr: float = Field(default=1e-3, gt=0.0)
-            weight_decay: float = Field(default=1e-4, ge=0.0)
-            lr_patience: int = Field(default=10, ge=1)
-            lr_factor: float = Field(default=0.5, gt=0.0, lt=1.0)
-            gradient_clip_val: float = Field(default=1.0, ge=0.0)
-
+    def params_model(self) -> type[PydanticModel]:
+        """Pydantic schema for ``fit.params`` on this backend."""
         return LightningFitParams
 
     def model_size(self, est: Any) -> dict[str, Any]:

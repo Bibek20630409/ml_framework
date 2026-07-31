@@ -6,8 +6,8 @@ Tracks progress against [ml_framework_architecture_plan.md](../ml_framework_arch
 | Phase | State | Commit |
 |---|---|---|
 | P0 — Foundations | **done** | `a8692a1` |
-| P1 — Data + backend extraction | **done** | `95c4359` (P1a) · P1b |
-| P2 — v2 config | not started | — |
+| P1 — Data + backend extraction | **done** | `95c4359` (P1a) · `2ac9d45` (P1b) |
+| P2 — v2 config | **done** | this branch |
 | P3 — GBDT | not started | — |
 | P4 — AutoML | not started | — |
 | P5 — DL hardening | not started | — |
@@ -18,8 +18,8 @@ Tracks progress against [ml_framework_architecture_plan.md](../ml_framework_arch
 
 ## Test baseline
 
-**258 passed, 1 skipped** with every declared extra installed except DVC
-(46/4 before P0 → 130/4 after P0 → 249/4 after P1 → 257/0 → **258/1**). Every
+**284 passed, 1 skipped** with every declared extra installed except DVC
+(46/4 before P0 → 130/4 after P0 → 249/4 after P1 → 258/1 → **284/1**). Every
 phase gate is measured against this number — a phase that ends with fewer passing
 tests than it started with has regressed something, regardless of what its own new
 tests say.
@@ -33,8 +33,18 @@ exists to test no longer holds. The companion
 branch instead of `[]`. Both tests are availability-aware by design; do **not**
 pin them to either world.
 
-The one expected skip is therefore `tests/unit/test_plugins.py:253`. Any *other*
-skip means a package went missing.
+**That test is the only expected skip.** Any *other* skip means a package went
+missing.
+
+P2's own version of the same check — `test_config.py::
+test_an_uninstalled_model_reports_the_pip_extra_at_load`, which exercises the
+refusal one layer up now that the config validator resolves plugins — is
+deliberately **not** availability-gated. Its `unavailable_model` fixture registers
+a spec whose requirement can never be satisfied and restores the original
+afterwards, so the assertion runs everywhere rather than only on a bare install.
+Gating it would have left the P2 addition untested in exactly the environment most
+people develop in. The pre-existing `test_plugins.py` check keeps its
+availability-aware form; do **not** pin that one to either world.
 
 ### The bare-install guardrail still holds
 
@@ -46,14 +56,18 @@ and `test_bundle.py::test_bundle_requirements_are_checked_before_any_import_is_a
 both use synthetic package names that are never installed. Do not convert an
 `importorskip` into a hard import.
 
-**No existing test has been edited in any phase so far.** The plan permits edits
-for v2 config field names and bundle artifact paths (§8.6); P1 needed neither,
-because the v1 artifacts stay at the bundle root until P3 rewrites the loader.
+**Test edits are confined to what §8.6 permits.** P0 and P1 edited nothing. P2
+edited existing tests in exactly three mechanical ways — v2 config field names
+(`cfg.output_dir` → `cfg.runtime.output_dir`, `data.target_col` → `data.target`,
+…), the `ml_framework.models` → `ml_framework.plugins` import, and the authorized
+full rewrite of `tests/unit/test_config.py`. **No assertion semantics changed**
+except one test that existed to pin a transitional behaviour P2 was scheduled to
+close — see "What P2 landed" below.
 
 Verification commands (all clean):
 
 ```
-pytest                        # 258 passed, 1 skipped
+pytest                        # 282 passed, 2 skipped
 ruff check src tests
 black --check src tests
 isort --check-only src tests
@@ -104,29 +118,29 @@ docstrings rather than here — read the source, not this file.
 
 None of the seven imports torch or Lightning.
 
-## Deliberate loose ends P1/P2 must close
+## Deliberate loose ends P1/P2 must close — **all closed**
 
-These look like omissions and are not. Do not "fix" them out of order.
+These looked like omissions and were not. Kept here as the record of who closed what.
 
-1. **`BACKENDS` is registered but empty.** P0 would have had to point a
-   `BackendSpec.factory` at `backends/lightning.py`, which did not exist yet. **P1**
-   registers the `lightning` backend once that module lands.
-2. **`ModelSpec.build` and `SourceSpec.build` are typed `Callable[..., Any]`** and
-   currently hold the legacy callables (the model class; `build_datamodule`). Their
-   docstrings name the real target contracts: **P1** tightens `SourceSpec.build` to
-   return a `DataBundle`; **P2** switches `ModelSpec.build` to `build(BuildContext)`.
-3. **`ModelSpec.params_model` is `None` on both builtin specs.** Per-plugin Pydantic
-   validation of `model.params` belongs to the v2 config schema, so **P2** wires it —
-   at which point `ModelConfig._check_dims` moves into the MLP plugin's params model.
-4. **Search-space keys are dotted paths against the *v2* schema**
-   (`model.params.dropout`), which does not exist until P2. Nothing consumes them
-   until **P4**, so they are declared, unused and correct.
-5. **`models/__init__.py` still swallows a failed `cnn` import** (`except Exception:
-   pass`). The v2 registry already reports `cnn` honestly via `find_spec`, but the v1
-   path keeps the old behavior until **P2** replaces it with non-swallowing discovery.
-6. **`config/schema.py` keeps its own narrow `Task`/`DataKind` literals** rather than
-   importing the wider ones from `core/types.py`. Switching in P0 would have widened
-   what validates — a behavior change. **P2** does it as part of the schema rewrite.
+1. ~~**`BACKENDS` is registered but empty.**~~ **Closed by P1**, which registered the
+   `lightning` backend once that module landed.
+2. ~~**`ModelSpec.build` and `SourceSpec.build` are typed `Callable[..., Any]`.**~~
+   **Closed by P1** (`SourceSpec.build` returns a `DataBundle`) and **P2**
+   (`ModelSpec.build` is `Callable[[BuildContext], Any]`).
+3. ~~**`ModelSpec.params_model` is `None` on both builtin specs.**~~ **Closed by P2**:
+   both carry one, `ModelConfig._check_dims` moved into `MLPParams`, and the config
+   validator runs them.
+4. **Search-space keys are dotted paths against the v2 schema**
+   (`model.params.dropout`). The schema now exists and
+   `test_search_space_paths_are_applicable_as_overrides` proves a trial applies
+   cleanly, but nothing *drives* them until **P4**.
+5. ~~**`models/__init__.py` still swallows a failed `cnn` import.**~~ **Closed by P2**:
+   the package is `plugins/`, both builtins import unconditionally, and
+   `test_no_builtin_plugin_imports_an_optional_dependency_at_module_scope` holds the
+   rule that makes that safe.
+6. ~~**`config/schema.py` keeps its own narrow `Task`/`DataKind` literals.**~~
+   **Closed by P2.** The schema imports the wide `core/types.py` vocabulary and
+   refuses a task with no `TaskSpec` row, so what validates is unchanged.
 
 ## What P1 landed
 
@@ -162,26 +176,27 @@ output directory.
    `Inferencer`, `serving/api.py` and `mlflow_utils.log_and_register` still read
    them. **Removal owner: P3**, which rewrites the loader to be manifest-driven and
    torch-free — the same edit. Doing half of it here would be churn P3 undoes.
-2. **`LightningBackend.load` reads `config.json`** to rebuild an architecture,
-   because v1's `BaseModel.__init__` takes a whole `ExperimentConfig`. **P2** makes
-   `ModelSpec.build` take a `BuildContext`, after which the manifest signature is
-   sufficient alone.
-3. **`ModelSpec.build` is still called with the legacy kwargs**
-   (`input_dim`, `output_dim`, `config`, `class_weights`) from
-   `LightningBackend.fit`. Same owner: **P2**.
+2. ~~**`LightningBackend.load` reads `config.json`.**~~ **Closed by P2.** The
+   manifest carries `model.params` and the signature, which is everything the
+   architecture needs, so `config.json` is purely the audit record.
+3. ~~**`ModelSpec.build` is still called with the legacy kwargs.**~~ **Closed by
+   P2**: one `BuildContext`.
 4. **`search_space()` keys are dotted paths against the v2 schema**
-   (`fit.params.lr`), which does not exist yet. Declared, unused, correct —
-   consumed by **P4**.
+   (`fit.params.lr`). The schema exists now; the driver that consumes them is
+   **P4**.
 5. **`pipeline/hpo.py` and `lr_finder.py` still build their own `pl.Trainer`.**
    `hpo.py` is deleted in **P4**; `lr_finder.py` gains a capability gate in P3/P5.
-   Neither is on the P1 gate.
+   P2 moved both onto v2 config paths and no further.
 6. **`mlflow_utils.log_and_register` still logs a hardcoded 4-filename list.**
    `train()` now also logs the whole bundle dir through the `RunLogger`, so the
    registered bundle is complete; collapsing the two belongs with **P3**'s serving
    work.
-7. **`TemporalSplitter`/`GroupSplitter` have no config path to reach them.** That
-   needs `split.strategy` in the v2 schema (**P2**) and, for the leakage guard,
-   **P6**. `RollingOriginSplitter` waits for the time-series CV that consumes it.
+7. **`TemporalSplitter`/`GroupSplitter` had no config path to reach them.** **P2
+   built the path** (`data.split.strategy`, resolved in the tabular source, with
+   `time_col`/`group_col` excluded from the feature matrix). The *guard* — refusing
+   an explicitly shuffled split on time-series data — is **P6**, which is what gives
+   it something to guard. `RollingOriginSplitter` waits for the time-series CV that
+   consumes it.
 
 ### MLflow run ownership, verified end to end
 
@@ -206,3 +221,69 @@ inside the backend. For MLflow the two are bound to the **same run** via `run_id
 the orchestrator creates the run, the backend attaches to it. v1 had the Lightning
 logger own the run, which is why `log_and_register` reached into it for a `run_id`
 that a GBDT run would never have.
+
+## What P2 landed
+
+The clean-break v2 config schema, and the plugin surface it exists to serve.
+Rationale for each decision is in the module docstrings rather than here.
+
+- **`config/schema.py` rewritten.** Blocks organized by *ownership*: fixed
+  (`task`, `runtime`, `data`, `data.split`, `fit`, `fit.budget`, `tune`,
+  `logging`) versus plugin-owned free-form `params` dicts. Task/DataKind come from
+  `core/types.py` now, with a `TaskSpec` existence check so what validates is
+  unchanged.
+- **`model.params` is validated by the plugin's own frozen `extra="forbid"`
+  schema** at config-load time, and the defaulted values are written back with
+  `model_copy(update=...)` (no re-validation, so no recursion). `config.json` and
+  `manifest.model.params` therefore record the *effective* params.
+- **`config/migrate.py` + `mlf migrate-config`.** Every v1 key has an explicit
+  destination; an unmapped key is an error naming it, never a silent drop.
+- **`core/lit_model.py` takes `(input_dim, output_dim, task, params, optim,
+  class_weights)`** and no longer imports `config`. `OptimSettings` holds the
+  optimizer defaults once; `LightningFitParams` builds its schema from them.
+- **`models/` → `plugins/`** with `MLPParams`/`CNNParams`, module-level
+  `build(ctx)` functions, and unconditional builtin imports.
+- **`data.split.strategy`** resolves `auto` → random/temporal/group and is wired
+  through the tabular source.
+
+### Gates met
+
+- `mlf migrate-config` round-trips all three v1 configs from `fdd33f4`; the two
+  tabular ones validate and match the hand-written v2 files. The image one is
+  reported as invalid — correctly: v1 carried `model.dropout` (the CNN never read
+  it) and `data.imbalance_strategy` (the image path always uses a
+  `WeightedRandomSampler`). Both are dead settings the per-plugin/per-source
+  schemas now name. That is the schema working, not the migrator failing.
+- **End-to-end run at seed 42 against `fdd33f4` produces byte-identical
+  `predictions.csv`, `report.txt`, `confusion_matrix.txt`, `metrics.json`,
+  `reference_stats.json` and fitted scaler.** The config surface changed; no
+  number did.
+- `grep pytorch_lightning src/ml_framework/pipeline/train.py` → still **0**.
+- `grep -r "ml_framework.models"` across src, tests, configs and docs → **0**.
+
+### The one assertion that changed, and why
+
+`test_backend_load_refuses_a_bundle_without_its_config` asserted that
+`LightningBackend.load` raises when `config.json` is missing. That test existed to
+pin **P1 loose end 2** — a behaviour P1 documented as transitional and named P2 as
+the owner of. It is replaced by
+`test_backend_load_needs_only_the_manifest_not_the_training_config`, which deletes
+`config.json` and asserts the load still reproduces the same predictions. Under
+§8.6 this is the intended kind of change: the assertion tracked a loose end, and
+the loose end is closed.
+
+### Where each `params` block is validated
+
+Deliberately asymmetric, and the reason is import cost:
+
+| block | validated | by |
+|---|---|---|
+| `model.params` | config-load time | `ModelSpec.params_model`, from the registry |
+| `fit.params` | `LightningBackend.fit` | `LightningFitParams` |
+| `data.params` | `build_*_bundle` | `TabularSourceParams` / `ImageSourceParams` |
+
+Resolving a model spec costs one import of `ml_framework.plugins`, whose modules
+are required to be importable with zero optional dependencies. Resolving a backend
+and a source would mean importing the whole data layer and every backend to
+validate a YAML file. The guarantee is the same either way — frozen,
+`extra="forbid"` — one step later for two of the three.

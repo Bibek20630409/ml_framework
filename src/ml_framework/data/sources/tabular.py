@@ -15,20 +15,29 @@ because serving computes drift on the raw features clients send. SMOTE runs
 high-variance column dominate the distance metric. Both were deliberate in v1.
 
 No Lightning here, and no DataLoader: what comes out is arrays plus a schema.
+
+:class:`TabularSourceParams` validates ``data.params`` — frozen and
+``extra="forbid"``, so ``imbalance_strategy: smoate`` is an error rather than a
+silently ignored key. It is run here rather than in the config validator because
+resolving a source's schema from there would mean importing the whole data layer
+to validate a YAML file (see ``config/schema.py``).
 """
 
 from __future__ import annotations
 
 import logging
 from pathlib import Path
+from typing import Any, Literal
 
 import numpy as np
 import pandas as pd
+from pydantic import BaseModel as PydanticModel
+from pydantic import Field
 
 from ...core.plugins import check_requirements
 from ...core.types import FrameworkError, Requirement
 from ..preprocess.tabular import TabularPreprocessor, resolve_imbalance
-from ..splitters import RandomSplitter
+from ..splitters import GroupSplitter, RandomSplitter, SplitError, TemporalSplitter
 from ..types import DataBundle, FeatureSchema, Split
 
 log = logging.getLogger(__name__)
@@ -40,6 +49,18 @@ log = logging.getLogger(__name__)
 # command, not with a pandas ImportError, in exactly the environment where the
 # dependency is most likely absent — a serving image built without the mlops extra.
 PARQUET_REQUIREMENT = Requirement("pyarrow", extra="parquet", min_version="10.0.1")
+
+
+class TabularSourceParams(PydanticModel):
+    """``data.params`` for the tabular source."""
+
+    model_config = {"frozen": True, "extra": "forbid"}
+
+    imbalance_strategy: Literal["smote", "class_weights", "none"] = "smote"
+    imbalance_threshold: float = Field(default=0.3, gt=0.0, le=1.0)
+    # n >= this → plain holdout; below it a 5-fold cut yields a larger, more
+    # stable training set than carving 30% off the top.
+    holdout_threshold: int = Field(default=5000, gt=0)
 
 
 def read_table(path: str) -> pd.DataFrame:
@@ -56,29 +77,69 @@ def read_table(path: str) -> pd.DataFrame:
     return pd.read_csv(path)
 
 
+def build_splitter(config, params: TabularSourceParams) -> Any:
+    """The splitter ``data.split`` asks for, with ``auto`` already resolved.
+
+    Existing only for ``random`` would make ``strategy`` decoration: the temporal
+    and group splitters were written in P1 with no config path to reach them, and
+    this is that path. Their *guard* — refusing an explicitly shuffled split on
+    time-series data — belongs with the forecasting work that gives it something
+    to guard.
+    """
+    split = config.data.split
+    strategy = split.resolved_strategy(config.data.kind)
+    log.info("split strategy=%s (declared: %s)", strategy, split.strategy)
+
+    if strategy == "random":
+        return RandomSplitter(
+            seed=config.runtime.seed,
+            task=config.task,
+            val_size=split.val_size,
+            test_size=split.test_size,
+            holdout_threshold=params.holdout_threshold,
+        )
+    if strategy == "temporal":
+        return TemporalSplitter(val_size=split.val_size, test_size=split.test_size, gap=split.gap)
+    if strategy == "group":
+        return GroupSplitter(
+            seed=config.runtime.seed, val_size=split.val_size, test_size=split.test_size
+        )
+    raise SplitError(f"Unknown split strategy '{strategy}'")
+
+
 def build_tabular_bundle(config) -> DataBundle:
     """Materialize a tabular :class:`DataBundle` from a validated config."""
-    if config.data.csv_path is None:
-        raise ValueError("tabular data requires data.csv_path")
-    df = read_table(config.data.csv_path)
-    target = config.data.target_col
-    if target not in df.columns:
-        raise KeyError(f"target_col '{target}' not in CSV columns")
+    if config.data.path is None:
+        raise ValueError("tabular data requires data.path")
+    params = TabularSourceParams.model_validate(dict(config.data.params))
 
-    feature_cols = [c for c in df.columns if c != target]
+    df = read_table(config.data.path)
+    target = config.data.target
+    if target not in df.columns:
+        raise KeyError(f"data.target '{target}' not in the table's columns")
+
+    split_cfg = config.data.split
+    # The ordering/grouping columns are inputs to the *split*, not features.
+    # Leaving them in would let the model read the timestamp it is supposed to be
+    # generalizing across.
+    reserved = {target, split_cfg.time_col, split_cfg.group_col} - {None}
+    for name in (split_cfg.time_col, split_cfg.group_col):
+        if name is not None and name not in df.columns:
+            raise KeyError(f"split column '{name}' not in the table's columns")
+
+    feature_cols = [c for c in df.columns if c not in reserved]
     if not feature_cols:
-        raise FrameworkError(f"'{config.data.csv_path}' has no feature columns besides '{target}'")
+        raise FrameworkError(f"'{config.data.path}' has no feature columns besides '{target}'")
     x = df[feature_cols].values.astype("float32")
     y = df[target].values
     y = y.astype("int64") if config.task != "regression" else y.astype("float32")
 
-    parts = RandomSplitter(
-        seed=config.seed,
-        task=config.task,
-        val_size=config.data.val_size,
-        test_size=config.data.test_size,
-        holdout_threshold=config.data.holdout_threshold,
-    ).split(len(x), y=y)
+    parts = build_splitter(config, params).split(
+        len(x),
+        y=y,
+        time=df[split_cfg.time_col].values if split_cfg.time_col else None,
+        groups=df[split_cfg.group_col].values if split_cfg.group_col else None,
+    )
 
     x_train, y_train = x[parts.train], y[parts.train]
     x_val, y_val = x[parts.val], y[parts.val]
@@ -99,9 +160,9 @@ def build_tabular_bundle(config) -> DataBundle:
         x_train,
         y_train,
         task=config.task,
-        strategy=config.data.imbalance_strategy,
-        threshold=config.data.imbalance_threshold,
-        seed=config.seed,
+        strategy=params.imbalance_strategy,
+        threshold=params.imbalance_threshold,
+        seed=config.runtime.seed,
     )
 
     # Head convention, unchanged from v1: binary is a single logit
@@ -117,6 +178,7 @@ def build_tabular_bundle(config) -> DataBundle:
         dtypes={c: str(df[c].dtype) for c in feature_cols},
         target_name=target,
         class_names=tuple(config.data.class_names) if config.data.class_names else None,
+        time_col=split_cfg.time_col,
     )
     log.info("input_dim=%d output_dim=%d", input_dim, output_dim)
 

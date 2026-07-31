@@ -1,37 +1,49 @@
-# ── Example image experiment config ──────────────────────────────────
+# ── Example image experiment config (schema v2) ──────────────────────
 # Load with:  mlf train --config configs/example_image.yaml
+#
+# Two v1 keys are deliberately gone, and both were dead settings the shared v1
+# ModelConfig/DataConfig carried for every run regardless of kind:
+#   * model.dropout            — the CNN never read it
+#   * data.imbalance_strategy  — the image path corrects imbalance with a
+#                                WeightedRandomSampler regardless of its value
+# The per-plugin, per-source schemas now say so instead of accepting them.
 
 task: multiclass
-seed: 42
-output_dir: outputs
+
+runtime:
+  seed: 42
+  output_dir: outputs
+  num_workers: -1
+  deterministic: true
 
 data:
   kind: image
-  train_dir: data/train
-  # val_dir: data/val          # optional — auto-split from train if absent
-  test_dir: data/test
-  img_size: 224
-  imbalance_strategy: class_weights   # image path uses WeightedRandomSampler regardless
+  path: data/train             # the training image folder (ImageFolder layout)
+  split:
+    val_size: 0.15             # used only when params.val_dir is absent
+    test_size: 0.15
+  params:                      # validated by the image source
+    test_dir: data/test
+    # val_dir: data/val        # optional — auto-split from `path` if absent
+    img_size: 224
 
 model:
   name: cnn
-  backbone: resnet18           # torchvision backbone
-  pretrained: true
-  dropout: 0.3
+  params:
+    backbone: resnet18         # torchvision backbone
+    pretrained: true
 
-optim:
-  lr: 0.0003
-  weight_decay: 0.0001
-  lr_patience: 5
-  lr_factor: 0.5
-
-train:
-  epochs: 50
-  batch_size: 32
-  num_workers: -1
+fit:
+  budget:
+    max_epochs: 50
   patience: 10
-  gradient_clip_val: 1.0
-  deterministic: true
+  batch_size: 32
+  params:
+    lr: 0.0003
+    weight_decay: 0.0001
+    lr_patience: 5
+    lr_factor: 0.5
+    gradient_clip_val: 1.0
 
 logging:
   backend: csv

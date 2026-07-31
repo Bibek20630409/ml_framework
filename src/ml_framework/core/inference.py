@@ -22,15 +22,18 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 import numpy as np
 import torch
 import torch.nn as nn
 
-from ..config import ExperimentConfig
 from .lit_model import BaseModel
 from .registry import get_model_class
+
+if TYPE_CHECKING:  # `core` is imported *by* the config layer's plugin resolution,
+    # so a module-scope import here is a cycle. P3 removes the dependency outright.
+    from ..config import ExperimentConfig
 
 log = logging.getLogger(__name__)
 
@@ -60,7 +63,9 @@ class Inferencer:
 
         # Ensure the built-in models/datamodules are registered — a standalone
         # serving process may not have imported them yet.
-        import ml_framework.models  # noqa: F401
+        import ml_framework.plugins  # noqa: F401
+
+        from ..config import ExperimentConfig
 
         art = Path(artifact_dir)
         meta_path = art / "metadata.json"
@@ -75,7 +80,9 @@ class Inferencer:
             str(ckpt_path),
             input_dim=meta["input_dim"],
             output_dim=meta["output_dim"],
-            config=config,
+            task=config.task,
+            params=config.model.params,
+            optim=config.fit.params,
             class_weights=None,
             map_location="cpu",
         )

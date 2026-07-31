@@ -21,14 +21,14 @@ Extras: `image`, `serve`, `hpo`, `diagnostics`, `logging`, `dev`.
 ## Quickstart
 
 1. **Write one YAML config** (copy `configs/example_tabular.yaml`). Set `task`,
-   `data.csv_path`, `data.target_col`. That's the only file you edit per project.
+   `data.path`, `data.target`. That's the only file you edit per project.
 
-2. **Learning rate** — find a good LR, paste into `optim.lr`:
+2. **Learning rate** — find a good LR, paste into `fit.params.lr`:
    ```bash
    mlf lr --config configs/example_tabular.yaml
    ```
 
-3. **HPO** — search architecture, paste `model.hidden_dims`/`dropout`/`lr`/`weight_decay`:
+3. **HPO** — search architecture, paste the printed `model.params.*` / `fit.params.*`:
    ```bash
    mlf hpo --config configs/example_tabular.yaml
    ```
@@ -37,7 +37,7 @@ Extras: `image`, `serve`, `hpo`, `diagnostics`, `logging`, `dev`.
    ```bash
    mlf train --config configs/example_tabular.yaml
    # override anything inline:
-   mlf train --config configs/example_tabular.yaml --set train.epochs=5 --set optim.lr=3e-4
+   mlf train -c configs/example_tabular.yaml --set fit.budget.max_epochs=5 --set fit.params.lr=3e-4
    ```
 
 5. **Serve**:
@@ -47,51 +47,110 @@ Extras: `image`, `serve`, `hpo`, `diagnostics`, `logging`, `dev`.
         -d '{"instances": [[0.1, 0.2, 0.3, 0.4]]}'
    ```
 
+### Config schema v2
+
+The config is organized by *ownership*: fixed blocks for what the framework owns
+(`task`, `runtime`, `data`, `fit`, `tune`, `logging`) and free-form `params`
+sub-dicts for what a plugin owns.
+
+| block | holds | validated by |
+|---|---|---|
+| `runtime` | seed, output_dir, workers, accelerator, precision | the schema |
+| `data` | kind, path, target, `split.*` | the schema |
+| `data.params` | source-specific knobs (imbalance, img_size…) | the data source |
+| `model.params` | architecture knobs (hidden_dims, backbone…) | the model plugin |
+| `fit` | budget, patience, batch_size | the schema |
+| `fit.params` | loop knobs (lr, weight_decay, LR schedule, clipping) | the backend |
+
+`params` blocks are free-form in core and **strict** in the plugin — each ships a
+frozen `extra="forbid"` schema, so a typo is still an error at config-load time,
+while a third-party plugin never has to edit `config/schema.py`.
+
+Coming from a v1 config, convert it mechanically:
+
+```bash
+mlf migrate-config -i configs/old.yaml -o configs/new.yaml
+```
+
+It refuses to drop a key it cannot map, and validates the result before writing.
+
 ## Project structure
 
 ```
 src/ml_framework/
-├── config/schema.py     Pydantic ExperimentConfig (validated, frozen)
+├── config/              schema.py (v2 ExperimentConfig) · migrate.py (v1 → v2)
 ├── core/                framework internals — you rarely touch these
+│   ├── types.py         Task/DataKind vocabulary, Requirement, Capabilities
+│   ├── protocols.py     Estimator · TrainingBackend · Preprocessor · Splitter
+│   ├── plugins.py       PluginRegistry, ModelSpec/BackendSpec/SourceSpec
+│   ├── task.py          TaskSpec table: metric, direction, monitor, postprocess
+│   ├── bundle.py        artifact bundle v2 + manifest.json
 │   ├── lit_model.py     BaseModel: steps, metrics, loss, optimizer
-│   ├── lit_data.py      Tabular/Image DataModules: split, scale, imbalance
 │   ├── evaluate.py      report.txt · predictions.csv · confusion_matrix.txt
 │   ├── inference.py     Inferencer.from_artifacts(dir)
-│   └── registry.py      @register_model / @register_datamodule
-├── models/              mlp.py (tabular), cnn.py (image transfer learning)
-├── data/builders.py     config → datamodule/model factory
+│   └── registry.py      MODELS / BACKENDS / SOURCES
+├── backends/            one per fit-loop shape — lightning.py owns pl.Trainer
+├── plugins/             mlp.py (tabular), cnn.py (image transfer learning)
+├── data/                sources · preprocess · splitters · lightning_adapter
 ├── pipeline/            train · hpo · lr_finder
 ├── serving/api.py       FastAPI: /health /predict /predict_proba
 ├── utils/               logging, seed, platform-aware workers
 └── cli.py               `mlf` entry point
 configs/                 example_tabular.yaml · example_image.yaml
-tests/                   unit · integration · serving
+tests/                   unit · integration · serving · backends · data
 ```
 
 ## Extending (scalability)
 
-Add a new model or data source without touching the pipeline — just register it:
+Add a new model without touching the pipeline. A plugin is a params schema, a
+network, and a spec:
 
 ```python
-from ml_framework.core import register_model, BaseModel
+from pydantic import BaseModel as PydanticModel
+from ml_framework.core import BaseModel, ModelSpec, register_model, register_model_spec
+
+class MyNetParams(PydanticModel):
+    model_config = {"frozen": True, "extra": "forbid"}
+    width: int = 64
 
 @register_model("my_net")
 class MyNet(BaseModel):
+    @classmethod
+    def params_model(cls): return MyNetParams
     def build_network(self):
-        ...   # uses self.input_dim, self.output_dim, self.config.model
+        ...   # uses self.input_dim, self.output_dim, self.params.width
+
+def build(ctx):
+    return MyNet(input_dim=ctx.input_dim, output_dim=ctx.output_dim, task=ctx.task,
+                 params=ctx.params, optim=ctx.optim, class_weights=ctx.class_weights)
+
+register_model_spec(ModelSpec(
+    name="my_net", backend="lightning", build=build, params_model=MyNetParams,
+    tasks=frozenset({"binary", "multiclass"}), data_kinds=frozenset({"tabular"}),
+))
 ```
 
-Then set `model.name: my_net` in the YAML. Same pattern for `@register_datamodule`.
+Then set `model.name: my_net` in the YAML. The spec is what makes the model
+introspectable: its tasks, data kinds, optional-dependency requirements and search
+space are all declared rather than discovered by branching somewhere else. Keep
+heavy imports **inside** `build_network()` so the module stays importable — and the
+plugin listable — on an install without its extra. Data sources register the same
+way with `SourceSpec`.
 
 ## What runs automatically
 
 - Train/val/test split (holdout for large data, KFold-derived for small; **KFold for
-  regression** to avoid stratification crashes)
+  regression** to avoid stratification crashes). Set `data.split.time_col` or
+  `group_col` and `strategy: auto` switches to a temporal or grouped split — the two
+  leakage modes a shuffled split hides
 - Scaling (`StandardScaler`, fit on train only), persisted for inference
 - Imbalance handling — one explicit strategy: `smote | class_weights | none`
 - Gradient clipping, early stopping, best-checkpointing, LR scheduling
 - Metrics + CSV/WandB logging; final report, predictions, confusion matrix
-- Self-contained artifact bundle: `model.ckpt · scaler.pkl · metadata.json`
+- Self-contained artifact bundle v2: `manifest.json` (the only file a loader must
+  understand) · `config.json` · `model/` · `preprocessor/` · `metrics.json` ·
+  `report.txt` · `predictions.csv`. The v1 root files (`model.ckpt`, `scaler.pkl`,
+  `metadata.json`) are still written for the current loader
 
 ## Task reference
 

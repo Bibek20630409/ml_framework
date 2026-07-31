@@ -9,7 +9,7 @@ from ml_framework.serving.api import create_app
 def trained_app(tabular_csv, make_config):
     cfg = make_config(tabular_csv, "multiclass")
     train(cfg)
-    return create_app(cfg.output_dir)
+    return create_app(cfg.runtime.output_dir)
 
 
 @pytest.mark.serving

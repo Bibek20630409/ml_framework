@@ -2,7 +2,7 @@
 pipeline/lr_finder.py
 ─────────────────────
 LR range test (run once before training). Saves a plot and prints a suggested
-learning rate to paste into ``optim.lr`` in the YAML config.
+learning rate to paste into ``fit.params.lr`` in the YAML config.
 """
 
 from __future__ import annotations
@@ -14,6 +14,7 @@ import torch
 import torch.nn as nn
 
 from ..config import ExperimentConfig
+from ..core.lit_model import OptimSettings
 from ..data import build_datamodule, build_model
 
 log = logging.getLogger(__name__)
@@ -28,7 +29,7 @@ _CRITERION = {
 def find_lr(config: ExperimentConfig) -> float:
     from torch_lr_finder import LRFinder  # optional dep
 
-    out = Path(config.output_dir)
+    out = Path(config.runtime.output_dir)
     out.mkdir(parents=True, exist_ok=True)
 
     dm = build_datamodule(config)
@@ -37,9 +38,8 @@ def find_lr(config: ExperimentConfig) -> float:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
-    optimizer = torch.optim.Adam(
-        model.parameters(), lr=1e-7, weight_decay=config.optim.weight_decay
-    )
+    optim = OptimSettings.from_mapping(config.fit.params)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-7, weight_decay=optim.weight_decay)
     criterion = _CRITERION[config.task]()
 
     finder = LRFinder(model, optimizer, criterion, device=device)
@@ -51,6 +51,6 @@ def find_lr(config: ExperimentConfig) -> float:
     losses = finder.history["loss"]
     lrs = finder.history["lr"]
     suggested = lrs[losses.index(min(losses))] / 10
-    log.info("suggested LR: %.2e (set optim.lr in your YAML)", suggested)
+    log.info("suggested LR: %.2e (set fit.params.lr in your YAML)", suggested)
     finder.reset()
     return suggested

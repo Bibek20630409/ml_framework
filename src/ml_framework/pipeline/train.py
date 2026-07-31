@@ -12,7 +12,7 @@ grepping this file for the Lightning package name finds nothing — v1 construct
 estimator could enter the pipeline at any price. (The phase gate greps for the
 literal module name, so this file must not spell it out, even in prose.)
 
-Produces an artifact bundle v2 in ``config.output_dir``:
+Produces an artifact bundle v2 in ``config.runtime.output_dir``:
 
     manifest.json · config.json · model/ · preprocessor/ · metrics.json
     reference_stats.json · report.txt · confusion_matrix.txt · predictions.csv · training.log
@@ -60,10 +60,10 @@ log = logging.getLogger(__name__)
 
 
 def train(config: ExperimentConfig) -> dict:
-    out = Path(config.output_dir)
+    out = Path(config.runtime.output_dir)
     out.mkdir(parents=True, exist_ok=True)
     setup_logging(out)
-    seed_everything(config.seed, workers=True)
+    seed_everything(config.runtime.seed, workers=True)
     log.info("task=%s model=%s data=%s", config.task, config.model.name, config.data.kind)
 
     # Fails here — with a pip command or an explanation of why the combination
@@ -85,10 +85,13 @@ def train(config: ExperimentConfig) -> dict:
     )
     run = RunContext(
         output_dir=out,
-        seed=config.seed,
+        seed=config.runtime.seed,
         budget=resolve_budget(config),
         run_logger=run_logger,
-        deterministic=config.train.deterministic,
+        accelerator=config.runtime.accelerator,
+        devices=config.runtime.devices,
+        precision=config.runtime.precision,
+        deterministic=config.runtime.deterministic,
     )
 
     try:
@@ -197,7 +200,9 @@ def _build_manifest(
             backend=spec.backend,
             artifact=artifact.path,
             format=artifact.format,
-            params=config.model.model_dump(),
+            # The architecture params only — post-defaults, so `backend.load()`
+            # can rebuild the network from the manifest without config.json.
+            params=dict(config.model.params),
             size=size or None,
         ),
         signature=Signature(

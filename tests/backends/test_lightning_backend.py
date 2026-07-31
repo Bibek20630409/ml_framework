@@ -26,7 +26,7 @@ def fitted(tabular_csv, make_config):
     cfg = make_config(tabular_csv, "multiclass")
     bundle = build_bundle(cfg)
     backend = LightningBackend()
-    run = RunContext(output_dir=Path(cfg.output_dir), seed=cfg.seed)
+    run = RunContext(output_dir=Path(cfg.runtime.output_dir), seed=cfg.runtime.seed)
     result = backend.fit(MODELS.get("mlp"), bundle, cfg, run=run)
     return backend, result, bundle, cfg
 
@@ -146,7 +146,7 @@ def test_fit_returns_an_estimator_holding_its_best_checkpoint(fitted):
     est = result.estimator
     assert isinstance(est, LightningEstimator)
     assert est.checkpoint_path is not None and est.checkpoint_path.exists()
-    assert est.checkpoint_path.parent == Path(cfg.output_dir) / "checkpoints"
+    assert est.checkpoint_path.parent == Path(cfg.runtime.output_dir) / "checkpoints"
 
 
 @pytest.mark.integration
@@ -212,7 +212,7 @@ def test_backend_load_reproduces_the_trained_predictions(tabular_csv, make_confi
     cfg = make_config(tabular_csv, "multiclass")
     train(cfg)
 
-    out = Path(cfg.output_dir)
+    out = Path(cfg.runtime.output_dir)
     manifest = read_manifest(out)
     backend = get_backend(manifest.model.backend)
     est = backend.load(out, manifest)
@@ -225,17 +225,36 @@ def test_backend_load_reproduces_the_trained_predictions(tabular_csv, make_confi
 
 
 @pytest.mark.integration
-def test_backend_load_refuses_a_bundle_without_its_config(tmp_path, tabular_csv, make_config):
+def test_backend_load_needs_only_the_manifest_not_the_training_config(tabular_csv, make_config):
+    """P1's `load` re-validated config.json to rebuild the architecture, because
+    v1's BaseModel took a whole ExperimentConfig. That made loading a bundle depend
+    on the training config still parsing under the current schema. The manifest now
+    carries `model.params` and the signature, which is everything the network
+    needs — and config.json goes back to being purely the audit record."""
     from ml_framework.pipeline import train
 
     cfg = make_config(tabular_csv, "multiclass")
     train(cfg)
-    out = Path(cfg.output_dir)
-    manifest = read_manifest(out)
-    (out / "config.json").unlink()
 
-    with pytest.raises(FileNotFoundError, match="cannot rebuild the architecture"):
-        get_backend("lightning").load(out, manifest)
+    out = Path(cfg.runtime.output_dir)
+    manifest = read_manifest(out)
+    expected = get_backend("lightning").load(out, manifest).predict(build_bundle(cfg).test.x)
+
+    (out / "config.json").unlink()
+    est = get_backend("lightning").load(out, manifest)
+    assert np.array_equal(est.predict(build_bundle(cfg).test.x), expected)
+
+
+@pytest.mark.integration
+def test_manifest_records_the_effective_model_params(tabular_csv, make_config):
+    """Which is what makes the load above possible: post-defaults params, not the
+    subset the user happened to type."""
+    from ml_framework.pipeline import train
+
+    cfg = make_config(tabular_csv, "multiclass")
+    train(cfg)
+    params = read_manifest(Path(cfg.runtime.output_dir)).model.params
+    assert set(params) == {"hidden_dims", "dropout"}
 
 
 # ── Logger wiring ─────────────────────────────────────────
@@ -264,7 +283,7 @@ def test_mlflow_logger_attaches_to_the_orchestrators_run(monkeypatch, tabular_cs
         run_id = "run-abc123"
 
     cfg = make_config(tabular_csv, "multiclass", **{"logging.backend": "mlflow"})
-    run = RunContext(output_dir=Path(cfg.output_dir), run_logger=_RunLogger())
+    run = RunContext(output_dir=Path(cfg.runtime.output_dir), run_logger=_RunLogger())
     logger = LightningBackend()._build_logger(cfg, run)
 
     assert isinstance(logger, _FakeMLFlowLogger)
@@ -276,7 +295,7 @@ def test_mlflow_logger_attaches_to_the_orchestrators_run(monkeypatch, tabular_cs
 @pytest.mark.unit
 def test_no_lightning_logger_when_tracking_is_disabled(tabular_csv, make_config):
     cfg = make_config(tabular_csv, "multiclass")  # logging.backend == "none"
-    run = RunContext(output_dir=Path(cfg.output_dir))
+    run = RunContext(output_dir=Path(cfg.runtime.output_dir))
     assert LightningBackend()._build_logger(cfg, run) is False
 
 

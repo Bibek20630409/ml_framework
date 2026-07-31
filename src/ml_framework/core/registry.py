@@ -17,17 +17,18 @@ pipeline still runs on and is unchanged.
 
 *v2* (:data:`MODELS` / :data:`BACKENDS` / :data:`SOURCES`) are spec-carrying
 :class:`~ml_framework.core.plugins.PluginRegistry` instances holding capabilities,
-optional-dependency requirements and search spaces. They are *populated* now and
-*consumed* from P1 onward, at which point the v1 functions become thin shims over
-them. Registering into both is deliberate: it keeps behavior identical while the
-new consumers are built.
+optional-dependency requirements, params schemas and search spaces. They are what
+the config validator, the orchestrator and the backends consume.
+
+The v1 class registry survives for one reason: ``load_from_checkpoint`` is a
+*classmethod*, so rebuilding a Lightning model from a bundle needs the class
+itself, not a build callable. A plugin registers both, one line apart.
 
 Who populates the v2 registries:
-  * ``models/__init__.py``      → :data:`MODELS` (mlp, cnn)
+  * ``plugins/__init__.py``     → :data:`MODELS` (mlp, cnn) + entry-point discovery
   * ``data/builders.py``        → :data:`SOURCES` (tabular, image)
-  * ``backends/lightning.py``   → :data:`BACKENDS` (arrives in P1; the registry is
-    intentionally empty until a real backend exists, rather than holding a spec
-    that points at a module nobody has written yet)
+  * ``backends/__init__.py``    → :data:`BACKENDS` (lightning), via a lazy factory
+    so registering never imports torch
 """
 
 from __future__ import annotations

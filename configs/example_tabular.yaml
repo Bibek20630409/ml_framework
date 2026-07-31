@@ -1,46 +1,65 @@
-# ── Example tabular experiment config ────────────────────────────────
-# This is the only file you edit per project (plus optional custom models).
+# ── Example tabular experiment config (schema v2) ────────────────────
+# This is the only file you edit per project (plus optional custom plugins).
 # Load with:  mlf train --config configs/example_tabular.yaml
+# Coming from a v1 config?  mlf migrate-config -i old.yaml -o new.yaml
 
 task: multiclass          # binary | multiclass | regression
-seed: 42
-output_dir: outputs
+
+runtime:
+  seed: 42
+  output_dir: outputs
+  num_workers: -1                   # -1 → auto (0 on Windows, 4 elsewhere)
+  accelerator: auto
+  devices: auto
+  precision: "32"
+  deterministic: true
 
 data:
   kind: tabular
-  csv_path: data.csv
-  target_col: label
+  path: data.csv                    # CSV, Parquet file, or Parquet directory
+  target: label
   # class_names: [cat, dog, bird]   # optional, for readable reports
-  val_size: 0.15
-  test_size: 0.15
-  holdout_threshold: 5000           # n >= this → holdout, else KFold-derived split
-  imbalance_strategy: smote         # smote | class_weights | none
-  imbalance_threshold: 0.3
+  split:
+    strategy: auto                  # auto | random | temporal | group
+    val_size: 0.15
+    test_size: 0.15
+    # time_col: date                # set → `auto` becomes a temporal split
+    # group_col: patient_id         # set → `auto` becomes a grouped split
+    gap: 0
+  params:                           # validated by the tabular source
+    imbalance_strategy: smote       # smote | class_weights | none
+    imbalance_threshold: 0.3
+    holdout_threshold: 5000         # n >= this → holdout, else KFold-derived split
 
 model:
   name: mlp                         # registry key (mlp | cnn)
-  hidden_dims: [128, 64, 32]        # paste tuned values from `mlf hpo`
-  dropout: 0.3
+  params:                           # validated by the plugin's own schema
+    hidden_dims: [128, 64, 32]      # paste tuned values from `mlf hpo`
+    dropout: 0.3
 
-optim:
-  lr: 0.001                         # paste tuned value from `mlf lr`
-  weight_decay: 0.0001
-  lr_patience: 10
-  lr_factor: 0.5
-
-train:
-  epochs: 200
+fit:
+  budget:
+    max_epochs: 200
+    max_seconds: null
+  patience: 20                      # early stopping
   batch_size: 32
-  num_workers: -1                   # -1 → auto (0 on Windows, 4 elsewhere)
-  patience: 20
-  gradient_clip_val: 1.0
-  deterministic: true
+  params:                           # validated by the backend (lightning)
+    lr: 0.001                       # paste tuned value from `mlf lr`
+    weight_decay: 0.0001
+    lr_patience: 10                 # ReduceLROnPlateau
+    lr_factor: 0.5
+    gradient_clip_val: 1.0
+
+tune:
+  enabled: true
+  max_trials: 20
+  max_seconds: 900
+  metric: null                      # null → the task's primary metric
+  refit: best                       # best | reuse
+  overrides: {}                     # narrow a plugin's declared search space
 
 logging:
-  backend: csv                      # wandb | csv | none
+  backend: csv                      # wandb | csv | mlflow | none
   wandb_project: my-project
   wandb_run: run-01
   log_model: false
-
-hpo_n_trials: 50
-hpo_timeout: 3600

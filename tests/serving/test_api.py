@@ -9,7 +9,7 @@ from ml_framework.serving.api import create_app
 def trained_app(tabular_csv, make_config):
     cfg = make_config(tabular_csv, "multiclass")
     train(cfg)
-    app = create_app(cfg.output_dir)
+    app = create_app(cfg.runtime.output_dir)
     return app, cfg
 
 

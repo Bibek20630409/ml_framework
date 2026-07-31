@@ -201,9 +201,9 @@ class BundleDataModule(pl.LightningDataModule):
         preprocessor = bundle.preprocessor
         return cls(
             bundle,
-            batch_size=config.train.batch_size,
-            num_workers=config.train.num_workers,
-            output_dir=config.output_dir,
+            batch_size=config.fit.batch_size,
+            num_workers=config.runtime.num_workers,
+            output_dir=config.runtime.output_dir,
             collate_fn=getattr(preprocessor, "collate_fn", None),
         )
 
@@ -224,9 +224,9 @@ class TabularDataModule(BundleDataModule):
         self.config = config
         super().__init__(
             bundle_factory=lambda: build_tabular_bundle(config),
-            batch_size=config.train.batch_size,
-            num_workers=config.train.num_workers,
-            output_dir=config.output_dir,
+            batch_size=config.fit.batch_size,
+            num_workers=config.runtime.num_workers,
+            output_dir=config.runtime.output_dir,
         )
 
 
@@ -238,7 +238,7 @@ class ImageDataModule(BundleDataModule):
         self.config = config
         super().__init__(
             bundle_factory=lambda: build_image_bundle(config),
-            batch_size=config.train.batch_size,
-            num_workers=config.train.num_workers,
-            output_dir=config.output_dir,
+            batch_size=config.fit.batch_size,
+            num_workers=config.runtime.num_workers,
+            output_dir=config.runtime.output_dir,
         )

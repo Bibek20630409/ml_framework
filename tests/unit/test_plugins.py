@@ -162,7 +162,7 @@ def test_backend_and_source_specs_default_to_no_requirements():
 # ── The populated built-in registries ─────────────────────
 @pytest.mark.unit
 def test_builtin_model_specs_are_registered_alongside_the_v1_registry():
-    import ml_framework.models  # noqa: F401  (population is an import side effect)
+    import ml_framework.plugins  # noqa: F401  (population is an import side effect)
     from ml_framework.core import available_models
 
     assert set(MODELS.names()) == set(available_models()) == {"mlp", "cnn"}
@@ -178,7 +178,7 @@ def test_builtin_source_specs_are_registered():
 
 @pytest.mark.unit
 def test_mlp_spec_declares_its_tasks_kinds_and_capabilities():
-    import ml_framework.models  # noqa: F401
+    import ml_framework.plugins  # noqa: F401
 
     spec = MODELS.get_spec("mlp")
     assert spec.backend == "lightning"
@@ -191,7 +191,7 @@ def test_mlp_spec_declares_its_tasks_kinds_and_capabilities():
 
 @pytest.mark.unit
 def test_cnn_spec_declares_the_image_extra():
-    import ml_framework.models  # noqa: F401
+    import ml_framework.plugins  # noqa: F401
 
     spec = MODELS.get_spec("cnn")
     assert [r.package for r in spec.requires] == ["torchvision", "Pillow"]
@@ -200,9 +200,72 @@ def test_cnn_spec_declares_the_image_extra():
 
 
 @pytest.mark.unit
+def test_every_builtin_spec_carries_a_params_model():
+    """`model.params` is free-form in core and strict in the plugin. Without a
+    params_model the config validator has nothing to enforce, so a typo would
+    reach the model as a silently ignored key."""
+    import ml_framework.plugins as plugins
+
+    for name in plugins.BUILTINS:
+        spec = MODELS.get_spec(name)
+        assert spec.params_model is not None, name
+        assert spec.params_model.model_config.get("extra") == "forbid", name
+        with pytest.raises(Exception, match="extra_forbidden|Extra inputs"):
+            spec.params_model(definitely_not_a_knob=1)
+
+
+@pytest.mark.unit
+def test_no_builtin_plugin_imports_an_optional_dependency_at_module_scope():
+    """The rule that replaces `except Exception: pass` structurally.
+
+    A plugin module must be importable with zero optional dependencies, so its
+    heavy imports live inside `build()`/`build_network()`. Hold that and there is
+    no exception to swallow: `cnn` stays listable — honestly marked unavailable —
+    on a torchvision-less install, and a genuinely broken module can no longer
+    hide behind "torchvision is missing".
+
+    Checked structurally rather than by watching `sys.modules`, because
+    pytorch_lightning imports torchvision itself when it is present, which would
+    make a runtime check pass for the wrong reason.
+    """
+    import ast
+    from pathlib import Path
+
+    import ml_framework.plugins as plugins
+
+    optional = {r.module for spec in MODELS.specs() for r in spec.requires}
+    assert optional  # a vacuous test would pass forever
+
+    root = Path(plugins.__file__).parent
+    for name in plugins.BUILTINS:
+        tree = ast.parse((root / f"{name}.py").read_text(encoding="utf-8"))
+        for node in tree.body:  # module scope only — nested imports are the point
+            names: list[str] = []
+            if isinstance(node, ast.Import):
+                names = [a.name.split(".")[0] for a in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                names = [node.module.split(".")[0]]
+            assert not (set(names) & optional), f"{name}.py imports {names} at module scope"
+
+
+@pytest.mark.unit
+def test_a_broken_builtin_would_not_be_hidden_behind_a_missing_extra():
+    """The behaviour the v1 `except Exception: pass` made impossible to observe.
+
+    A builtin that fails to import is *our* bug, so the import must propagate.
+    Simulated by importing a module that raises, since breaking a real plugin is
+    not something a test can do reversibly.
+    """
+    import importlib
+
+    with pytest.raises(ModuleNotFoundError):
+        importlib.import_module("ml_framework.plugins.no_such_plugin")
+
+
+@pytest.mark.unit
 def test_mlp_search_space_keys_are_dotted_config_paths():
     """Applying a trial must be exactly `config.with_overrides(values)`."""
-    import ml_framework.models  # noqa: F401
+    import ml_framework.plugins  # noqa: F401
 
     spec = MODELS.get_spec("mlp")
     assert all("." in key for key in spec.search_space)
@@ -211,7 +274,7 @@ def test_mlp_search_space_keys_are_dotted_config_paths():
 
 @pytest.mark.unit
 def test_mlp_suggest_hook_emits_dotted_paths_for_a_conditional_space():
-    import ml_framework.models  # noqa: F401
+    import ml_framework.plugins  # noqa: F401
 
     class FakeTrial:
         def suggest_int(self, name, low, high, log=False, step=1):
@@ -230,7 +293,7 @@ def test_mlp_suggest_hook_emits_dotted_paths_for_a_conditional_space():
 # ── validate_combination ──────────────────────────────────
 @pytest.mark.unit
 def test_validate_combination_accepts_a_supported_triple():
-    import ml_framework.models  # noqa: F401
+    import ml_framework.plugins  # noqa: F401
 
     assert validate_combination("multiclass", "tabular", "mlp").name == "mlp"
 
@@ -239,7 +302,7 @@ def test_validate_combination_accepts_a_supported_triple():
 def test_validate_combination_rejects_an_unsupported_task():
     """Also pins the check order: cnn is torchvision-gated, and the impossible
     combination must be reported before "go install 2 GB of torchvision"."""
-    import ml_framework.models  # noqa: F401
+    import ml_framework.plugins  # noqa: F401
 
     with pytest.raises(IncompatibleCombinationError, match="does not support task"):
         validate_combination("regression", "image", "cnn")
@@ -247,7 +310,7 @@ def test_validate_combination_rejects_an_unsupported_task():
 
 @pytest.mark.unit
 def test_validate_combination_raises_missing_extra_for_a_sound_but_uninstalled_model():
-    import ml_framework.models  # noqa: F401
+    import ml_framework.plugins  # noqa: F401
 
     if MODELS.is_available("cnn"):
         pytest.skip("torchvision installed — nothing to refuse")
@@ -258,7 +321,7 @@ def test_validate_combination_raises_missing_extra_for_a_sound_but_uninstalled_m
 @pytest.mark.unit
 def test_validate_combination_rejects_a_wrong_data_kind():
     """'xgboost cannot consume an image folder', at config-load time."""
-    import ml_framework.models  # noqa: F401
+    import ml_framework.plugins  # noqa: F401
 
     with pytest.raises(IncompatibleCombinationError, match="cannot consume data kind"):
         validate_combination("multiclass", "image", "mlp")
@@ -266,7 +329,7 @@ def test_validate_combination_rejects_a_wrong_data_kind():
 
 @pytest.mark.unit
 def test_validate_combination_rejects_an_unacceptable_payload():
-    import ml_framework.models  # noqa: F401
+    import ml_framework.plugins  # noqa: F401
 
     with pytest.raises(IncompatibleCombinationError, match="payload"):
         validate_combination("multiclass", "tabular", "mlp", payload="series")
@@ -274,7 +337,7 @@ def test_validate_combination_rejects_an_unacceptable_payload():
 
 @pytest.mark.unit
 def test_models_for_lists_only_installed_compatible_models():
-    import ml_framework.models  # noqa: F401
+    import ml_framework.plugins  # noqa: F401
 
     names = [s.name for s in models_for(task="multiclass", data_kind="tabular")]
     assert names == ["mlp"]

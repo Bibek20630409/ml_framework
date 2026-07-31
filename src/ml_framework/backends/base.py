@@ -55,13 +55,16 @@ def resolve_budget(config: Any) -> Budget:
     """The training budget from a config, without the backend reading the config.
 
     Kept here rather than in each backend so ``fit.budget`` grows one axis at a
-    time in one place.
+    time in one place. ``max_seconds`` is carried but not yet enforced — the
+    per-backend wall-clock caps that make tuning-by-default finish in minutes are
+    the tuning driver's job.
     """
-    train = getattr(config, "train", None)
+    fit = getattr(config, "fit", None)
+    budget = getattr(fit, "budget", None)
     return Budget(
-        max_epochs=getattr(train, "epochs", None),
-        max_seconds=None,
-        patience=getattr(train, "patience", None),
+        max_epochs=getattr(budget, "max_epochs", None),
+        max_seconds=getattr(budget, "max_seconds", None),
+        patience=getattr(fit, "patience", None),
     )
 
 

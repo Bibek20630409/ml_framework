@@ -20,24 +20,24 @@ For custom data, register a source:
 ...then set ``data.kind: my_source`` in the YAML.
 
 **Import discipline:** everything below imports core *submodules*
-(``..core.lit_model``, ``..core.registry``) rather than the ``..core`` package
+(``..core.protocols``, ``..core.registry``) rather than the ``..core`` package
 surface. ``core`` re-exports the data layer's helpers, so reaching for
 ``from ..core import X`` here would be a circular import that only shows up in
-whichever module happens to be imported first.
+whichever module happens to be imported first. ``ExperimentConfig`` is imported
+under ``TYPE_CHECKING`` for the same reason from the other direction: the config
+validator resolves plugins, so a module-scope import here would make validating a
+config depend on the data package being importable first.
 """
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-import torch
-
-# Side-effect imports register the built-ins.
-from .. import models as _models  # noqa: F401  (registers mlp/cnn)
-from ..config import ExperimentConfig
-from ..core.lit_model import BaseModel
+# Side-effect import: registers mlp/cnn in both registries.
+from .. import plugins as _plugins  # noqa: F401
 from ..core.plugins import SourceSpec
-from ..core.registry import get_datamodule_class, get_model_class, register_source
+from ..core.protocols import BuildContext
+from ..core.registry import MODELS, get_datamodule_class, register_source
 from ..core.types import Requirement
 from .lightning_adapter import (  # noqa: F401  (registers tabular/image datamodules)
     BundleDataModule,
@@ -46,6 +46,9 @@ from .lightning_adapter import (  # noqa: F401  (registers tabular/image datamod
 )
 from .sources import build_image_bundle, build_tabular_bundle
 from .types import DataBundle
+
+if TYPE_CHECKING:
+    from ..config import ExperimentConfig
 
 _BUNDLE_BUILDERS = {
     "tabular": build_tabular_bundle,
@@ -80,20 +83,32 @@ def build_model(
     *,
     input_dim: int,
     output_dim: int,
-    class_weights: torch.Tensor | None = None,
-) -> BaseModel:
-    return get_model_class(config.model.name)(
-        input_dim=input_dim,
-        output_dim=output_dim,
-        config=config,
-        class_weights=class_weights,
+    class_weights: Any = None,
+) -> Any:
+    """Build the configured model through its plugin spec.
+
+    The config is unpacked into a :class:`BuildContext` *here* rather than handed
+    to the model, which is the point of the v2 change: a model knows its
+    architecture and its forward pass, not the shape of the experiment around it.
+    """
+    spec = MODELS.get(config.model.name)
+    return spec.build(
+        BuildContext(
+            task=config.task,
+            input_dim=input_dim,
+            output_dim=output_dim,
+            class_weights=class_weights,
+            params=config.model.params,
+            optim=config.fit.params,
+            seed=config.runtime.seed,
+        )
     )
 
 
 # ── v2 source specs ───────────────────────────────────────
-# `build` now returns a DataBundle, which is what `SourceSpec.build`'s docstring
-# promised from P1. The spec metadata (data kind, payload, requirements) is
-# unchanged from P0.
+# `build` returns a DataBundle, which is what `SourceSpec.build`'s docstring
+# promises. Source-specific knobs come from `data.params` and are validated by
+# the source's own frozen params model.
 register_source(
     SourceSpec(
         name="tabular",

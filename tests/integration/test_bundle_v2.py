@@ -26,7 +26,7 @@ pytestmark = pytest.mark.integration
 def trained(tabular_csv, make_config):
     cfg = make_config(tabular_csv, "multiclass")
     metrics = train(cfg)
-    return Path(cfg.output_dir), cfg, metrics
+    return Path(cfg.runtime.output_dir), cfg, metrics
 
 
 def test_bundle_has_the_v2_layout(trained):
@@ -125,7 +125,7 @@ def test_reference_stats_are_written_for_serving_side_drift(trained):
 def test_regression_bundle_reports_values_not_probabilities(regression_csv, make_config):
     cfg = make_config(regression_csv, "regression")
     train(cfg)
-    manifest = read_manifest(Path(cfg.output_dir))
+    manifest = read_manifest(Path(cfg.runtime.output_dir))
     assert manifest.signature.output.kind == "values"
     assert manifest.signature.output.n_classes is None
 
@@ -134,6 +134,6 @@ def test_binary_bundle_keeps_two_classes_behind_a_single_logit(binary_csv, make_
     """The asymmetric case: n_classes is 2 but the head is one logit wide."""
     cfg = make_config(binary_csv, "binary")
     train(cfg)
-    manifest = read_manifest(Path(cfg.output_dir))
+    manifest = read_manifest(Path(cfg.runtime.output_dir))
     assert manifest.signature.output.n_classes == 2
     assert manifest.signature.output.kind == "probabilities"

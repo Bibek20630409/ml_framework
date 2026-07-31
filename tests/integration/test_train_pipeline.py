@@ -22,7 +22,7 @@ def test_train_produces_artifacts_and_infers(task, csv_fixture, make_config, req
     metrics = train(cfg)
     assert isinstance(metrics, dict) and metrics
 
-    out = Path(cfg.output_dir)
+    out = Path(cfg.runtime.output_dir)
     for artifact in ("model.ckpt", "scaler.pkl", "metadata.json", "report.txt", "predictions.csv"):
         assert (out / artifact).exists(), f"missing {artifact}"
 

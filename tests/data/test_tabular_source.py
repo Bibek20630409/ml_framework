@@ -40,7 +40,9 @@ def test_splits_are_disjoint_and_cover_the_table(tabular_csv, make_config):
 @pytest.mark.unit
 def test_class_weights_are_numpy_not_torch(tabular_csv, make_config):
     """The agnostic layer must not import torch; the Lightning adapter converts."""
-    cfg = make_config(tabular_csv, "multiclass", **{"data.imbalance_strategy": "class_weights"})
+    cfg = make_config(
+        tabular_csv, "multiclass", **{"data.params.imbalance_strategy": "class_weights"}
+    )
     bundle = build_tabular_bundle(cfg)
     assert bundle.class_weights is None or isinstance(bundle.class_weights, np.ndarray)
 
@@ -86,7 +88,7 @@ def test_smote_resamples_only_the_training_split(binary_csv, make_config, tmp_pa
     csv = tmp_path / "skewed.csv"
     skewed.to_csv(csv, index=False)
 
-    cfg = make_config(csv, "binary", **{"data.imbalance_strategy": "smote"})
+    cfg = make_config(csv, "binary", **{"data.params.imbalance_strategy": "smote"})
     bundle = build_tabular_bundle(cfg)
     counts = np.bincount(bundle.train.y.astype("int64"))
     assert counts[0] == counts[1]  # train balanced
@@ -95,7 +97,7 @@ def test_smote_resamples_only_the_training_split(binary_csv, make_config, tmp_pa
 
 @pytest.mark.unit
 def test_missing_target_column_names_the_column(tabular_csv, make_config):
-    cfg = make_config(tabular_csv, "multiclass", **{"data.target_col": "nope"})
+    cfg = make_config(tabular_csv, "multiclass", **{"data.target": "nope"})
     with pytest.raises(KeyError, match="nope"):
         build_tabular_bundle(cfg)
 

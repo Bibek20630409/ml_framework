@@ -4,21 +4,25 @@ cli.py
 `mlf` command-line entry point. All commands load a validated YAML config and
 accept dotted ``--set key=value`` overrides.
 
-    mlf lr       --config configs/example_tabular.yaml
-    mlf hpo      --config configs/example_tabular.yaml
-    mlf train    --config configs/example_tabular.yaml --set train.epochs=5
-    mlf serve    --artifacts outputs --host 0.0.0.0 --port 8000
+    mlf lr             --config configs/example_tabular.yaml
+    mlf hpo            --config configs/example_tabular.yaml
+    mlf train          --config configs/example_tabular.yaml --set fit.budget.max_epochs=5
+    mlf serve          --artifacts outputs --host 0.0.0.0 --port 8000
+    mlf migrate-config -i configs/old.yaml -o configs/new.yaml
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 from typing import Any
 
 from .config import ExperimentConfig
 from .utils import setup_logging
+
+log = logging.getLogger(__name__)
 
 
 def _parse_override(raw: str) -> tuple[str, Any]:
@@ -73,12 +77,49 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--rate-limit", default="60/minute", help="Per-client rate limit")
     serve.add_argument("--max-instances", type=int, default=10_000, help="Max instances/request")
 
+    migrate = sub.add_parser("migrate-config", help="Convert a v1 YAML config to the v2 schema")
+    migrate.add_argument("--input", "-i", required=True, help="Path to the v1 YAML config")
+    migrate.add_argument("--output", "-o", required=True, help="Where to write the v2 config")
+    migrate.add_argument(
+        "--force", action="store_true", help="Overwrite the output file if it exists"
+    )
+    migrate.add_argument(
+        "--no-validate",
+        dest="validate",
+        action="store_false",
+        help=(
+            "Skip validating the result. Use when the config selects a model whose "
+            "optional extra is not installed on this machine."
+        ),
+    )
+
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     setup_logging()
+
+    if args.command == "migrate-config":
+        from pydantic import ValidationError
+
+        from .config import MigrationError, migrate_file
+        from .core.types import FrameworkError
+
+        try:
+            migrate_file(args.input, args.output, validate=args.validate, overwrite=args.force)
+        except (MigrationError, FileExistsError, FileNotFoundError, FrameworkError) as exc:
+            log.error("%s", exc)
+            return 1
+        except ValidationError as exc:
+            # The migration itself is mechanical and faithful; the *result* can
+            # still be invalid, and the commonest reason is a v1 key that never
+            # did anything (model.dropout on a cnn). Report it, do not write.
+            log.error("the migrated config is not valid:\n%s", exc)
+            log.error("remove the offending key(s), or re-run with --no-validate")
+            return 1
+        print(f"wrote {args.output}")
+        return 0
 
     if args.command == "serve":
         import uvicorn

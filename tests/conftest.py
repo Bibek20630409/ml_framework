@@ -58,13 +58,23 @@ def regression_csv(tmp_path: Path) -> Path:
 
 @pytest.fixture
 def make_config(tmp_path: Path):
+    """A minimal valid v2 config, overridable with dotted keys.
+
+    Overrides go through ``with_overrides`` rather than a dict merge on purpose:
+    every test that tweaks a config exercises the same mechanism HPO uses to
+    apply a trial.
+    """
+
     def _factory(csv: Path, task: str, **overrides) -> ExperimentConfig:
         raw = {
             "task": task,
-            "seed": 42,
-            "output_dir": str(tmp_path / "outputs"),
-            "data": {"kind": "tabular", "csv_path": str(csv), "target_col": "label"},
-            "train": {"epochs": 2, "batch_size": 16, "num_workers": 0},
+            "runtime": {
+                "seed": 42,
+                "output_dir": str(tmp_path / "outputs"),
+                "num_workers": 0,
+            },
+            "data": {"kind": "tabular", "path": str(csv), "target": "label"},
+            "fit": {"budget": {"max_epochs": 2}, "batch_size": 16},
             "logging": {"backend": "none"},
         }
         cfg = ExperimentConfig.model_validate(raw)

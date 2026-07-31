@@ -160,7 +160,7 @@ def test_tabular_datamodule_wraps_the_bundle_source(tabular_csv, make_config):
     dm = TabularDataModule(cfg)
     dm.setup()
     assert dm.bundle.input_dim == dm.input_dim == 6
-    assert dm.batch_size == cfg.train.batch_size
+    assert dm.batch_size == cfg.fit.batch_size
 
 
 @pytest.mark.unit
@@ -168,5 +168,5 @@ def test_from_bundle_uses_the_configs_loader_settings(tabular_csv, make_config):
     cfg = make_config(tabular_csv, "multiclass")
     dm = BundleDataModule.from_bundle(build_bundle(cfg), cfg)
     dm.setup()
-    assert dm.batch_size == cfg.train.batch_size
-    assert dm.test_dataloader().batch_size == cfg.train.batch_size
+    assert dm.batch_size == cfg.fit.batch_size
+    assert dm.test_dataloader().batch_size == cfg.fit.batch_size
