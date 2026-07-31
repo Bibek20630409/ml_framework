@@ -70,11 +70,12 @@ def log_and_register(
     run_id = logger.run_id
     bundle = Path(bundle_dir)
 
-    # Log only the portable bundle files (not the whole outputs/ dir).
-    for name in ("model.ckpt", "scaler.pkl", "metadata.json", "reference_stats.json"):
-        f = bundle / name
-        if f.exists():
-            client.log_artifact(run_id, str(f), artifact_path="bundle")
+    # Log the whole bundle directory. v1 enumerated four filenames, which meant a
+    # bundle containing anything else — a preprocessor directory, a HuggingFace
+    # model dir, a CatBoost .cbm — registered incomplete and silently failed to
+    # load back. The manifest already says what is inside; the logger does not
+    # need a second, hand-maintained opinion.
+    client.log_artifacts(run_id, str(bundle), artifact_path="bundle")
     for key, value in metrics.items():
         try:
             client.log_metric(run_id, key, float(value))

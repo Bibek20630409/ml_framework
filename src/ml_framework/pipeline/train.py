@@ -17,9 +17,10 @@ Produces an artifact bundle v2 in ``config.runtime.output_dir``:
     manifest.json · config.json · model/ · preprocessor/ · metrics.json
     reference_stats.json · report.txt · confusion_matrix.txt · predictions.csv · training.log
 
-plus three files at the bundle root (``model.ckpt``, ``scaler.pkl``,
-``metadata.json``) that reproduce v1's layout. Those are transitional — see
-:func:`_write_v1_artifacts`.
+That is the whole bundle. v1's three root files (``model.ckpt``, ``scaler.pkl``,
+``metadata.json``) are gone: the loader is manifest-driven now, so mirroring them
+would be dead weight in every bundle. Bundles already on disk still load — see
+``Inferencer._from_v1_bundle``.
 
 All execution is inside a function so the DataLoader worker processes on Windows
 have a proper ``__main__`` guard (via the CLI / console-script entry point).
@@ -29,7 +30,6 @@ from __future__ import annotations
 
 import json
 import logging
-import shutil
 from pathlib import Path
 from typing import Any
 
@@ -116,7 +116,6 @@ def train(config: ExperimentConfig) -> dict:
             (out / "reference_stats.json").write_text(
                 json.dumps(bundle.reference_stats), encoding="utf-8"
             )
-        _write_v1_artifacts(config, bundle, out, artifact, preprocessor_ref)
 
         run_logger.log_params(_tracked_params(config))
         run_logger.log_metrics(metrics)
@@ -221,45 +220,3 @@ def _build_manifest(
         requires=[RequirementRef.from_requirement(r) for r in spec.requires],
         metrics=metrics,
     )
-
-
-def _write_v1_artifacts(
-    config: ExperimentConfig,
-    bundle: Any,
-    out: Path,
-    artifact: Any,
-    preprocessor_ref: dict[str, Any] | None,
-) -> None:
-    """Mirror the v1 bundle layout at the bundle root.
-
-    ``Inferencer``, ``serving/api.py`` and ``mlflow_utils.log_and_register`` all
-    still read ``model.ckpt`` / ``scaler.pkl`` / ``metadata.json`` from the root.
-    Rewriting them to read the manifest is P3's job — it is the same edit as making
-    them torch-free, and doing half of it here would be churn that P3 undoes. The
-    alternative, moving the artifacts now, would break serving for two phases.
-
-    Note that even here nothing names ``scaler.pkl``: the files come from the
-    preprocessor's own manifest fragment, so the "nothing outside the preprocessor
-    knows its filenames" invariant holds in the compatibility path too.
-
-    **Removal owner: P3.** When ``inference.py`` becomes manifest-driven, delete
-    this function and the files it writes.
-    """
-    source = out / artifact.path
-    if source.is_file():
-        shutil.copyfile(source, out / "model.ckpt")
-
-    for name in (preprocessor_ref or {}).get("files", []):
-        staged = out / PREPROCESSOR_DIR / name
-        if staged.is_file():
-            shutil.copyfile(staged, out / name)
-
-    meta = {
-        "task": config.task,
-        "input_dim": int(bundle.input_dim),
-        "output_dim": int(bundle.output_dim),
-        "feature_cols": list(bundle.schema.feature_names),
-        "class_names": config.data.class_names,
-        "config": config.model_dump(),
-    }
-    (out / "metadata.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")

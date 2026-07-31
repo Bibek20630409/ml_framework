@@ -7,32 +7,21 @@ Uses a torchvision backbone (default resnet18) with the classifier head resized
 to ``output_dim``. Consumes 4D image tensors (B, C, H, W) directly — unlike the
 MLP, which is why images need this model rather than the flat network.
 
-``torchvision`` is imported inside :meth:`CNN.build_network`, never at module
-scope: a plugin module must be importable with zero optional dependencies
-installed, which is what lets ``mlf models`` list ``cnn`` — honestly marked
-unavailable — on a bare install.
-
-:class:`CNNParams` deliberately has no ``dropout``. v1's shared ``ModelConfig``
-carried one for every model and the CNN never read it; the per-plugin
-``extra="forbid"`` schema now says so out loud instead of accepting a knob that
-does nothing.
+``torchvision`` is imported inside :meth:`CNN.build_network`, and this module is
+itself imported lazily by ``plugins/__init__.py`` — defining a ``LightningModule``
+subclass needs torch, which is optional. :class:`~ml_framework.plugins.params.CNNParams`
+therefore lives in ``params.py``, so the config validator can check
+``model.params`` without either dependency present.
 """
 
 from __future__ import annotations
 
 import torch.nn as nn
-from pydantic import BaseModel as PydanticModel
 
 from ..core.lit_model import BaseModel
 from ..core.protocols import BuildContext
 from ..core.registry import register_model
-
-
-class CNNParams(PydanticModel):
-    model_config = {"frozen": True, "extra": "forbid"}
-
-    backbone: str = "resnet18"
-    pretrained: bool = True
+from .params import CNNParams
 
 
 @register_model("cnn")

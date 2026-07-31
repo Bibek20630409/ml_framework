@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ml-framework"
-version = "1.0.0"
+version = "2.0.0"
 description = "Production-grade PyTorch Lightning framework for tabular, image, and mixed data."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -12,10 +12,11 @@ license = { text = "MIT" }
 authors = [{ name = "ML Framework" }]
 keywords = ["pytorch", "lightning", "mlops", "tabular", "training"]
 
+# Deliberately free of any ML runtime. torch/Lightning moved to the `lightning`
+# extra in P3: they are the dependency of one *backend*, not of the framework, and
+# leaving them here put 533 MB into a GBDT serving image that never imports them.
+# Everything below is needed to read a table, split it, and load a bundle.
 dependencies = [
-    "torch>=2.0.0",
-    "pytorch-lightning>=2.0.0",
-    "torchmetrics>=1.0.0",
     "pandas>=2.0.0",
     "numpy>=1.24.0",
     "scikit-learn>=1.3.0",
@@ -26,6 +27,17 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# The deep-learning runtime. Required by the `lightning` backend and therefore by
+# the mlp/cnn plugins, which declare it — so on an install without this extra they
+# are *listed* by `mlf models` and refuse selection with a pip command, rather
+# than vanishing. `image` extends this with torchvision; installing `image`
+# without `lightning` gets you torchvision's own torch, which is why they are
+# documented as a pair.
+lightning = [
+    "torch>=2.0.0",
+    "pytorch-lightning>=2.0.0",
+    "torchmetrics>=1.0.0",
+]
 # Deliberately an unbounded floor, despite the sharp edge: every torchvision
 # release pins ONE torch patch exactly (0.25.0 requires torch==2.10.0; the pairing
 # is torch 2.N <-> torchvision 0.(N+15)). An upper bound here would therefore pin
@@ -79,6 +91,14 @@ monitoring = [
 ]
 dev = [
     "pytest>=7.4.0",
+    # The full toolkit: `dev` installs every runtime so the whole suite runs
+    # rather than importorskip-ing half of it.
+    "torch>=2.0.0",
+    "pytorch-lightning>=2.0.0",
+    "torchmetrics>=1.0.0",
+    "xgboost>=2.0",
+    "lightgbm>=4.0",
+    "catboost>=1.2",
     "pytest-cov>=4.1.0",
     "httpx>=0.27.0",
     "black>=24.0.0",

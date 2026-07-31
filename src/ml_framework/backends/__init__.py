@@ -9,8 +9,7 @@ not-yet-installed ``gbdt`` on a bare install, and what keeps
     gbdt        XGBoost, LightGBM, CatBoost, sklearn  (one-shot fit(X, y))
     forecast    Prophet, statsmodels, seasonal-naive  (fit-per-series)
 
-Only ``lightning`` exists today; the other two arrive with the model families
-that need them.
+``forecast`` arrives with the model family that needs it.
 """
 
 from __future__ import annotations
@@ -52,10 +51,38 @@ register_backend(
             supports_sample_weight=False,
         ),
         requires=(
-            Requirement("torch", min_version="2.0"),
-            Requirement("pytorch_lightning", min_version="2.0", dist="pytorch-lightning"),
+            Requirement("torch", extra="lightning", min_version="2.0"),
+            Requirement(
+                "pytorch_lightning", extra="lightning", min_version="2.0", dist="pytorch-lightning"
+            ),
         ),
         description="Iterative mini-batch training: epoch loop + validation callbacks.",
+    )
+)
+
+# No `requires`: the backend itself is pure-python dispatch, and *which* library it
+# needs depends on the model selected. Each GBDT plugin declares its own
+# requirement, so `mlf models` can say "xgboost needs xgboost>=2.0" while still
+# listing the backend as available. Declaring the union here would refuse a
+# lightgbm run on an install that has lightgbm but not catboost.
+register_backend(
+    BackendSpec(
+        name="gbdt",
+        factory=_lazy_factory(".gbdt"),
+        capabilities=Capabilities(
+            accepts=frozenset({"arrays", "frame"}),
+            needs_scaling=False,
+            native_categorical=True,
+            native_missing=True,
+            supports_sample_weight=True,
+            produces_proba=True,
+            supports_pruning=True,
+            supports_gpu=True,
+            supports_mixed_precision=False,
+            supports_lr_range_test=False,
+        ),
+        requires=(),
+        description="One-shot fit(X, y, eval_set=) with library-native early stopping.",
     )
 )
 

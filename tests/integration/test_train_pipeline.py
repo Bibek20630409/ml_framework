@@ -23,12 +23,21 @@ def test_train_produces_artifacts_and_infers(task, csv_fixture, make_config, req
     assert isinstance(metrics, dict) and metrics
 
     out = Path(cfg.runtime.output_dir)
-    for artifact in ("model.ckpt", "scaler.pkl", "metadata.json", "report.txt", "predictions.csv"):
+    # Bundle v2 paths: the model and the fitted transform state live in their own
+    # directories now, named by the manifest rather than by convention.
+    for artifact in (
+        "manifest.json",
+        "config.json",
+        "model/model.ckpt",
+        "preprocessor/scaler.pkl",
+        "report.txt",
+        "predictions.csv",
+    ):
         assert (out / artifact).exists(), f"missing {artifact}"
 
     # Artifact-based inference round-trip.
     inf = Inferencer.from_artifacts(out)
-    x = np.random.default_rng(0).normal(size=(5, inf.model.input_dim)).astype("float32")
+    x = np.random.default_rng(0).normal(size=(5, inf.n_features)).astype("float32")
     preds = inf.predict(x)
     assert len(preds) == 5
 

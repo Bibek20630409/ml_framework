@@ -1,7 +1,7 @@
 .PHONY: install lint format type test cov train serve docker-serve clean
 
 install:
-	pip install -e ".[dev,serve,hpo,image,diagnostics]"
+	pip install -e ".[dev,serve,hpo,image,diagnostics,parquet]"
 
 format:
 	black src tests

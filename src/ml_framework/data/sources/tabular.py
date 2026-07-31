@@ -35,8 +35,12 @@ from pydantic import BaseModel as PydanticModel
 from pydantic import Field
 
 from ...core.plugins import check_requirements
-from ...core.types import FrameworkError, Requirement
-from ..preprocess.tabular import TabularPreprocessor, resolve_imbalance
+from ...core.types import Capabilities, FrameworkError, Requirement
+from ..preprocess.tabular import (
+    TabularPreprocessor,
+    balanced_sample_weights,
+    resolve_imbalance,
+)
 from ..splitters import GroupSplitter, RandomSplitter, SplitError, TemporalSplitter
 from ..types import DataBundle, FeatureSchema, Split
 
@@ -56,7 +60,10 @@ class TabularSourceParams(PydanticModel):
 
     model_config = {"frozen": True, "extra": "forbid"}
 
-    imbalance_strategy: Literal["smote", "class_weights", "none"] = "smote"
+    # `auto` resolves against the selected model's capabilities: sample weights
+    # where the model consumes them natively (trees), SMOTE otherwise. The default
+    # stays `smote` so an existing tabular config trains exactly as it did.
+    imbalance_strategy: Literal["auto", "smote", "class_weights", "none"] = "smote"
     imbalance_threshold: float = Field(default=0.3, gt=0.0, le=1.0)
     # n >= this → plain holdout; below it a 5-fold cut yields a larger, more
     # stable training set than carving 30% off the top.
@@ -107,6 +114,71 @@ def build_splitter(config, params: TabularSourceParams) -> Any:
     raise SplitError(f"Unknown split strategy '{strategy}'")
 
 
+def model_capabilities(config) -> Capabilities:
+    """The capability flags of the *selected model*, defaulting conservatively.
+
+    The source asking the model what it needs looks like a layering inversion and
+    is not: scaling and imbalance correction are not properties of a CSV, they are
+    properties of what will consume it. Standardizing for a tree buys nothing and
+    destroys the interpretability of its split thresholds; SMOTE for a tree is
+    nonsense where native sample weights exist. Those decisions have to be made
+    somewhere, and the alternative — deciding in the backend, after the arrays are
+    already built — would mean fitting the scaler twice or throwing one away.
+
+    Falls back to neural defaults when the model is unknown, which keeps this
+    usable in tests that build a bundle without a registered plugin.
+    """
+    from ...core.plugins import UnknownPluginError
+    from ...core.registry import MODELS
+
+    try:
+        return MODELS.get_spec(config.model.name).capabilities
+    except UnknownPluginError:
+        log.debug("model '%s' is not registered; assuming default capabilities", config.model.name)
+        return Capabilities()
+
+
+def _apply_imbalance(
+    x: np.ndarray,
+    y: np.ndarray,
+    *,
+    config,
+    params: TabularSourceParams,
+    caps: Capabilities,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray | None, np.ndarray | None]:
+    """Resolve the imbalance strategy. Returns ``(x, y, class_weights, sample_weights)``.
+
+    Exactly one of the three corrections is ever applied — resampling, per-class
+    loss weights, or per-row sample weights. Applying two would correct twice.
+    """
+    strategy: str = params.imbalance_strategy
+    if strategy == "auto":
+        strategy = "sample_weights" if caps.supports_sample_weight else "smote"
+        log.info("imbalance strategy auto → %s", strategy)
+    elif strategy == "smote" and caps.supports_sample_weight:
+        # Honoured, because it was asked for explicitly — but flagged, because
+        # interpolating synthetic neighbours for an axis-aligned splitter is a
+        # known-poor choice when the model takes weights natively.
+        log.warning(
+            "model '%s' supports sample weights; 'smote' is a poor fit for it. "
+            "Use data.params.imbalance_strategy: auto",
+            config.model.name,
+        )
+
+    if strategy == "sample_weights":
+        return x, y, None, balanced_sample_weights(y, config.task, params.imbalance_threshold)
+
+    x_res, y_res, class_weights = resolve_imbalance(
+        x,
+        y,
+        task=config.task,
+        strategy=strategy,
+        threshold=params.imbalance_threshold,
+        seed=config.runtime.seed,
+    )
+    return x_res, y_res, class_weights, None
+
+
 def build_tabular_bundle(config) -> DataBundle:
     """Materialize a tabular :class:`DataBundle` from a validated config."""
     if config.data.path is None:
@@ -151,18 +223,14 @@ def build_tabular_bundle(config) -> DataBundle:
 
     reference_stats = build_reference(x_train, feature_cols)
 
-    preprocessor = TabularPreprocessor(needs_scaling=True)
+    caps = model_capabilities(config)
+    preprocessor = TabularPreprocessor(needs_scaling=caps.needs_scaling)
     x_train = preprocessor.fit_transform(Split(x=x_train, y=y_train))
     x_val = preprocessor.transform(x_val)
     x_test = preprocessor.transform(x_test)
 
-    x_train, y_train, weights = resolve_imbalance(
-        x_train,
-        y_train,
-        task=config.task,
-        strategy=params.imbalance_strategy,
-        threshold=params.imbalance_threshold,
-        seed=config.runtime.seed,
+    x_train, y_train, weights, sample_weights = _apply_imbalance(
+        x_train, y_train, config=config, params=params, caps=caps
     )
 
     # Head convention, unchanged from v1: binary is a single logit
@@ -196,4 +264,9 @@ def build_tabular_bundle(config) -> DataBundle:
         class_weights=weights,
         preprocessor=preprocessor,
         reference_stats=reference_stats,
+        # Per-row weights when the model consumes them natively. `meta` rather than
+        # a field because it is source-specific plumbing the DataBundle contract
+        # should not name — the same slot the image source uses for its sampler
+        # weights.
+        meta={} if sample_weights is None else {"sample_weights": sample_weights},
     )

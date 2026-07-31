@@ -37,13 +37,8 @@ from typing import TYPE_CHECKING, Any
 from .. import plugins as _plugins  # noqa: F401
 from ..core.plugins import SourceSpec
 from ..core.protocols import BuildContext
-from ..core.registry import MODELS, get_datamodule_class, register_source
+from ..core.registry import MODELS, register_source
 from ..core.types import Requirement
-from .lightning_adapter import (  # noqa: F401  (registers tabular/image datamodules)
-    BundleDataModule,
-    ImageDataModule,
-    TabularDataModule,
-)
 from .sources import build_image_bundle, build_tabular_bundle
 from .types import DataBundle
 
@@ -74,7 +69,17 @@ def build_bundle(config: ExperimentConfig) -> DataBundle:
 
 
 def build_datamodule(config: ExperimentConfig) -> Any:
-    """The Lightning adapter for the configured data kind."""
+    """The Lightning adapter for the configured data kind.
+
+    The adapter is imported *here* rather than at module scope: it subclasses
+    ``pl.LightningDataModule``, and ``build_bundle`` — which the orchestrator uses
+    for every backend — lives in this same module. A module-scope import would put
+    Lightning into the import path of a GBDT training run. Importing it also
+    registers the v1 datamodules, which is what ``get_datamodule_class`` reads.
+    """
+    from ..core.registry import get_datamodule_class
+    from . import lightning_adapter  # noqa: F401  (registers tabular/image datamodules)
+
     return get_datamodule_class(config.data.kind)(config)
 
 

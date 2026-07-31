@@ -70,8 +70,8 @@ def test_cli_train_end_to_end(tmp_path):
     rc = cli.main(["train", "--config", str(cfg_path), "--set", "fit.budget.max_epochs=1"])
     assert rc == 0
     out = tmp_path / "outputs"
-    assert (out / "model.ckpt").exists()
-    assert (out / "metadata.json").exists()
+    assert (out / "manifest.json").exists()
+    assert (out / "model" / "model.ckpt").exists()
 
 
 # ── migrate-config ────────────────────────────────────────

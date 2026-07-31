@@ -108,12 +108,14 @@ def test_metrics_json_matches_the_returned_metrics(trained):
     assert read_manifest(out).metrics == metrics
 
 
-def test_v1_artifacts_remain_at_the_bundle_root_for_the_existing_loader(trained):
-    """Transitional, with a named owner: P3 rewrites Inferencer to be
-    manifest-driven and torch-free, and deletes these three."""
+def test_the_v1_root_artifacts_are_gone(trained):
+    """P1 mirrored `model.ckpt`/`scaler.pkl`/`metadata.json` at the bundle root
+    because the loader still read them. The loader is manifest-driven now, so
+    keeping them would be dead weight in every bundle. Already-written v1 bundles
+    still load — see test_bundle.py's back-compat case."""
     out, _, _ = trained
     for name in ("model.ckpt", "scaler.pkl", "metadata.json"):
-        assert (out / name).exists(), name
+        assert not (out / name).exists(), f"{name} should live under model/ or preprocessor/"
 
 
 def test_reference_stats_are_written_for_serving_side_drift(trained):

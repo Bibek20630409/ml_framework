@@ -36,6 +36,69 @@ jobs:
       - name: Test
         run: pytest --cov=ml_framework --cov-report=term-missing
 
+  # The P3 phase gate, enforced rather than asserted. torch is genuinely absent
+  # here — no meta-path trickery — so this is the only place the claim "a GBDT
+  # bundle serves without a deep-learning stack" is proven end to end. It is also
+  # the plan's standing bare-install guardrail: the plugin registry must list the
+  # models it cannot run and refuse them with a pip command, not hide them.
+  gbdt-no-torch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install without the lightning extra
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[gbdt,serve]" pytest httpx
+      - name: Assert no deep-learning stack is present
+        run: |
+          python - <<'PY'
+          import importlib.util as u, sys
+          present = [m for m in ("torch", "pytorch_lightning", "torchvision", "torchmetrics")
+                     if u.find_spec(m) is not None]
+          if present:
+              sys.exit(f"the lean install pulled in {present}; check pyproject dependencies")
+          print("no deep-learning runtime installed")
+          PY
+      - name: Unavailable plugins are listed, not hidden
+        run: |
+          python - <<'PY'
+          from ml_framework.core.plugins import MissingExtraError
+          from ml_framework.core.registry import MODELS
+          import ml_framework.plugins  # noqa: F401
+
+          names = set(MODELS.names())
+          assert {"mlp", "cnn", "xgboost"} <= names, names
+          assert MODELS.is_available("xgboost")
+          assert not MODELS.is_available("mlp"), "torch should be absent here"
+          try:
+              MODELS.get("mlp")
+          except MissingExtraError as exc:
+              assert "ml-framework[lightning]" in str(exc), exc
+              print(exc)
+          else:
+              raise SystemExit("selecting an uninstalled model must raise MissingExtraError")
+          PY
+      - name: Train a GBDT bundle and serve it
+        run: |
+          mlf train --config configs/example_gbdt.yaml --set fit.params.n_estimators=20
+          python - <<'PY'
+          from fastapi.testclient import TestClient
+          from ml_framework.serving.api import create_app
+
+          with TestClient(create_app("outputs", api_key=None, rate_limit=None)) as c:
+              health = c.get("/health").json()
+              assert health["backend"] == "gbdt", health
+              res = c.post("/predict", json={"instances": [[0.0] * 6]})
+              assert res.status_code == 200, res.text
+              print("served:", res.json())
+          import sys
+          assert "torch" not in sys.modules
+          PY
+
   mlops-validate:
     runs-on: ubuntu-latest
     steps:

@@ -1,0 +1,66 @@
+# ── Example gradient-boosted-tree config (schema v2) ─────────────────
+# Load with:  mlf train --config configs/example_gbdt.yaml
+# Needs the gbdt extra:  pip install -e '.[gbdt]'
+#
+# Compare this with example_tabular.yaml: same task, same data, same blocks.
+# Only `model.name` and the two params dicts differ — which is the whole point of
+# the backend split. Nothing about the orchestration, the bundle or the serving
+# contract changes because the fit loop did.
+#
+# A bundle produced from this config **serves without torch installed**. That is
+# the phase gate, and it is only possible because core/inference.py dispatches on
+# the manifest instead of importing a checkpoint loader.
+
+task: multiclass
+
+runtime:
+  seed: 42
+  output_dir: outputs
+  num_workers: -1
+  deterministic: true
+
+data:
+  kind: tabular
+  path: data/raw/sample.csv
+  target: label
+  split:
+    strategy: auto
+    val_size: 0.15
+    test_size: 0.15
+  params:
+    # `auto` resolves against the model's capabilities: sample weights here,
+    # because trees consume them natively and SMOTE interpolates synthetic
+    # neighbours an axis-aligned splitter cannot use well.
+    imbalance_strategy: auto
+    imbalance_threshold: 0.3
+    holdout_threshold: 5000
+
+model:
+  name: xgboost                # or: lightgbm | catboost — see `mlf models`
+  params:                      # tree shape, validated by the plugin
+    max_depth: 6
+    min_child_weight: 1.0
+    reg_lambda: 1.0
+    tree_method: hist
+
+fit:
+  # No `budget.max_epochs`: boosting rounds are `n_estimators` below, and the
+  # library stops early on its own. The budget block still applies to wall-clock
+  # limits once the tuning driver enforces them.
+  patience: 20
+  batch_size: 32               # unused by this backend; kept for schema uniformity
+  params:                      # the boosting loop, validated by the backend
+    learning_rate: 0.1
+    n_estimators: 500
+    subsample: 0.9
+    colsample_bytree: 0.9
+    early_stopping_rounds: 50
+
+tune:
+  enabled: true
+  max_trials: 30               # trees tune far cheaper than a neural net
+  max_seconds: 300
+  refit: best
+
+logging:
+  backend: csv

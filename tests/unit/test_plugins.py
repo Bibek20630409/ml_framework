@@ -161,11 +161,34 @@ def test_backend_and_source_specs_default_to_no_requirements():
 
 # ── The populated built-in registries ─────────────────────
 @pytest.mark.unit
-def test_builtin_model_specs_are_registered_alongside_the_v1_registry():
-    import ml_framework.plugins  # noqa: F401  (population is an import side effect)
+def test_builtin_model_specs_are_registered():
+    import ml_framework.plugins as plugins  # noqa: F401  (population is a side effect)
     from ml_framework.core import available_models
 
-    assert set(MODELS.names()) == set(available_models()) == {"mlp", "cnn"}
+    expected = {"mlp", "cnn", "xgboost", "lightgbm", "catboost"}
+    assert set(MODELS.names()) == set(available_models()) == expected
+    assert set(plugins.BUILTINS) == expected
+
+
+@pytest.mark.unit
+def test_available_models_covers_plugins_that_have_no_model_class():
+    """`available_models()` shims over MODELS, not over the v1 class registry.
+
+    A GBDT plugin registers a build *function*; there is no LightningModule
+    subclass to put in the class registry. Reading that registry here would have
+    made "available models" quietly Lightning-only the moment a non-neural family
+    landed — which is exactly what P3 landed.
+    """
+    import ml_framework.plugins as plugins
+    from ml_framework.core import available_models
+    from ml_framework.core.registry import _MODEL_REGISTRY
+
+    assert "xgboost" in available_models()
+    # `model_class` imports the defining module, which is what populates the v1
+    # class registry — the neural plugins are registered with a lazy build.
+    assert plugins.model_class("mlp").__name__ == "MLP"
+    assert "mlp" in _MODEL_REGISTRY
+    assert "xgboost" not in _MODEL_REGISTRY  # no class, and that is correct
 
 
 @pytest.mark.unit
@@ -184,7 +207,11 @@ def test_mlp_spec_declares_its_tasks_kinds_and_capabilities():
     assert spec.backend == "lightning"
     assert spec.tasks == frozenset({"binary", "multiclass", "regression"})
     assert spec.data_kinds == frozenset({"tabular"})
-    assert spec.requires == ()  # torch is a base dependency
+    # torch left the base dependencies in P3, so the neural plugins declare it like
+    # any other optional runtime — which is what lets a GBDT-only install list them
+    # honestly instead of shipping 533 MB nothing imports.
+    assert [r.package for r in spec.requires] == ["torch", "pytorch-lightning"]
+    assert all(r.extra == "lightning" for r in spec.requires)
     assert spec.capabilities.needs_scaling and spec.capabilities.supports_pruning
     assert spec.suggest is not None  # conditional hidden_dims space
 
@@ -194,8 +221,16 @@ def test_cnn_spec_declares_the_image_extra():
     import ml_framework.plugins  # noqa: F401
 
     spec = MODELS.get_spec("cnn")
-    assert [r.package for r in spec.requires] == ["torchvision", "Pillow"]
-    assert all(r.extra == "image" for r in spec.requires)
+    # torch first (the backend it rides), then its own extra on top.
+    assert [r.package for r in spec.requires] == [
+        "torch",
+        "pytorch-lightning",
+        "torchvision",
+        "Pillow",
+    ]
+    extras = {r.package: r.extra for r in spec.requires}
+    assert extras["torchvision"] == extras["Pillow"] == "image"
+    assert extras["torch"] == "lightning"
     assert spec.capabilities.accepts == frozenset({"dataset"})
 
 
@@ -215,37 +250,62 @@ def test_every_builtin_spec_carries_a_params_model():
 
 
 @pytest.mark.unit
-def test_no_builtin_plugin_imports_an_optional_dependency_at_module_scope():
+def test_registering_the_builtins_imports_no_optional_runtime():
     """The rule that replaces `except Exception: pass` structurally.
 
-    A plugin module must be importable with zero optional dependencies, so its
-    heavy imports live inside `build()`/`build_network()`. Hold that and there is
-    no exception to swallow: `cnn` stays listable — honestly marked unavailable —
-    on a torchvision-less install, and a genuinely broken module can no longer
-    hide behind "torchvision is missing".
+    **Registering** a plugin must not import the library it wraps. Hold that and
+    there is no exception to swallow: every model stays listable — honestly marked
+    unavailable — on an install that cannot run it, and a genuinely broken module
+    can no longer hide behind "the extra is missing".
 
-    Checked structurally rather than by watching `sys.modules`, because
-    pytorch_lightning imports torchvision itself when it is present, which would
-    make a runtime check pass for the wrong reason.
+    How each family manages it differs, and the difference is the point. The GBDT
+    plugins are pydantic-only at module scope and import xgboost inside `build()`.
+    The neural plugins cannot be: defining a LightningModule subclass imports
+    torch. So their schemas live in `params.py` and their modules sit behind a
+    lazy `build`.
+
+    Checked by importing the package in a subprocess where every optional runtime
+    raises on import, rather than by watching `sys.modules` — pytorch_lightning
+    imports torchvision itself when present, which would make a naive runtime
+    check pass for the wrong reason.
     """
-    import ast
-    from pathlib import Path
+    import subprocess
+    import sys
 
-    import ml_framework.plugins as plugins
-
-    optional = {r.module for spec in MODELS.specs() for r in spec.requires}
+    optional = sorted({r.module for spec in MODELS.specs() for r in spec.requires})
     assert optional  # a vacuous test would pass forever
 
-    root = Path(plugins.__file__).parent
-    for name in plugins.BUILTINS:
-        tree = ast.parse((root / f"{name}.py").read_text(encoding="utf-8"))
-        for node in tree.body:  # module scope only — nested imports are the point
-            names: list[str] = []
-            if isinstance(node, ast.Import):
-                names = [a.name.split(".")[0] for a in node.names]
-            elif isinstance(node, ast.ImportFrom) and node.module:
-                names = [node.module.split(".")[0]]
-            assert not (set(names) & optional), f"{name}.py imports {names} at module scope"
+    code = f"""
+import sys
+
+BANNED = {optional!r}
+
+
+class _Ban:
+    def find_spec(self, name, path=None, target=None):
+        if name.split(".")[0] in BANNED:
+            raise ModuleNotFoundError(name)
+        return None
+
+
+sys.meta_path.insert(0, _Ban())
+for _m in list(sys.modules):
+    if _m.split(".")[0] in BANNED:
+        del sys.modules[_m]
+
+import ml_framework.plugins as plugins
+from ml_framework.core.registry import MODELS
+
+missing = set(plugins.BUILTINS) - set(MODELS.names())
+assert not missing, missing
+# The schemas must be usable too: the config validator runs them here.
+assert MODELS.get_spec("mlp").params_model is not None
+assert MODELS.get_spec("xgboost").params_model is not None
+print("ok")
+"""
+    proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr
+    assert "ok" in proc.stdout
 
 
 @pytest.mark.unit
@@ -340,7 +400,20 @@ def test_models_for_lists_only_installed_compatible_models():
     import ml_framework.plugins  # noqa: F401
 
     names = [s.name for s in models_for(task="multiclass", data_kind="tabular")]
-    assert names == ["mlp"]
+    assert "mlp" in names
+    # Ordered by auto_priority, best first — the tie-break zero-config selection
+    # uses. XGBoost outranks the MLP on tabular data, which is the whole reason
+    # the GBDT family exists.
+    installed_trees = [n for n in ("xgboost", "lightgbm", "catboost") if MODELS.is_available(n)]
+    if installed_trees:
+        assert (
+            names[0] == "xgboost" if "xgboost" in installed_trees else names[0] in installed_trees
+        )
+        assert names.index("mlp") > max(names.index(n) for n in installed_trees)
+    # An uninstalled tree must not appear as a candidate at all.
+    for name in ("xgboost", "lightgbm", "catboost"):
+        assert (name in names) == MODELS.is_available(name)
+
     # cnn is registered but torchvision-gated, so it must not appear as a candidate
     # for automatic selection unless it is actually installed.
     image_names = [s.name for s in models_for(data_kind="image")]

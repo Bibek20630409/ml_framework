@@ -65,7 +65,11 @@ def make_config(tmp_path: Path):
     apply a trial.
     """
 
-    def _factory(csv: Path, task: str, **overrides) -> ExperimentConfig:
+    def _factory(csv: Path, task: str, *, model: str = "mlp", **overrides) -> ExperimentConfig:
+        # `model` is set in the raw dict rather than passed as an override on
+        # purpose: switching model.name afterwards would leave the previous
+        # plugin's params in place, and the config validator would then — quite
+        # correctly — reject `hidden_dims` as not a knob xgboost has.
         raw = {
             "task": task,
             "runtime": {
@@ -74,6 +78,7 @@ def make_config(tmp_path: Path):
                 "num_workers": 0,
             },
             "data": {"kind": "tabular", "path": str(csv), "target": "label"},
+            "model": {"name": model},
             "fit": {"budget": {"max_epochs": 2}, "batch_size": 16},
             "logging": {"backend": "none"},
         }

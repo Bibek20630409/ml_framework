@@ -102,11 +102,29 @@ def instantiate_datamodule(name: str, **kwargs: Any) -> Any:
 
 
 def available_models() -> list[str]:
-    return sorted(_MODEL_REGISTRY)
+    """Every registered model, from the spec registry.
+
+    A thin shim over :data:`MODELS` rather than over the v1 class registry, which
+    only ever holds ``LightningModule`` subclasses — a GBDT plugin registers a
+    build *function*, so it has no class to put there. Reading the class registry
+    here would have made ``mlf``'s idea of "available models" quietly
+    Lightning-only the moment a non-neural family landed.
+    """
+    return MODELS.names()
 
 
 def available_datamodules() -> list[str]:
-    return sorted(_DATAMODULE_REGISTRY)
+    """Every registered data source, from the spec registry.
+
+    Named for the v1 concept it replaces — datamodules stopped being an extension
+    point when there came to be exactly one (the Lightning adapter over a bundle);
+    *sources* are what users plug in. Shims over :data:`SOURCES` for the same
+    reason :func:`available_models` does: the v1 datamodule registry is populated
+    by importing the Lightning adapter, which a torch-free process never does.
+    """
+    import ml_framework.data.builders  # noqa: F401  (registration side effect)
+
+    return SOURCES.names()
 
 
 # ══ v2: spec-carrying registries ═════════════════════════════════════
@@ -135,9 +153,17 @@ def register_source(spec: SourceSpec, *, override: bool = False) -> SourceSpec:
 def get_backend(name: str) -> Any:
     """The instantiated :class:`TrainingBackend` for ``name``.
 
-    Availability is checked first, so a missing extra produces a pip command
+    Populates :data:`BACKENDS` first. Registration is an import side effect of
+    ``ml_framework.backends``, and the training pipeline imports that package for
+    other reasons — but the **serving** path does not, so without this a bundle
+    would load in ``mlf train`` and fail with "Unknown backend" in the API. Doing
+    it here rather than at every call site keeps the one rule in one place.
+
+    Availability is checked after, so a missing extra produces a pip command
     rather than an ImportError from inside the factory.
     """
+    import ml_framework.backends  # noqa: F401  (registration side effect)
+
     return BACKENDS.get(name).factory()
 
 

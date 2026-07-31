@@ -39,6 +39,6 @@ def test_mlflow_tracking_registry_and_reload(tabular_csv, make_config, tmp_path)
 
     # Load it back from the registry (by version) and predict.
     inf = Inferencer.from_registry("test-model", version, tracking_uri=uri)
-    x = np.random.default_rng(0).normal(size=(4, inf.model.input_dim)).astype("float32")
+    x = np.random.default_rng(0).normal(size=(4, inf.n_features)).astype("float32")
     preds = inf.predict(x)
     assert len(preds) == 4

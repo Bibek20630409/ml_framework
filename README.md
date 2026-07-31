@@ -1,8 +1,10 @@
 # ML Framework
 
-Production-grade PyTorch Lightning framework for **tabular**, **image**, and mixed
-data. Supports binary classification, multi-class classification, and regression —
-driven end-to-end by a single validated YAML config and a `mlf` CLI.
+Production-grade training + serving framework for **tabular**, **image**, and mixed
+data. Supports binary classification, multi-class classification, and regression
+across neural networks (PyTorch Lightning) and gradient-boosted trees (XGBoost,
+LightGBM, CatBoost) — driven end-to-end by a single validated YAML config and a
+`mlf` CLI.
 
 ```
 lr finder → HPO (Optuna) → train → serve (FastAPI)
@@ -10,13 +12,29 @@ lr finder → HPO (Optuna) → train → serve (FastAPI)
 
 ## Install
 
+**The base install carries no ML runtime.** Pick the model families you need:
+
 ```bash
-pip install -e ".[dev,serve,hpo,image,diagnostics]"   # full toolkit
-# or minimal training only:  pip install -e .
+pip install -e ".[lightning]"          # MLP / CNN (PyTorch Lightning)
+pip install -e ".[gbdt]"               # XGBoost / LightGBM / CatBoost
+pip install -e ".[gbdt,serve]"         # serve a tree model — no torch, ~500 MB lighter
+pip install -e ".[dev]"                # everything, for running the test suite
 mlf --help
 ```
 
-Extras: `image`, `serve`, `hpo`, `diagnostics`, `logging`, `dev`.
+Nothing is hidden by an install you skipped: `mlf models` lists **every** plugin
+with an availability column, and selecting one you have not installed fails
+immediately with the command that fixes it —
+
+```
+model 'xgboost' requires xgboost>=2.0. Install it with: pip install 'ml-framework[gbdt]'
+```
+
+Extras: `lightning`, `gbdt`, `image`, `serve`, `hpo`, `parquet`, `diagnostics`,
+`logging`, `mlops`, `security`, `monitoring`, `dev`.
+
+> **torch + torchvision are a pair.** Every torchvision release pins one exact
+> torch patch, so install `[lightning,image]` together and from one index.
 
 ## Quickstart
 
@@ -159,6 +177,35 @@ way with `SourceSpec`.
 | `binary` | `BCEWithLogitsLoss` (scalar `pos_weight`) | acc, F1 |
 | `multiclass` | `CrossEntropyLoss` (class weights) | acc, macro-F1 |
 | `regression` | `MSELoss` | MAE, RMSE |
+
+## Backends
+
+A **backend** owns the fit loop; a **model** knows only its architecture. Roughly
+15 models map onto 3 loop shapes, so there are 3 backends rather than 15 `fit()`
+implementations — and adding CatBoost was ~40 lines, not a new backend.
+
+| backend | shape | models |
+|---|---|---|
+| `lightning` | epoch loop + validation callbacks | `mlp`, `cnn` |
+| `gbdt` | one-shot `fit(X, y, eval_set=…)` + native early stopping | `xgboost`, `lightgbm`, `catboost` |
+| `forecast` | fit-per-series, predict-by-horizon | *(time-series work)* |
+
+Switching families is a config edit — compare `configs/example_tabular.yaml` with
+`configs/example_gbdt.yaml`: same task, same data, same blocks, different
+`model.name`. Nothing about the orchestration, the bundle or the serving contract
+changes because the fit loop did.
+
+Capability flags on each model do real work rather than describing intent. A tree
+declares `needs_scaling: false`, so the preprocessor skips `StandardScaler` —
+scaling buys a tree nothing and turns an interpretable split ("age > 41") into an
+opaque one ("age > 0.34"). It declares `supports_sample_weight: true`, so
+`imbalance_strategy: auto` gives it per-row weights instead of SMOTE, which
+interpolates synthetic neighbours an axis-aligned splitter uses poorly.
+
+**A GBDT bundle serves without torch installed.** `core/inference.py` dispatches
+on `manifest.model.backend`, so nothing in the serving path imports a checkpoint
+loader; `docker build --target serve-gbdt` is roughly 500 MB lighter than the
+deep-learning image, with a cold start to match.
 
 ## Production MLOps
 

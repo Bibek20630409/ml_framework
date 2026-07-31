@@ -7,8 +7,8 @@ Tracks progress against [ml_framework_architecture_plan.md](../ml_framework_arch
 |---|---|---|
 | P0 — Foundations | **done** | `a8692a1` |
 | P1 — Data + backend extraction | **done** | `95c4359` (P1a) · `2ac9d45` (P1b) |
-| P2 — v2 config | **done** | this branch |
-| P3 — GBDT | not started | — |
+| P2 — v2 config | **done** | `5bddf2a` |
+| P3 — GBDT | **done** | this branch |
 | P4 — AutoML | not started | — |
 | P5 — DL hardening | not started | — |
 | P6 — Time-series | not started | — |
@@ -16,13 +16,25 @@ Tracks progress against [ml_framework_architecture_plan.md](../ml_framework_arch
 | P8 — Zero-config | not started | — |
 | P9 — Deployment polish | not started | — |
 
+## Version
+
+**2.0.0 as of P3.** 1.0.0 was claiming a compatibility the package no longer has:
+P2 broke the config schema, P3 broke the install contract (torch is an extra) and
+the bundle layout (no root `model.ckpt`/`scaler.pkl`/`metadata.json`). The string
+is not cosmetic — it lands in every bundle's `manifest.json` as
+`framework_version`, which is the field someone reads to explain why an old bundle
+behaves differently, and `serving/api.py` reports it as the OpenAPI version.
+
+v1 *bundles* still load (`test_v1_bundle_compat.py`); v1 *configs* do not, and
+`mlf migrate-config` converts them.
+
 ## Test baseline
 
-**284 passed, 1 skipped** with every declared extra installed except DVC
-(46/4 before P0 → 130/4 after P0 → 249/4 after P1 → 258/1 → **284/1**). Every
-phase gate is measured against this number — a phase that ends with fewer passing
-tests than it started with has regressed something, regardless of what its own new
-tests say.
+**355 passed, 1 skipped** with every declared extra installed except DVC
+(46/4 before P0 → 130/4 after P0 → 249/4 after P1 → 258/1 → 284/1 after P2 →
+**355/1**). Every phase gate is measured against this number — a phase that ends
+with fewer passing tests than it started with has regressed something, regardless
+of what its own new tests say.
 
 **Read the 257 → 256 step carefully: it was not a regression** (2 parquet-guard tests then took it to 258). Installing
 `torchvision` makes `MODELS.is_available("cnn")` true, so
@@ -64,10 +76,19 @@ full rewrite of `tests/unit/test_config.py`. **No assertion semantics changed**
 except one test that existed to pin a transitional behaviour P2 was scheduled to
 close — see "What P2 landed" below.
 
+P3 edited existing tests only for bundle **artifact paths** (`model.ckpt` →
+`model/model.ckpt`, `scaler.pkl` → `preprocessor/scaler.pkl`) and the
+`inf.model.input_dim` → `inf.n_features` accessor rename — both §8.6 category (b).
+Two assertions inverted, and both existed to pin transitional behaviour with P3
+named as the owner: `test_v1_artifacts_remain_at_the_bundle_root` (now asserts
+they are gone) and `test_builtin_model_specs_are_registered_alongside_the_v1_registry`
+(the v1 class registry is Lightning-only by construction once a plugin registers a
+build *function* rather than a class — see `available_models` below).
+
 Verification commands (all clean):
 
 ```
-pytest                        # 282 passed, 2 skipped
+pytest                        # 355 passed, 1 skipped
 ruff check src tests
 black --check src tests
 isort --check-only src tests
@@ -76,10 +97,16 @@ mypy src
 
 ### Environment notes
 
+- **torch is an extra now, not a base dependency** (P3). `pip install -e .` gets
+  you the data layer, the config, the bundle loader and the GBDT path;
+  `[lightning]` adds the deep-learning runtime. `[dev]` installs everything, so
+  the local suite is unaffected. The one thing to remember: a lean checkout runs
+  `pytest` with the neural tests failing at import unless `[lightning]` is present
+  — which is why `dev` lists it explicitly rather than relying on the base.
 - **torch and torchvision must be installed together, from one index.** Every
   torchvision release pins one torch patch *exactly* (0.25.0 requires
   torch==2.10.0). The extras therefore keep an unbounded floor — an upper bound
-  there would pin the user's torch and contradict `torch>=2.0.0`. The constraint
+  there would pin the user's torch and contradict the `lightning` extra. The constraint
   lives in CI instead, which installs both from the CPU index in a single
   resolution. Locally, install the pair: a bare `pip install -e '.[image]'`
   resolves the newest torchvision and replaces torch to match it, silently and
@@ -287,3 +314,102 @@ are required to be importable with zero optional dependencies. Resolving a backe
 and a source would mean importing the whole data layer and every backend to
 validate a YAML file. The guarantee is the same either way — frozen,
 `extra="forbid"` — one step later for two of the three.
+
+## What P3 landed
+
+The GBDT family, and the torch-free serving path that was the point of building
+the backend split in the first place.
+
+- **`backends/gbdt.py`** — one-shot `fit(X, y, eval_set=…)` with library-native
+  early stopping. Per-library differences (serialization format, the spelling of
+  early stopping, the pruning callback) live in one adapter table, which is why
+  CatBoost was ~40 lines rather than a fourth backend.
+- **`plugins/gbdt/`** — xgboost, lightgbm, catboost. Each declares *tree shape* in
+  its own params schema; the boosting loop's knobs (`learning_rate`,
+  `n_estimators`, `subsample`, `colsample_bytree`) are declared once on the
+  backend, exactly as `lr`/`batch_size` are on the Lightning backend.
+- **`core/inference.py` rewritten** — manifest-driven, no torch. Five steps, all
+  from `manifest.json`: version check, requirement check, `backend.load`,
+  `load_preprocessor`, predict.
+- **`serving/schemas.py` + `serving/metrics.py`** — request/response models keyed
+  by `data.kind`, and Prometheus collectors that survive a second `create_app`.
+- **`core/__init__` and `data/__init__` are lazy** (PEP 562). Without this the
+  package `__init__` would import torch for every serving process no matter how
+  clean `inference.py` was.
+- **torch left the base dependencies** for a `lightning` extra — see below.
+
+### Capability flags that now do real work
+
+Each of these had exactly one named consumer in the plan; P3 is where three of
+them acquired one.
+
+| flag | consumer | observable effect |
+|---|---|---|
+| `needs_scaling=False` | `TabularPreprocessor` | a tree bundle has no fitted `StandardScaler` |
+| `supports_sample_weight` | the imbalance resolver | `imbalance_strategy: auto` yields per-row weights, not SMOTE |
+| `produces_proba` / `output.kind` | `/predict_proba` | the 400 comes from the manifest, not from `task == "regression"` |
+
+### Gates met
+
+- **The phase gate, twice.** `tests/integration/test_torch_free_serving.py` trains
+  an XGBoost bundle and serves it in a subprocess where `import torch` *raises* —
+  a stricter condition than absence, because it also catches an import that would
+  have succeeded by accident. And it was then run for real:
+
+  ```
+  python -m venv .venv && .venv/bin/pip install -e '.[gbdt,serve]'
+  mlf train --config configs/example_gbdt.yaml     # test_acc 0.90
+  # POST /predict -> {"predictions": [2.0, 2.0]}
+  # torch imported: False    pytorch_lightning imported: False
+  ```
+
+  **Measured saving: 498 MB** (torch 471 + torchvision 15 + torchmetrics 8 +
+  pytorch-lightning 4, CPU wheels). The plan estimated "~2 GB"; that figure comes
+  from CUDA builds. 498 MB is what a CPU serving image actually drops, and the
+  honest number is the one worth recording. The `gbdt-no-torch` CI job keeps it
+  enforced.
+- `grep pytorch_lightning src/ml_framework/pipeline/train.py` → still **0**.
+- **v1 bundles still load** (`test_v1_bundle_compat.py`), including the case where
+  v1's flat `ModelConfig` recorded `backbone`/`pretrained` on an MLP.
+- All three libraries train → save → reload → predict identically
+  (`test_each_library_trains_saves_and_reloads_identically`).
+
+### The dependency finding, and what it forced
+
+The plan's gate reads "a fresh venv with `pip install -e '.[gbdt,serve]'` and **no
+torch**". That could not pass as written: `torch`, `pytorch-lightning` and
+`torchmetrics` were **base** dependencies, so the lean install pulled 533 MB of
+torch and the `serve-gbdt` image would have shipped it too — leaving the concrete
+payoff the plan names unrealized.
+
+They moved to a `lightning` extra. The consequences were followed through rather
+than papered over:
+
+- `mlp`/`cnn` declare `Requirement("torch", extra="lightning")`, so on a
+  GBDT-only install they are **listed** by the registry and refuse selection with
+  `pip install 'ml-framework[lightning]'`. This is the plugin design doing exactly
+  what it was built for, and the `gbdt-no-torch` CI job asserts it.
+- `pip install ml-framework` alone no longer trains an MLP. The README leads with
+  the extras rather than burying them.
+- The `serve` and `train` Docker targets gained `lightning`; `serve-gbdt` builds
+  from a torch-free `src` stage.
+
+### Deliberate loose ends P4+ must close
+
+1. **`pipeline/hpo.py` still builds its own `pl.Trainer`** and tunes an MLP shape.
+   **P4** deletes it for `pipeline/tune.py`, which consumes the declarative spaces
+   both backends now expose.
+2. **`GbdtBackend.trial_hooks` reports rather than prunes.** The per-library
+   Optuna callbacks are written (`_xgboost_adapter`/`_lightgbm_adapter`) but the
+   driver that would install them is **P4**; CatBoost has no such callback at all,
+   and returning an empty hook set is the honest answer.
+3. **`fit.budget.max_seconds` is carried but not enforced.** The per-backend
+   wall-clock caps that make tuning-on-by-default finish in minutes belong to
+   **P4**.
+4. **`native_categorical` has no consumer yet.** The three libraries declare it,
+   but the tabular source still builds a float matrix; passing a pandas
+   `category` dtype through needs the source to stop calling `.values.astype`,
+   which is a data-layer change with its own tests.
+5. **`lr_finder.py` has no capability gate.** `mlf lr` on a GBDT config will still
+   crash inside `torch_lr_finder` rather than refusing politely.
+   `supports_lr_range_test` is declared `False` and unread — **P5**.

@@ -69,6 +69,32 @@ def apply_smote(x: np.ndarray, y: np.ndarray, seed: int) -> tuple[np.ndarray, np
     return x_res, y_res
 
 
+def balanced_sample_weights(y: np.ndarray, task: str, threshold: float = 0.3) -> np.ndarray | None:
+    """Per-**row** weights for a model that consumes ``sample_weight`` natively.
+
+    Distinct from :func:`class_weights`, which returns one weight per *class* for a
+    loss function. Boosting libraries take a weight per training row instead, so
+    this expands the balanced per-class weights back over the label array.
+
+    This is the consumer of ``Capabilities.supports_sample_weight``: SMOTE
+    synthesizes points by interpolating between neighbours, which is a poor fit for
+    an axis-aligned splitter, and these libraries expose weighting natively. Returns
+    ``None`` when the data is not imbalanced, so a balanced dataset carries no
+    weights at all rather than a vector of ones.
+    """
+    if task not in ("binary", "multiclass"):
+        return None
+    if not detect_imbalance(y, threshold):
+        log.info("sample weights: not applied (classes are balanced)")
+        return None
+    labels = np.asarray(y).astype("int64")
+    counts = np.clip(np.bincount(labels), 1, None)
+    per_class = counts.sum() / (len(counts) * counts)
+    weights = np.asarray(per_class[labels], dtype="float64")
+    log.info("sample weights: %d rows, %d classes", len(weights), len(counts))
+    return weights
+
+
 def resolve_imbalance(
     x: np.ndarray,
     y: np.ndarray,

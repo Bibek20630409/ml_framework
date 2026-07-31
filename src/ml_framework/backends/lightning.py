@@ -358,13 +358,15 @@ class LightningBackend(BaseBackend):
         the signature), and ``config.json`` is purely the audit record the plan
         says it is.
         """
-        import ml_framework.plugins  # noqa: F401  (a serving process may not have registered them)
-
         from ..core.lit_model import BaseModel
-        from ..core.registry import get_model_class
+        from ..plugins import model_class
 
         root = Path(bundle_dir)
-        model_cls = cast("type[BaseModel]", get_model_class(manifest.model.name))
+        # `model_class` imports the defining module first. The neural plugins are
+        # registered with a *lazy* build (defining a LightningModule imports torch,
+        # which is optional from P3), so their class may not be in the v1 registry
+        # yet in a process that has only ever loaded bundles.
+        model_cls = cast("type[BaseModel]", model_class(manifest.model.name))
         module = model_cls.load_from_checkpoint(
             str(root / manifest.model.artifact),
             input_dim=manifest.signature.input.n_features,

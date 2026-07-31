@@ -3,12 +3,12 @@ plugins/mlp.py
 ──────────────
 Default feed-forward network for tabular data. Registered as ``"mlp"``.
 
-Architecture comes from :class:`MLPParams` (``model.params`` in the YAML), which
-is the plugin's own frozen, ``extra="forbid"`` schema — so a typo in
-``hidden_dims`` errors at config-load time even though core knows nothing about
-this model's knobs. v1's ``ModelConfig._check_dims`` moves here with it: "all
-hidden_dims must be positive" is a fact about the MLP, not about every model in
-the framework.
+Architecture comes from :class:`~ml_framework.plugins.params.MLPParams`
+(``model.params`` in the YAML). That schema lives in ``params.py`` rather than
+here because the config validator must run it on installs without torch, while
+*this* module defines a ``LightningModule`` subclass and therefore imports torch
+at module scope. ``plugins/__init__.py`` registers the spec with a lazy ``build``,
+so nothing imports this file until an MLP is actually constructed.
 
 Kaiming init for ReLU stacks, unchanged.
 """
@@ -16,25 +16,11 @@ Kaiming init for ReLU stacks, unchanged.
 from __future__ import annotations
 
 import torch.nn as nn
-from pydantic import BaseModel as PydanticModel
-from pydantic import Field, model_validator
 
 from ..core.lit_model import BaseModel
 from ..core.protocols import BuildContext
 from ..core.registry import register_model
-
-
-class MLPParams(PydanticModel):
-    model_config = {"frozen": True, "extra": "forbid"}
-
-    hidden_dims: list[int] = Field(default_factory=lambda: [128, 64, 32])
-    dropout: float = Field(default=0.3, ge=0.0, lt=1.0)
-
-    @model_validator(mode="after")
-    def _check_dims(self) -> MLPParams:
-        if any(d <= 0 for d in self.hidden_dims):
-            raise ValueError("all hidden_dims must be positive")
-        return self
+from .params import MLPParams
 
 
 @register_model("mlp")

@@ -1,14 +1,32 @@
 """
 serving/api.py
 ──────────────
-FastAPI inference service around the artifact bundle / MLflow registry. The model
-is loaded once at startup and reused across requests.
+FastAPI inference service over an artifact bundle (or an MLflow registry model).
+The model is loaded once at startup and reused across requests.
 
 Endpoints:
-  GET  /health          → liveness/readiness (unauthenticated)
-  GET  /metrics         → Prometheus metrics (unauthenticated)
-  POST /predict         → {"predictions": [...]}         (auth + rate-limited)
-  POST /predict_proba   → {"probabilities": [[...]]}      (auth + rate-limited)
+  GET  /health                  → liveness/readiness + what is loaded (unauthenticated)
+  GET  /metrics                 → Prometheus metrics (unauthenticated)
+  POST /predict                 → {"predictions": [...], "labels": [...]}
+  POST /predict_proba           → {"probabilities": [[...]], "classes": [...]}
+  POST /predict_with_confidence → {"predictions": [...], "confidence": [...]}
+  GET  /drift                   → PSI per feature (tabular bundles only)
+
+**Nothing here imports torch.** The app talks to an
+:class:`~ml_framework.core.inference.Inferencer`, which dispatches on the bundle
+manifest, so the same code serves a Lightning checkpoint and an XGBoost booster —
+and a GBDT image never installs a deep-learning stack to do it.
+
+Three things are manifest-derived rather than hardcoded, each replacing a v1 wart:
+
+* **The request/response schemas**, chosen by ``data.kind`` from
+  ``serving/schemas.py``, so ``/docs`` describes *this* model.
+* **The ``/predict_proba`` refusal**, which reads ``signature.output.kind``
+  instead of testing ``task == "regression"`` — a check that was wrong for every
+  task not yet invented.
+* **The input contract**, from ``signature.input``, replacing
+  ``getattr(inf.model, "input_dim", None)`` — code that reached into a torch
+  module to learn its own API and returned ``None`` for anything else.
 
 Hardening (production): API-key auth (``X-API-Key``), per-client rate limiting,
 and request-size caps. Secrets come from the environment, never config files.
@@ -23,32 +41,20 @@ from typing import Any
 
 import numpy as np
 from fastapi import Depends, FastAPI, Header, HTTPException
-from pydantic import BaseModel, Field
 
-from ..core import Inferencer
+from ..core.inference import Inferencer
+from ..core.types import UnsupportedCapability
+from .metrics import get_collectors, instrument
+from .schemas import (
+    ConfidenceResponse,
+    PayloadError,
+    ProbaResponse,
+    request_model,
+    response_model,
+    supports_drift,
+)
 
 log = logging.getLogger(__name__)
-
-# Prometheus is optional (part of the [serve]/[mlops] extras).
-_PRED_COUNTER: Any = None
-_DRIFT_GAUGE: Any = None
-try:
-    from prometheus_client import Counter, Gauge
-    from prometheus_fastapi_instrumentator import Instrumentator
-
-    _PROM = True
-    _PRED_COUNTER = Counter(
-        "mlf_predictions_total",
-        "Model predictions, labelled by predicted class",
-        ["predicted_class"],
-    )
-    _DRIFT_GAUGE = Gauge(
-        "mlf_feature_psi",
-        "Input feature drift (PSI) vs the training reference distribution",
-        ["feature"],
-    )
-except Exception:  # pragma: no cover - prometheus not installed
-    _PROM = False
 
 # slowapi is optional (part of the [security] extra).
 try:
@@ -58,20 +64,8 @@ try:
     from slowapi.util import get_remote_address
 
     _SLOWAPI = True
-except Exception:  # pragma: no cover - slowapi not installed
+except ImportError:  # pragma: no cover - slowapi not installed
     _SLOWAPI = False
-
-
-class PredictRequest(BaseModel):
-    instances: list[list[float]] = Field(..., min_length=1)
-
-
-class PredictResponse(BaseModel):
-    predictions: list[float]
-
-
-class ProbaResponse(BaseModel):
-    probabilities: list[list[float]]
 
 
 def create_app(
@@ -91,6 +85,7 @@ def create_app(
     local/dev), ``rate_limit`` (None → disabled), and ``max_instances`` per request.
     """
     state: dict[str, Any] = {"inferencer": None, "tracker": None}
+    collectors = get_collectors()
 
     def _load() -> Inferencer:
         if registry_model:
@@ -103,7 +98,9 @@ def create_app(
         log.info("model loaded (registry=%s dir=%s)", registry_model, artifact_dir)
         yield
 
-    app = FastAPI(title="ML Framework Inference API", version="1.0.0", lifespan=lifespan)
+    from .. import __version__
+
+    app = FastAPI(title="ML Framework Inference API", version=__version__, lifespan=lifespan)
 
     # ── Rate limiting (per client IP) ─────────────────────
     if _SLOWAPI and rate_limit:
@@ -136,59 +133,133 @@ def create_app(
 
             inf = _get_inferencer()
             state["tracker"] = DriftTracker(
-                inf.reference_stats, inf.feature_cols, gauge=_DRIFT_GAUGE
+                inf.reference_stats, inf.feature_cols, gauge=collectors.drift
             )
         return state["tracker"]
 
-    def _to_array(req: PredictRequest) -> np.ndarray:
-        if len(req.instances) > max_instances:
-            raise HTTPException(
-                status_code=413,
-                detail=f"too many instances: {len(req.instances)} > {max_instances}",
-            )
-        arr = np.asarray(req.instances, dtype="float32")
-        if arr.ndim != 2:
-            raise HTTPException(status_code=422, detail="instances must be a 2D array")
+    # The bundle is loaded lazily, so the request schema cannot be a static
+    # annotation without forcing a load at import time. The body is validated
+    # explicitly instead, against the model chosen from the manifest.
+    def _parse(body: dict[str, Any]) -> tuple[Inferencer, Any, np.ndarray]:
         inf = _get_inferencer()
-        expected = getattr(inf.model, "input_dim", None)
+        try:
+            req = request_model(inf.data_kind).model_validate(body)
+        except PayloadError as exc:
+            raise HTTPException(status_code=501, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+        n_rows = getattr(req, "n_rows", 0)
+        if n_rows > max_instances:
+            raise HTTPException(
+                status_code=413, detail=f"too many instances: {n_rows} > {max_instances}"
+            )
+        # Checked rather than caught: a kind whose request schema cannot yet build
+        # model input is a 501, but an AttributeError raised *inside* to_array is a
+        # bug and must not be reported as "not implemented".
+        to_array = getattr(req, "to_array", None)
+        if to_array is None:
+            raise HTTPException(
+                status_code=501,
+                detail=f"serving data kind '{inf.data_kind}' is not implemented yet",
+            )
+        try:
+            arr = to_array(inf.feature_cols)
+        except PayloadError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+        expected = inf.n_features
         if expected and arr.shape[1] != expected:
             raise HTTPException(
-                status_code=422,
-                detail=f"expected {expected} features, got {arr.shape[1]}",
+                status_code=422, detail=f"expected {expected} features, got {arr.shape[1]}"
             )
-        return arr
+        return inf, req, arr
 
+    def _labels(inf: Inferencer, preds: np.ndarray) -> list[str] | None:
+        """Human-readable class names, when the bundle records them."""
+        names = inf.class_names
+        if not names or not inf.produces_proba:
+            return None
+        return [names[int(p)] if 0 <= int(p) < len(names) else str(int(p)) for p in preds]
+
+    # ── Routes ────────────────────────────────────────────
     @app.get("/health")
     def health() -> dict:
+        """Keeps v1's ``status``/``task`` keys and adds what is actually loaded."""
         inf = _get_inferencer()
-        return {"status": "ok", "task": inf.task, "model": inf.config.model.name}
+        return {
+            "status": "ok",
+            "task": inf.task,
+            "model": inf.model_name,
+            "backend": inf.backend_name,
+            "data_kind": inf.data_kind,
+            "bundle_version": inf.manifest.bundle_version,
+            "framework_version": inf.manifest.framework_version,
+            "n_features": inf.n_features,
+        }
 
-    @app.post("/predict", response_model=PredictResponse, dependencies=auth)
-    def predict(req: PredictRequest) -> PredictResponse:
-        inf = _get_inferencer()
-        arr = _to_array(req)
+    @app.post("/predict", dependencies=auth)
+    def predict(body: dict[str, Any]) -> Any:
+        inf, _, arr = _parse(body)
         preds = inf.predict(arr)
-        _get_tracker().observe(arr)  # feed the rolling drift window
-        if _PROM and _PRED_COUNTER is not None and inf.task != "regression":
+        if supports_drift(inf.data_kind):
+            _get_tracker().observe(arr)  # feed the rolling drift window
+        if collectors.predictions is not None and inf.produces_proba:
             for p in preds:
-                _PRED_COUNTER.labels(predicted_class=str(int(p))).inc()
-        return PredictResponse(predictions=[float(p) for p in preds])
+                collectors.predictions.labels(predicted_class=str(int(p))).inc()
+        model = response_model(inf.data_kind)
+        return model(predictions=[float(p) for p in preds], labels=_labels(inf, preds))
+
+    @app.post("/predict_proba", response_model=ProbaResponse, dependencies=auth)
+    def predict_proba(body: dict[str, Any]) -> ProbaResponse:
+        inf, _, arr = _parse(body)
+        try:
+            probs = inf.predict_proba(arr)
+        except UnsupportedCapability as exc:
+            # From the manifest, not from a hardcoded task check.
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return ProbaResponse(
+            probabilities=[[float(v) for v in row] for row in probs],
+            classes=inf.class_names,
+        )
+
+    @app.post("/predict_with_confidence", response_model=ConfidenceResponse, dependencies=auth)
+    def predict_with_confidence(body: dict[str, Any]) -> ConfidenceResponse:
+        """``Inferencer.predict_with_confidence`` exposed over HTTP."""
+        inf, _, arr = _parse(body)
+        try:
+            preds, conf = inf.predict_with_confidence(arr)
+        except UnsupportedCapability as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return ConfidenceResponse(
+            predictions=[int(p) for p in preds],
+            confidence=[float(c) for c in conf],
+            labels=_labels(inf, preds),
+        )
 
     @app.get("/drift", dependencies=auth)
     def drift() -> dict:
-        """Current input drift (PSI per feature) over the rolling window."""
+        """Current input drift (PSI per feature) over the rolling window.
+
+        Tabular only. PSI over token ids or pixel bytes is a number without a
+        meaning, so other kinds get an explicit 501 rather than a plausible-looking
+        answer.
+        """
+        inf = _get_inferencer()
+        if not supports_drift(inf.data_kind):
+            raise HTTPException(
+                status_code=501,
+                detail=(
+                    f"drift is computed over named numeric features; data kind "
+                    f"'{inf.data_kind}' has none"
+                ),
+            )
         return {"psi": _get_tracker().compute()}
 
-    @app.post("/predict_proba", response_model=ProbaResponse, dependencies=auth)
-    def predict_proba(req: PredictRequest) -> ProbaResponse:
-        inf = _get_inferencer()
-        if inf.task == "regression":
-            raise HTTPException(status_code=400, detail="proba unavailable for regression")
-        probs = inf.predict_proba(_to_array(req))
-        return ProbaResponse(probabilities=[[float(v) for v in row] for row in probs])
-
     # Expose latency/throughput/error metrics at /metrics for Prometheus.
-    if _PROM:
-        Instrumentator().instrument(app).expose(app, include_in_schema=False)
+    instrument(app)
 
     return app
+
+
+__all__ = ["create_app"]

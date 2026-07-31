@@ -9,9 +9,12 @@ broken model module — a syntax error, a bad refactor — vanished from the reg
 with no message, indistinguishable from "torchvision is not installed". The v2
 design removes the exception rather than catching it better:
 
-* **A plugin module must be importable with zero optional dependencies.** Heavy
-  imports live inside ``build_network``/``fit``. Both builtins already obeyed
-  this, which is why the ``try`` never had anything legitimate to catch.
+* **Registering a plugin must not import its runtime.** For the GBDT plugins that
+  means module-scope pydantic only, with xgboost imported inside ``build()``. The
+  neural plugins cannot manage that — defining a ``LightningModule`` subclass
+  imports torch — so their *schemas* live in ``params.py`` and their modules are
+  reached through a lazy ``build``. Either way, registration is cheap and
+  dependency-free.
 * **Availability is answered by** ``importlib.util.find_spec`` **through**
   ``Requirement`` — no import, no exception. ``cnn`` therefore appears in
   ``MODELS`` with ``available: False`` on a bare install instead of disappearing.
@@ -29,6 +32,8 @@ schema the config validator runs against ``model.params``.
 
 from __future__ import annotations
 
+import importlib
+from collections.abc import Callable
 from typing import Any
 
 from ..core.plugins import ModelSpec
@@ -36,18 +41,47 @@ from ..core.protocols import Float
 from ..core.registry import MODELS, register_model_spec
 from ..core.types import Capabilities, Requirement
 
-# The builtin imports are unconditional on purpose: both modules are
-# dependency-free at module scope, so a failure here is a real defect and must
-# not be hidden behind an optional-dependency excuse.
-from .cnn import CNN, CNNParams
-from .cnn import build as _build_cnn
-from .mlp import MLP, MLPParams
-from .mlp import build as _build_mlp
+# Unconditional on purpose: neither module needs an optional dependency to import,
+# so a failure here is a real defect and must not be hidden behind an
+# optional-dependency excuse.
+from . import gbdt as _gbdt  # registers xgboost / lightgbm / catboost
+from .params import CNNParams, MLPParams
 
 # The explicit builtin list, in registration order.
-BUILTINS: tuple[str, ...] = ("mlp", "cnn")
+BUILTINS: tuple[str, ...] = ("mlp", "cnn", *_gbdt.BUILTINS)
 
-__all__ = ["BUILTINS", "CNN", "CNNParams", "MLP", "MLPParams"]
+__all__ = ["BUILTINS", "CNNParams", "MLPParams", "model_class"]
+
+
+def _lazy_build(module: str) -> Callable[..., Any]:
+    """Defer a plugin module's import to the moment a model is actually built.
+
+    ``mlp.py``/``cnn.py`` define ``LightningModule`` subclasses, so importing them
+    imports torch — which is optional from P3 onward. Their *schemas* live in
+    ``params.py`` and are imported eagerly above, which is what the spec needs to
+    validate ``model.params``. The GBDT plugins need no such deferral: their
+    modules are pydantic-only at import time.
+    """
+
+    def _build(ctx: Any) -> Any:
+        return importlib.import_module(module, __name__).build(ctx)
+
+    return _build
+
+
+def model_class(name: str) -> type:
+    """The ``LightningModule`` subclass for ``name``, importing it on demand.
+
+    ``core.registry.get_model_class`` reads a dict that is only populated once the
+    defining module has been imported — which, for the lazily-imported neural
+    plugins, is not guaranteed. This triggers that import first.
+    """
+    from ..core.registry import get_model_class
+
+    key = name.lower()
+    if key in {"mlp", "cnn"}:
+        importlib.import_module(f".{key}", __name__)
+    return get_model_class(key)
 
 
 def _mlp_suggest(trial: Any, cfg: Any = None) -> dict[str, Any]:
@@ -67,6 +101,18 @@ def _mlp_suggest(trial: Any, cfg: Any = None) -> dict[str, Any]:
     }
 
 
+# torch moved out of the base dependencies in P3, so the neural plugins declare it
+# like any other optional runtime. On an install without `[lightning]` they stay
+# listed by `mlf models` — marked unavailable, with the pip command that fixes it —
+# which is the whole reason availability is answered by `find_spec` rather than by
+# a failed import.
+_TORCH_REQUIREMENTS: tuple[Requirement, ...] = (
+    Requirement("torch", extra="lightning", min_version="2.0"),
+    Requirement(
+        "pytorch_lightning", extra="lightning", min_version="2.0", dist="pytorch-lightning"
+    ),
+)
+
 _NEURAL_CAPS: dict[str, bool] = {
     "needs_scaling": True,
     "produces_proba": True,
@@ -83,10 +129,10 @@ register_model_spec(
     ModelSpec(
         name="mlp",
         backend="lightning",
-        build=_build_mlp,
+        build=_lazy_build(".mlp"),
         tasks=frozenset({"binary", "multiclass", "regression"}),
         data_kinds=frozenset({"tabular"}),
-        requires=(),  # torch is a base dependency
+        requires=_TORCH_REQUIREMENTS,
         capabilities=Capabilities(accepts=frozenset({"arrays"}), **_NEURAL_CAPS),
         # Declarative keys are dotted v2 config paths; `suggest` overrides them
         # because hidden_dims is conditional on the layer count.
@@ -102,10 +148,11 @@ register_model_spec(
     ModelSpec(
         name="cnn",
         backend="lightning",
-        build=_build_cnn,
+        build=_lazy_build(".cnn"),
         tasks=frozenset({"binary", "multiclass"}),
         data_kinds=frozenset({"image"}),
         requires=(
+            *_TORCH_REQUIREMENTS,
             Requirement("torchvision", extra="image", min_version="0.15"),
             Requirement("PIL", extra="image", min_version="9.0", dist="Pillow"),
         ),
