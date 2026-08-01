@@ -1155,6 +1155,58 @@ in the repository.
 3. **The generated Dockerfile is not built in CI**, so it is checked for content
    rather than for actually producing a working image.
 4. **Text and seq2seq cannot be traced** — refused with a reason.
-5. Everything still open from P4–P8: `native_categorical` has no consumer,
+5. **Both export paths run on machinery PyTorch has deprecated** — measured below,
+   and P10's to close.
+6. Everything still open from P4–P8: `native_categorical` has no consumer,
    multi-series forecasting, `exog`, entity-level NER scoring, seq2seq vocabulary
    resizing, text drift.
+
+### The deprecation P10 inherits, measured rather than guessed
+
+Both formats sit on TorchScript, which PyTorch is retiring. On torch 2.10 /
+Python 3.14 the suite is green but noisy:
+
+    torch/jit/_trace.py:994          torch.jit.trace is not supported in Python 3.14+
+    torch/onnx/.../torchscript_exporter/utils.py:218   the feature will be removed
+
+The second one is the surprise: `dynamo=False` at `lightning.py` routes **ONNX**
+through the TorchScript exporter too, so this is not a TorchScript-format-only
+problem. That pin was correct when written — the dynamo exporter needs
+`onnxscript`, which the `export` extra does not declare, so the torch 2.9+ default
+would fail on a correctly-installed machine.
+
+**The blocker is one missing package, and the opset pin survives.** Measured with
+`onnxscript` 0.7.1 present, exporting and verifying in one process, through
+onnxruntime at 1/7/64 rows:
+
+| requested | artifact `opset_import` | batch axis | max abs diff |
+|---|---|---|---|
+| 17 | 17 | `'batch'` | **5.96e-08** |
+| 18 | 18 | `'batch'` | 1.19e-07 |
+
+5.96e-08 is the *same* figure the legacy exporter produces in the gate above, so
+the migration does not move the number, and `ONNX_OPSET = 17` needs no
+renegotiation with deployment targets.
+
+**One caveat that belongs in the test, not in a comment.** Torch builds at opset 18
+and down-converts, warning that conversion "may not be successful". It succeeded
+here for `Gemm`/`Relu`; the CNN adds `Conv`/`MaxPool`, all long-settled ops, so the
+risk is low — but it is **op-dependent, not a blanket guarantee**. The export test
+should assert `opset_import` on the produced file, so an op that fails to
+down-convert fails the build instead of silently shipping an opset-18 artifact to a
+runtime that was promised 17.
+
+**The trap in the migration.** `export()` traces at batch size **1**
+(`torch.zeros(shape)`). Harmless for TorchScript; fatal for `torch.export`, which
+treats 0 and 1 as special values and specializes the dimension to a constant —
+`ConstraintViolationError: You marked batch as dynamic but your code specialized it
+to be a constant (1)`. The example tensor must be batch ≥ 2. This is exactly the
+frozen-batch failure the seven-row gate exists to catch, so the test would catch
+it; the point is to not spend the debugging.
+
+**TorchScript has no fix.** `torch.jit` is end-of-life and there is no shim that
+keeps `trace` working on 3.14+. The replacement is `torch.export` + `.pt2`, which
+round-trips exactly (verified, dynamic batch intact). That makes it a
+user-visible format decision on `mlf export --format torchscript` rather than a
+code edit, which is why it is not being done as a P9 amendment: the warnings are
+noise today, not breakage, and P9's gates pass as committed.
