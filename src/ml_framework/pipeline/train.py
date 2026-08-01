@@ -71,7 +71,20 @@ def train(
     *,
     emit_config: str | Path | None = None,
     resume: bool | str | Path = False,
+    baseline: bool = False,
 ) -> dict:
+    """Fit the configured model and write a bundle; return its metrics.
+
+    ``baseline=True`` also scores the trivial predictor (majority class / mean /
+    seasonal-naive) and records it under ``baseline_*``, with a WARNING when the
+    model fails to beat it. The CLI sets it whenever the *framework* chose the
+    model rather than the user: a zero-config score has nothing to be judged
+    against, and `test_acc: 0.91` on a dataset that is 91% one class is the most
+    common way a pipeline looks successful while having learned nothing.
+
+    Off by default because a user who named the model has their own frame of
+    reference, and the flag is about supplying one that is missing.
+    """
     out = Path(config.runtime.output_dir)
     out.mkdir(parents=True, exist_ok=True)
     setup_logging(out)
@@ -143,6 +156,12 @@ def train(
             output_dir=out,
             class_names=config.data.class_names,
         )
+        if baseline:
+            trivial = _baseline_metrics(predictions, bundle, config.task)
+            metrics.update(trivial)
+            # After the merge, so the comparison reads the same dict that lands in
+            # metrics.json rather than a copy that could drift from it.
+            _compare_to_baseline(metrics, trivial, config.task)
         # The CV estimate sits beside the holdout score rather than replacing it:
         # they answer different questions, and a single held-out number on a small
         # dataset is exactly the one worth distrusting.
@@ -306,6 +325,28 @@ def _register_with_mlflow(
 
 
 # ── Bundle assembly ───────────────────────────────────────
+def _compare_to_baseline(metrics: dict[str, float], trivial: dict[str, float], task: str) -> None:
+    from ..core.baseline import compare
+
+    compare(metrics, trivial, task)
+
+
+def _baseline_metrics(predictions: Any, bundle: Any, task: str) -> dict[str, float]:
+    """Score the trivial predictor and say whether the model beat it.
+
+    Reads the training labels off the bundle so the statistic comes from the split
+    it should — taking the majority class from the *test* labels would make the
+    baseline stronger than anything achievable at training time, inverting the
+    comparison.
+    """
+    from ..core.baseline import baseline_metrics
+
+    scores = baseline_metrics(predictions, task, train_y=bundle.train.y)
+    if not scores:
+        log.info("no meaningful trivial baseline for task '%s'; skipping", task)
+    return scores
+
+
 def _save_preprocessor(bundle: Any, out: Path) -> dict[str, Any] | None:
     """Write the preprocessor's own directory and return its manifest fragment.
 

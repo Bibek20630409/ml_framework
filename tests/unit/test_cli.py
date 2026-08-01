@@ -364,3 +364,45 @@ def test_listing_the_registry_imports_no_optional_runtime():
         [sys.executable, "-c", probe], capture_output=True, text=True, check=True
     )
     assert "LEAKED=\n" in result.stdout or result.stdout.rstrip().endswith("LEAKED=")
+
+
+# ── `mlf backends` ────────────────────────────────────────
+@pytest.mark.unit
+def test_backends_command_lists_the_fit_loop_shapes(capsys):
+    """The other half of the plugin surface. One renderer serves both because the
+    interesting columns are the same — what it is, whether it is ready, and what
+    would make it ready."""
+    assert cli.main(["backends"]) == 0
+
+    out = capsys.readouterr().out
+    assert "lightning" in out and "gbdt" in out and "forecast" in out
+    # The second column answers what a *backend* can consume, not what it rides on.
+    assert "ACCEPTS" in out
+    assert "series" in out
+
+
+@pytest.mark.unit
+def test_backends_show_reports_capabilities_not_search_spaces(capsys):
+    """A backend has no tasks or data kinds of its own; what distinguishes one is
+    what it can do with hardware and a trial."""
+    assert cli.main(["backends", "--show"]) == 0
+
+    out = capsys.readouterr().out
+    assert "supports:" in out
+    assert "mixed-precision" in out  # lightning
+    assert "tasks:" not in out
+
+
+# ── `mlf init` and `mlf train --data` reach the parser ────
+@pytest.mark.unit
+def test_train_accepts_data_without_a_config():
+    """`--config` stopped being required when `--data` could supply one."""
+    args = cli.build_parser().parse_args(["train", "--data", "x.csv"])
+    assert args.config is None and args.data == "x.csv"
+
+
+@pytest.mark.unit
+def test_a_command_with_neither_config_nor_data_says_so():
+    args = cli.build_parser().parse_args(["train"])
+    with pytest.raises(SystemExit, match="pass --config, or --data"):
+        cli._load_config(args)

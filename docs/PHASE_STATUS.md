@@ -13,7 +13,7 @@ Tracks progress against [ml_framework_architecture_plan.md](../ml_framework_arch
 | P5 — DL hardening | **done** | `3296920` |
 | P6 — Time-series | **done** | `01bd2aa` |
 | P7 — NLP | **done** | `e06c299` |
-| P8 — Zero-config | not started | — |
+| P8 — Zero-config | **done** | this branch |
 | P9 — Deployment polish | not started | — |
 
 ## Version
@@ -921,3 +921,126 @@ until token tagging, then wrong. Now a `STRATIFIED_TASKS` table.
 3. **A seq2seq model cannot resize its vocabulary.** Adding tokens to the
    preprocessor's tokenizer would leave the embedding table behind.
 4. **Drift for text remains a 501** (from P7).
+
+## P8 — Zero-config — **done**
+
+`mlf train --data x.csv` with no YAML and no flags produces a bundle and reports
+against a baseline. That is the stated exit gate, and it is the first test in
+`tests/integration/test_zero_config.py`.
+
+- **`data/sniff.py`** — kind, target, task, each with the rule that produced it.
+- **`config/defaults.py`** — the model rules table, keyed by `(kind, task)`.
+- **`config/autoconfig.py`** — synthesis to a plain dict, and the merge.
+- **`core/baseline.py`** — the trivial model, scored beside the real one.
+- **`mlf init`** — the synthesized YAML, with a comment per inferred field.
+- **`mlf backends`** — the other half of the plugin surface (`mlf models` landed
+  just before this phase).
+
+### The three decisions that make it trustworthy rather than merely convenient
+
+**Synthesis produces a plain dict, never a validated config.** That single choice
+is the whole mechanism: it lets synthesized values sit in an ordinary precedence
+chain instead of being special-cased anywhere downstream.
+
+    plugin defaults < synthesis < YAML file < --set < explicit CLI flags
+
+Nothing below that line can tell which layer a value came from, so `--data` and
+`--config` *compose* rather than being alternatives — point at a CSV, keep a YAML
+that overrides two fields, and exactly those two are overridden. The merge is
+recursive for the same reason: a shallow one would make a YAML that sets only
+`model.name` discard the synthesized `data.kind` beside it.
+
+**An uninstalled family is a refusal, not a substitution.** If `[gbdt]` is missing,
+a tabular run raises `MissingExtraError` with the pip command rather than quietly
+training an MLP. This matters more here than anywhere else in the framework: the
+user did not choose the model, so a score from the wrong one looks exactly like
+the score they asked for. The single sanctioned exception — seasonal-naive as the
+forecasting fallback — is marked `downgrade=True` in the table and logged at
+WARNING.
+
+**Every inference carries its rule.** The CLI logs each one (weak ones at WARNING)
+and `mlf init` writes them into the generated file:
+
+    task: multiclass  # inferred: the target is non-float with 3 distinct values
+    data:
+      kind: tabular  # inferred: columns are numeric or short strings
+      target: label  # inferred: column is named 'label'
+
+Fallbacks are marked `GUESS` rather than `inferred`, in the file and in the header
+block. A framework that decides things for you and will not say why is worse than
+one that makes you type.
+
+### Refusals, and the one guess it does make
+
+Two columns named `label` and `target` is not a tie to be broken by column order —
+it raises and names them. Two columns of prose, likewise. The one genuinely weak
+rule is "no conventional name, so use the last column", which is right often
+enough to be worth doing and wrong often enough to say out loud.
+
+`data.kind` is decided on positive evidence in both directions: a datetime column
+must also be **monotonic** before the data is a time series (parsing alone would
+make a table of birthdays one), and a string column must average ≥ 4 whitespace
+tokens before it is prose (a column of colour names is a *feature*, and treating
+it as text would fine-tune a 66M-parameter encoder on the word "red").
+
+### The baseline, and why it is on by default here only
+
+`test_acc: 0.91` on a dataset that is 91% one class is the most common way a
+pipeline looks successful while having learned nothing. A user who named the model
+has their own frame of reference; a zero-config user has none. So whenever the
+*framework* chose the model, the trivial predictor is scored too — majority class,
+training mean, or repeat-last-season — and recorded under `baseline_*`.
+
+Failing to beat it is a WARNING, not an error. A model that ties the baseline on a
+genuinely unpredictable target is an honest result, and failing the run would be
+pretending otherwise.
+
+Two details that are easy to get backwards and produce a number that looks fine:
+the statistic comes from the **training** split (taking the majority class from
+test would make the baseline stronger than anything achievable honestly), and the
+comparison uses the task's **declared direction** (MAE, RMSE and MASE improve by
+getting smaller).
+
+Whether the framework chose is decided against the *surviving* value, not by
+whether synthesis ran: a YAML, a `--set` or an explicit `--model` all mean the user
+chose, and then the baseline is not the point.
+
+### A pre-existing bug this phase had to fix
+
+`--set model.name=catboost` failed on **any** config, including a plain YAML with
+no zero-config involved. `_resolve_plugin_params` writes every default back into
+`model.params` at load time, so a config validated once carries xgboost's
+`tree_method` — and re-validating it as catboost failed with a wall of "extra
+inputs are not permitted".
+
+Fixed by clearing `model.params` when `model.name` is overridden, *before* the
+overrides are applied so that `--set model.name=catboost --set model.params.depth=5`
+lands `depth` on an empty dict. Clearing afterwards would either keep the stale
+keys or discard the value just set. Fixed here rather than deferred because
+`--set` is a documented layer of the chain this phase ships, and a layer that
+cannot change the model is a broken layer.
+
+### Also fixed while wiring it up
+
+A synthesized tabular config sets `data.params.imbalance_strategy: auto`. The
+schema default is `smote`, kept so an existing v1 config trains exactly as it did —
+but zero-config always picks a tree, which consumes sample weights natively and is
+measurably hurt by synthetic neighbours. Left at the default, *every* zero-config
+tabular run emitted a warning telling the user to set the value synthesis now sets.
+
+Pointing `--data` at an arbitrary directory used to surface a raw pyarrow schema
+error, because a directory of parquet part-files is a legitimate table. The sniffer
+now owns that message.
+
+### Deliberate loose ends P9+ must close
+
+1. **`--kind` cannot be forced.** `--text-col` and `--time-col` force text and
+   timeseries respectively, but there is no direct override for `data.kind`.
+2. **Image zero-config reuses the training folder as `test_dir`**, recorded as a
+   weak inference. There is no way to infer a held-out image directory.
+3. **No baseline for `seq2seq`** — "always emit the most common string" is not a
+   comparison anybody would make.
+4. **Drift for text remains a 501** (from P7).
+5. **Entity-level NER scoring, seq2seq vocabulary resizing** (from P7).
+6. **Multi-series forecasting and `exog` consumption** (from P6).
+7. **`native_categorical` still has no consumer** (from P4).

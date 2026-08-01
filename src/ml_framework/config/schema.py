@@ -420,6 +420,21 @@ class ExperimentConfig(BaseModel):
         ``extra="forbid"`` params model.
         """
         data = self.model_dump()
+
+        # Changing the model invalidates the params that belong to the old one.
+        # `_resolve_plugin_params` writes every default back into `model.params` at
+        # load time, so a config validated once carries xgboost's `tree_method` --
+        # and re-validating it as catboost fails with a wall of "extra inputs are
+        # not permitted".
+        #
+        # Cleared *before* the overrides are applied rather than after, so that
+        # `--set model.name=catboost --set model.params.depth=5` lands `depth` on an
+        # empty dict and the rest of catboost's defaults materialize around it.
+        # Clearing afterwards would either keep the stale keys or discard the depth
+        # the user just set, and both are wrong.
+        if "model.name" in overrides:
+            data["model"]["params"] = {}
+
         for dotted, value in overrides.items():
             creatable = dotted.startswith(_CREATABLE_PREFIXES)
             keys = dotted.split(".")
@@ -431,6 +446,7 @@ class ExperimentConfig(BaseModel):
             if keys[-1] not in node and not creatable:
                 raise KeyError(f"Unknown config key: {dotted}")
             node[keys[-1]] = value
+
         return self.__class__.model_validate(data)
 
 

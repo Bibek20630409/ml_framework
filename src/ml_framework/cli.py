@@ -5,6 +5,9 @@ cli.py
 accept dotted ``--set key=value`` overrides.
 
     mlf models         [--all] [--show]
+    mlf backends       [--all] [--show]
+    mlf init           --data data/raw/sample.csv -o configs/mine.yaml
+    mlf train          --data data/raw/sample.csv          # no YAML at all
     mlf lr             --config configs/example_tabular.yaml
     mlf tune           --config configs/example_tabular.yaml --emit-config configs/tuned.yaml
     mlf train          --config configs/example_tabular.yaml --set fit.budget.max_epochs=5
@@ -17,8 +20,20 @@ accept dotted ``--set key=value`` overrides.
 ``config/defaults.py``) — 300 s for trees, 900 s for neural nets. ``--no-tune``
 skips it; ``--tune-budget``/``--tune-trials`` turn it up just as easily.
 
-``mlf models`` is the only command that takes no config: it answers "what can this
-install train, and what would it take to widen that" from the plugin registry
+**Zero-config.** ``--data`` synthesizes a config by looking at the file, so
+``mlf train --data x.csv`` needs no YAML. Every inferred field is logged with the
+rule that produced it, and ``--data`` composes with ``--config``: synthesis is
+just one layer of an ordinary precedence chain,
+
+    plugin defaults < synthesis < YAML file < --set < explicit CLI flags
+
+so a YAML that sets two fields overrides exactly those two. A run whose model the
+*framework* chose also scores the trivial baseline and warns if the model fails to
+beat it — see ``core/baseline.py`` for why that is the guard that matters most
+here.
+
+``mlf models`` and ``mlf backends`` take no config at all: they answer "what can
+this install train, and what would it take to widen that" from the plugin registry
 alone. It deliberately lists models whose optional extra is **missing**, with the
 ``pip install`` line that fixes each — a listing of only what happens to be
 installed would describe the machine rather than the framework, and would make an
@@ -31,9 +46,11 @@ import argparse
 import json
 import logging
 import os
+from pathlib import Path
 from typing import Any
 
 from .config import ExperimentConfig
+from .core.types import FrameworkError
 from .utils import setup_logging
 
 log = logging.getLogger(__name__)
@@ -50,15 +67,82 @@ def _parse_override(raw: str) -> tuple[str, Any]:
     return key.strip(), parsed
 
 
+def _add_data_args(sub: argparse.ArgumentParser) -> None:
+    """The zero-config surface: point at data, let the framework read it."""
+    sub.add_argument(
+        "--data",
+        "-d",
+        default=None,
+        help="Dataset to infer a config from (CSV/Parquet/JSONL, or an image folder)",
+    )
+    sub.add_argument("--target", default=None, help="Target column (else inferred)")
+    sub.add_argument("--time-col", default=None, help="Time column, forcing a time series")
+    sub.add_argument("--text-col", default=None, help="Text column, forcing a text corpus")
+    sub.add_argument("--model", default=None, help="Model name (else chosen from the data)")
+    sub.add_argument("--output-dir", default=None, help="Where the bundle is written")
+
+
 def _load_config(args: argparse.Namespace) -> ExperimentConfig:
-    cfg = ExperimentConfig.from_yaml(args.config)
+    """Build the config from whichever layers were supplied.
+
+    The precedence chain is the whole zero-config mechanism, and it is deliberately
+    ordinary: synthesis produces a plain dict that a YAML file is merged *over*,
+    exactly as if the user had typed the synthesized values first. Nothing below
+    here can tell which layer a value came from — that is what lets ``--data`` and
+    ``--config`` compose instead of being alternatives.
+    """
+    import yaml
+
+    layers: list[dict[str, Any]] = []
+    chosen: str | None = None
+    if getattr(args, "data", None):
+        from .config.autoconfig import synthesize
+
+        synthesized = synthesize(
+            args.data,
+            target=getattr(args, "target", None),
+            time_col=getattr(args, "time_col", None),
+            text_col=getattr(args, "text_col", None),
+            model=getattr(args, "model", None),
+            output_dir=getattr(args, "output_dir", None),
+        )
+        synthesized.log()
+        chosen = synthesized.config["model"]["name"]
+        layers.append(synthesized.config)
+
+    if getattr(args, "config", None):
+        with open(args.config, encoding="utf-8") as handle:
+            layers.append(yaml.safe_load(handle) or {})
+    elif not layers:
+        raise SystemExit("nothing to load: pass --config, or --data to infer one")
+
+    from .config.autoconfig import merge
+
+    merged: dict[str, Any] = {}
+    for layer in layers:
+        merged = merge(merged, layer)
+
+    cfg = ExperimentConfig.model_validate(merged)
     if args.set:
         cfg = cfg.with_overrides(dict(args.set))
+
+    # Whether the *framework* chose the model, which is what decides if the trivial
+    # baseline is worth scoring. Compared against the surviving value rather than
+    # set when synthesis ran: a later layer -- a YAML, a --set, an explicit --model
+    # -- may have overridden the choice, and then the user has their own frame of
+    # reference and the baseline is not the point. Recorded on `args` rather than
+    # in the config because it is a fact about this invocation, not the experiment.
+    args.auto_selected = (
+        chosen is not None and getattr(args, "model", None) is None and cfg.model.name == chosen
+    )
     return cfg
 
 
 def _add_config_args(sub: argparse.ArgumentParser) -> None:
-    sub.add_argument("--config", "-c", required=True, help="Path to YAML config")
+    # Not required: `--data` can supply the config instead, and both together is a
+    # valid and useful combination rather than a conflict.
+    sub.add_argument("--config", "-c", default=None, help="Path to YAML config")
+    _add_data_args(sub)
     sub.add_argument(
         "--set",
         action="append",
@@ -129,18 +213,20 @@ def _format_search_space(spec: Any) -> list[str]:
     ]
 
 
-def _print_models(*, include_failed: bool, show_detail: bool) -> int:
-    """``mlf models`` — the registry, rendered.
+def _print_plugins(registry: Any, *, include_failed: bool, show_detail: bool) -> int:
+    """``mlf models`` / ``mlf backends`` — a plugin registry, rendered.
 
-    Reads :data:`~ml_framework.core.registry.MODELS` and nothing else, so it works
-    on an install with no optional extra present at all. That is the property the
-    whole plugin design exists to protect: registering a plugin must not import
-    its runtime, and this command is what makes the property visible.
+    Reads the registry and nothing else, so it works on an install with no optional
+    extra present at all. That is the property the whole plugin design protects:
+    registering a plugin must not import its runtime, and these commands are what
+    make the property visible.
+
+    One renderer for both because the interesting columns are the same ones —
+    what it is, whether it is ready, and what would make it ready. Only the second
+    column differs, and a spec answers that about itself.
     """
-    from .core.registry import MODELS
-
-    rows = MODELS.describe()
-    failed = set(MODELS.load_errors())
+    rows = registry.describe()
+    failed = set(registry.load_errors())
     if not include_failed:
         # A plugin that failed to *import* is a different thing from one whose
         # extra is missing, and mixing them would make a genuine bug look like an
@@ -153,12 +239,16 @@ def _print_models(*, include_failed: bool, show_detail: bool) -> int:
 
     width = max(len(row["name"]) for row in rows)
     pad = " " * (width + 9)
-    print(f"{'MODEL'.ljust(width)}  READY  BACKEND     DESCRIPTION")
+    label = registry.kind.upper()
+    second = "BACKEND" if registry.kind == "model" else "ACCEPTS"
+    # 14 wide: a backend accepting two payloads prints "arrays,dataset", and a
+    # narrower column would ragged-edge every description beside it.
+    print(f"{label.ljust(width)}  READY  {second:<14}  DESCRIPTION")
     for row in sorted(rows, key=lambda r: r["name"]):
-        spec = None if row["name"] in failed else MODELS.get_spec(row["name"])
-        backend = spec.backend if spec is not None else "-"
+        spec = None if row["name"] in failed else registry.get_spec(row["name"])
+        detail = "-" if spec is None else _second_column(registry.kind, spec)
         ready = "yes  " if row["available"] else "NO   "
-        print(f"{row['name'].ljust(width)}  {ready}  {backend:<10}  {row['description']}")
+        print(f"{row['name'].ljust(width)}  {ready}  {detail:<14}  {row['description']}")
 
         for reason in row["missing"]:
             print(f"{pad}{reason}")
@@ -166,15 +256,44 @@ def _print_models(*, include_failed: bool, show_detail: bool) -> int:
             print(f"{pad}fix: {row['install']}")
 
         if show_detail and spec is not None:
-            print(f"{pad}tasks: {', '.join(sorted(spec.tasks)) or 'any'}")
-            print(f"{pad}data:  {', '.join(sorted(spec.data_kinds)) or 'any'}")
-            for line in _format_search_space(spec):
+            for line in _format_detail(registry.kind, spec):
                 print(f"{pad}{line}")
 
     hidden = len(failed) if not include_failed else 0
     if hidden:
-        print(f"\n{hidden} plugin(s) failed to load and are hidden; `mlf models --all` shows them")
+        verb = "models" if registry.kind == "model" else "backends"
+        print(f"\n{hidden} plugin(s) failed to load and are hidden; `mlf {verb} --all` shows them")
     return 0
+
+
+def _second_column(kind: str, spec: Any) -> str:
+    """What a model rides on, or what a backend can consume."""
+    if kind == "model":
+        return str(spec.backend)
+    return ",".join(sorted(spec.capabilities.accepts)) or "-"
+
+
+def _format_detail(kind: str, spec: Any) -> list[str]:
+    if kind == "model":
+        return [
+            f"tasks: {', '.join(sorted(spec.tasks)) or 'any'}",
+            f"data:  {', '.join(sorted(spec.data_kinds)) or 'any'}",
+            *_format_search_space(spec),
+        ]
+    caps = spec.capabilities
+    supported = [
+        name
+        for name, value in (
+            ("gpu", caps.supports_gpu),
+            ("mixed-precision", caps.supports_mixed_precision),
+            ("pruning", caps.supports_pruning),
+            ("resume", caps.supports_resume),
+            ("sample-weight", caps.supports_sample_weight),
+            ("lr-range-test", caps.supports_lr_range_test),
+        )
+        if value
+    ]
+    return [f"supports: {', '.join(supported) or 'nothing beyond a plain fit'}"]
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -193,6 +312,15 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Add each model's tasks, data kinds and its own search space",
     )
+
+    backends_p = sub.add_parser("backends", help="List registered backends and what they need")
+    backends_p.add_argument("--all", action="store_true", help="Also list failed imports")
+    backends_p.add_argument("--show", action="store_true", help="Add each backend's capabilities")
+
+    init_p = sub.add_parser("init", help="Write a config inferred from a dataset")
+    _add_data_args(init_p)
+    init_p.add_argument("--output", "-o", required=True, metavar="PATH", help="Where to write it")
+    init_p.add_argument("--force", action="store_true", help="Overwrite an existing file")
 
     lr = sub.add_parser("lr", help="Run the LR range test")
     _add_config_args(lr)
@@ -271,18 +399,50 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     setup_logging()
 
-    if args.command == "models":
+    if args.command in ("models", "backends"):
         # Importing the plugin package is what populates the registry, and it is
         # required to be dependency-free — see plugins/__init__.py.
         import ml_framework.plugins  # noqa: F401
 
-        return _print_models(include_failed=args.all, show_detail=args.show)
+        from . import backends as _backends  # noqa: F401  (registers the backends)
+        from .core.registry import BACKENDS, MODELS
+
+        registry = MODELS if args.command == "models" else BACKENDS
+        return _print_plugins(registry, include_failed=args.all, show_detail=args.show)
+
+    if args.command == "init":
+        from .config.autoconfig import render_config, synthesize
+
+        if not args.data:
+            log.error("`mlf init` needs --data: there is nothing to infer a config from")
+            return 1
+        try:
+            synthesized = synthesize(
+                args.data,
+                target=args.target,
+                time_col=args.time_col,
+                text_col=args.text_col,
+                model=args.model,
+                output_dir=args.output_dir,
+            )
+        except FrameworkError as exc:
+            log.error("%s", exc)
+            return 1
+        synthesized.log()
+
+        destination = Path(args.output)
+        if destination.exists() and not args.force:
+            log.error("%s exists; pass --force to overwrite", destination)
+            return 1
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(render_config(synthesized), encoding="utf-8")
+        print(f"wrote {destination}")
+        return 0
 
     if args.command == "migrate-config":
         from pydantic import ValidationError
 
         from .config import MigrationError, migrate_file
-        from .core.types import FrameworkError
 
         try:
             migrate_file(args.input, args.output, validate=args.validate, overwrite=args.force)
@@ -373,7 +533,15 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.folds is not None:
             cfg = cfg.with_overrides({"data.split.folds": args.folds})
-        train(cfg, emit_config=args.emit_config, resume=args.resume)
+        train(
+            cfg,
+            emit_config=args.emit_config,
+            resume=args.resume,
+            # Only when the *framework* picked the model. A user who named it has
+            # their own frame of reference; a zero-config run has none, which is
+            # exactly when a trivial baseline is worth the milliseconds.
+            baseline=getattr(args, "auto_selected", False),
+        )
     return 0
 
 
