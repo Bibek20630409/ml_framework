@@ -1265,8 +1265,15 @@ arriving through a dependency instead of our own logging.
    and unsupported on Python 3.14+. Still a warning, not breakage. The decision it
    needs is a product one — rename the format, keep the flag and write `.pt2`, or
    drop it — not a code edit.
-2. **CI does not test the Python versions where this bites.** `requires-python`
-   says `>=3.10`; `ci.yml` runs 3.10–3.12. The `torch.jit` deprecation fires on
-   3.14, so CI stays green for a failure a user would hit. Either test 3.13+ or
-   cap the floor — this is why the problem was invisible until it was looked for.
+2. ~~**CI does not test the Python versions where this bites.**~~ **Closed here.**
+   `requires-python` claims `>=3.10` with no ceiling while `ci.yml` stopped at
+   3.12, so the `torch.jit` deprecation that motivated this migration fired on a
+   version no job ran. The matrix is now 3.10–3.14. **3.14 is the load-bearing
+   entry** — 3.13 would not have caught it, since the deprecation is 3.14+.
+
+   Evidence is asymmetric and worth stating: 3.14 is backed by the full suite
+   passing locally on 3.14.2 / torch 2.10.0+cpu, which is where every number in
+   this document was measured. **3.13 has not been run anywhere** — no
+   interpreter for it here. If it fails on the first CI run, that is the matrix
+   doing its job and the fix is a real one, not a revert.
 3. `skl2onnx` remains declared and unused (from P9).

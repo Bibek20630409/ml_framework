@@ -11,7 +11,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.10", "3.11", "3.12"]
+        # Must cover what `requires-python` claims, which is `>=3.10` with no
+        # ceiling. Stopping at 3.12 meant CI was green for versions the package
+        # advertises and never ran: `torch.jit.trace`/`load` are deprecated and
+        # "not supported" on 3.14+, so the deprecation motivating the P10 export
+        # migration fired on a version no job tested. A matrix whose top entry is
+        # below the supported ceiling cannot catch that class of failure at all.
+        #
+        # 3.14 is the load-bearing addition; 3.13 is here because the range claims
+        # it. If a version genuinely cannot be supported, the fix is a ceiling in
+        # `requires-python` — not a matrix that quietly tests less than it promises.
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
