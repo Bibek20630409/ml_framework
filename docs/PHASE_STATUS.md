@@ -14,7 +14,7 @@ Tracks progress against [ml_framework_architecture_plan.md](../ml_framework_arch
 | P6 — Time-series | **done** | `01bd2aa` |
 | P7 — NLP | **done** | `e06c299` |
 | P8 — Zero-config | **done** | `62672eb` |
-| P9 — Deployment polish | **done** | this branch |
+| P9 — Deployment polish | **done** | `1dc3a0c` |
 
 ## Version
 
