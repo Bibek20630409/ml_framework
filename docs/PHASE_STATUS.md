@@ -11,7 +11,7 @@ Tracks progress against [ml_framework_architecture_plan.md](../ml_framework_arch
 | P3 — GBDT | **done** | `3b46f4a` |
 | P4 — AutoML | **done** | `a300c38` |
 | P5 — DL hardening | **done** | `3296920` |
-| P6 — Time-series | **done** | this branch |
+| P6 — Time-series | **done** | `01bd2aa` |
 | P7 — NLP | not started | — |
 | P8 — Zero-config | not started | — |
 | P9 — Deployment polish | not started | — |
@@ -30,9 +30,9 @@ v1 *bundles* still load (`test_v1_bundle_compat.py`); v1 *configs* do not, and
 
 ## Test baseline
 
-**458 passed, 1 skipped** with every declared extra installed except DVC
-(46/4 before P0 → 130/4 after P0 → 249/4 after P1 → 258/1 → 284/1 after P2 → 355/1 after P3 → 395/1 after P4 → 429/1 after P5 →
-**458/1**). Every phase gate is measured against this number — a phase that ends
+**467 passed, 1 skipped** with every declared extra installed except DVC
+(46/4 before P0 → 130/4 after P0 → 249/4 after P1 → 258/1 → 284/1 after P2 → 355/1 after P3 → 395/1 after P4 → 429/1 after P5 → 458/1 after P6 →
+**467/1**). Every phase gate is measured against this number — a phase that ends
 with fewer passing tests than it started with has regressed something, regardless
 of what its own new tests say.
 
@@ -88,7 +88,7 @@ build *function* rather than a class — see `available_models` below).
 Verification commands (all clean):
 
 ```
-pytest                        # 458 passed, 1 skipped
+pytest                        # 467 passed, 1 skipped
 ruff check src tests
 black --check src tests
 isort --check-only src tests
@@ -644,3 +644,51 @@ nothing.
    whether it finds one.
 4. **`native_categorical` still has no consumer** (from P4).
 5. **CV remains unimplemented for image data** (from P5).
+
+## Follow-up: cross-validation for image data
+
+Not a phase — a loose end from P5, closed on request. Cross-validation now covers
+**tabular, timeseries and image**; only `text` remains, and only because there is
+no text source to partition (P7).
+
+The blocker was never mechanical. The image source reads two separate directories
+— `ImageFolder(data.path)` for train and `ImageFolder(params.test_dir)` for test —
+and k-fold needs one pool to repartition. Two readings were available and neither
+is obviously right:
+
+* fold over the train directory only, leaving `test_dir` untouched, or
+* pool train + test and repartition.
+
+**Chosen: fold over the train directory.** `test_dir` is an explicit statement
+about which images are held back, and silently folding it into the pool would
+override a decision made on disk. The cost is that "test" means different things
+in the two places, so the bundle records `meta["cv_test_source"] = "train_dir"`
+and the README says it outright: the CV estimate comes from folds of `data.path`,
+`test_acc` comes from `test_dir`.
+
+Two per-fold details that would have been invisible if wrong:
+
+* **Val and test images get the *eval* transforms.** Augmentation exists to make
+  training harder; measuring on augmented images measures the augmentation. That
+  needs a second `ImageFolder` over the same directory, because a transform
+  belongs to the dataset rather than to the `Subset`.
+* **Sample weights are recomputed per fold.** Reusing one vector would weight each
+  fold by another fold's class balance — the same category of mistake as sharing a
+  fitted scaler.
+
+`train_labels()` reads labels from the directory tree rather than decoding pixels,
+since stratification needs them up front.
+
+**One test inverted**, and it existed to pin exactly this limitation:
+`test_cross_validation_on_images_says_it_is_not_implemented` became
+`test_cross_validation_refuses_a_kind_it_cannot_partition`, now using `text` —
+which is genuinely unpartitionable rather than merely unimplemented.
+
+467 passed, 1 skipped (was 458/1).
+
+### A related wart, deliberately not fixed
+
+The **non-CV** image path carves its validation set with `random_split` over the
+*augmented* dataset, so validation images are augmented too. The CV path does not
+have this problem. Fixing the holdout path would change val metrics for every
+existing image run, so it is recorded here rather than changed quietly.

@@ -361,13 +361,18 @@ def test_cross_validation_works_for_gbdt_too(tabular_csv, make_config):
 
 
 @pytest.mark.integration
-def test_cross_validation_on_images_says_it_is_not_implemented(tabular_csv, make_config):
-    """Better than silently cross-validating something else."""
+def test_cross_validation_refuses_a_kind_it_cannot_partition(tabular_csv, make_config):
+    """Better than silently cross-validating something else.
+
+    Image data used to be on this list and is not any more — it now folds over the
+    training directory. `text` stands in because it has no source at all yet, so
+    there is genuinely nothing to partition.
+    """
     from ml_framework.data.builders import build_cv_bundles
 
     cfg = make_config(tabular_csv, "multiclass", **{"data.split.folds": 3})
-    cfg = cfg.model_copy(update={"data": cfg.data.model_copy(update={"kind": "image"})})
-    with pytest.raises(NotImplementedError, match="cross-validation is implemented for tabular"):
+    cfg = cfg.model_copy(update={"data": cfg.data.model_copy(update={"kind": "text"})})
+    with pytest.raises(NotImplementedError, match="cross-validation is implemented for"):
         list(build_cv_bundles(cfg))
 
 

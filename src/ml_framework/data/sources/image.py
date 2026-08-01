@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import logging
 from collections import Counter
+from typing import Any
 
 import numpy as np
 from pydantic import BaseModel as PydanticModel
@@ -54,8 +55,32 @@ class ImageSourceParams(PydanticModel):
     test_dir: str | None = None
 
 
-def build_image_bundle(config) -> DataBundle:
-    """Materialize an image :class:`DataBundle` from a validated config."""
+def train_labels(config) -> list[int]:
+    """The training folder's labels, without decoding a single image.
+
+    ``ImageFolder`` builds its ``targets`` list by walking the directory tree, so
+    this is a directory scan rather than a load. Cross-validation needs the labels
+    up front to stratify its folds, and paying for pixel decoding to get them would
+    be absurd.
+    """
+    from torchvision import datasets
+
+    return list(datasets.ImageFolder(config.data.path).targets)
+
+
+def build_image_bundle(config, *, indices: Any = None) -> DataBundle:
+    """Materialize an image :class:`DataBundle` from a validated config.
+
+    ``indices`` partitions the **training folder** for cross-validation. The
+    configured ``params.test_dir`` is deliberately left out of that partition: it
+    is an explicit statement about which images are held back, and silently folding
+    it into the pool would override a decision the user made on disk.
+
+    The consequence is worth stating plainly, and ``cv.json`` is where a reader
+    will look for it: under cross-validation, "test" means *a held-out slice of the
+    training folder*, not ``test_dir``. The final bundle's ``test_acc`` still comes
+    from ``test_dir``, so the two numbers answer different questions.
+    """
     import torch
     from torchvision import datasets
 
@@ -65,8 +90,12 @@ def build_image_bundle(config) -> DataBundle:
     eval_tf = preprocessor.eval_transform()
 
     full_train = datasets.ImageFolder(config.data.path, transform=train_tf)
-    test_ds = datasets.ImageFolder(params.test_dir, transform=eval_tf)
     classes = list(full_train.classes)
+
+    if indices is not None:
+        return _fold_bundle(config, params, preprocessor, full_train, eval_tf, classes, indices)
+
+    test_ds = datasets.ImageFolder(params.test_dir, transform=eval_tf)
 
     if params.val_dir:
         train_ds = full_train
@@ -110,4 +139,81 @@ def build_image_bundle(config) -> DataBundle:
         preprocessor=preprocessor,
         reference_stats=None,
         meta={"sample_weights": sample_weights, "classes": tuple(classes)},
+    )
+
+
+def _fold_bundle(
+    config,
+    params: ImageSourceParams,
+    preprocessor: ImagePreprocessor,
+    full_train: Any,
+    eval_tf: Any,
+    classes: list[str],
+    indices: Any,
+) -> DataBundle:
+    """One cross-validation fold, carved from the training folder.
+
+    Two details matter and neither is cosmetic:
+
+    * **Validation and test get the *eval* transforms.** Augmentation exists to
+      make training harder; measuring on augmented images measures the
+      augmentation. That needs a second ``ImageFolder`` over the same directory,
+      because a transform belongs to the dataset rather than to the subset.
+    * **Sample weights are recomputed per fold**, from this fold's training labels.
+      Reusing one weight vector across folds would weight each fold by another
+      fold's class balance — the same category of mistake as sharing a fitted
+      scaler, and just as invisible in the result.
+    """
+    from torch.utils.data import Subset
+    from torchvision import datasets
+
+    # A second view of the same directory, without augmentation.
+    eval_view = datasets.ImageFolder(config.data.path, transform=eval_tf)
+
+    train_ds = Subset(full_train, list(indices.train))
+    val_ds = Subset(eval_view, list(indices.val))
+    test_ds = Subset(eval_view, list(indices.test))
+
+    # `Subset` has no `.targets`; reading it would silently return the *parent's*
+    # full label list. Same bug the non-CV path documents, same recovery.
+    labels = [full_train.targets[i] for i in indices.train]
+    counts = Counter(labels)
+    total = sum(counts.values())
+    w_map = {c: total / cnt for c, cnt in counts.items()}
+
+    size = params.img_size
+    log.info(
+        "image fold: train=%d val=%d test=%d (carved from %s; test_dir untouched)",
+        len(train_ds),
+        len(val_ds),
+        len(test_ds),
+        config.data.path,
+    )
+    return DataBundle(
+        train=Split(payload="dataset", x=train_ds, y=np.asarray(labels)),
+        val=Split(payload="dataset", x=val_ds),
+        test=Split(
+            payload="dataset",
+            x=test_ds,
+            y=np.asarray([full_train.targets[i] for i in indices.test]),
+        ),
+        schema=FeatureSchema(
+            target_name=config.data.target,
+            class_names=(
+                tuple(config.data.class_names) if config.data.class_names else tuple(classes)
+            ),
+        ),
+        task=config.task,
+        data_kind="image",
+        input_dim=3 * size * size,
+        output_dim=1 if config.task == "binary" else len(classes),
+        class_weights=None,
+        preprocessor=preprocessor,
+        reference_stats=None,
+        meta={
+            "sample_weights": np.asarray([w_map[c] for c in labels], dtype="float64"),
+            "classes": tuple(classes),
+            # Recorded so a reader of cv.json knows what "test" meant here.
+            "cv_test_source": "train_dir",
+        },
     )

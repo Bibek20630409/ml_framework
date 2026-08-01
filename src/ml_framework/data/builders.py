@@ -34,6 +34,8 @@ from __future__ import annotations
 from collections.abc import Iterator
 from typing import TYPE_CHECKING, Any
 
+import numpy as np
+
 # Side-effect import: registers mlp/cnn in both registries.
 from .. import plugins as _plugins  # noqa: F401
 from ..core.plugins import SourceSpec
@@ -50,6 +52,15 @@ _BUNDLE_BUILDERS = {
     "tabular": build_tabular_bundle,
     "image": build_image_bundle,
     "timeseries": build_timeseries_bundle,
+}
+
+# The sources that accept an injected partition. A kind absent from this table
+# cannot be cross-validated, and `build_cv_bundles` says so by name rather than
+# folding something it does not understand.
+_CV_BUILDERS = {
+    "tabular": build_tabular_bundle,
+    "timeseries": build_timeseries_bundle,
+    "image": build_image_bundle,
 }
 
 
@@ -79,30 +90,26 @@ def build_cv_bundles(config: ExperimentConfig) -> Iterator[DataBundle]:
     would leak every fold's test set into every other fold's preprocessing —
     which produces a CV estimate that looks better than the model is.
 
-    Tabular only for now. An image source would need the same indices threaded
-    through ``ImageFolder``, and raising here is better than silently
-    cross-validating something else.
+    **Image folds are carved from the training folder only.** ``params.test_dir``
+    is an explicit statement about which images are held back; pooling it in would
+    override a decision made on disk. So under cross-validation "test" means a
+    held-out slice of the training folder, and the final bundle's ``test_acc``
+    still comes from ``test_dir`` — two numbers answering different questions.
     """
-    from .sources.tabular import read_table
     from .splitters import CrossValidationSplitter, RollingOriginSplitter
 
-    if config.data.kind not in ("tabular", "timeseries"):
+    kind = config.data.kind
+    if kind not in _CV_BUILDERS:
         raise NotImplementedError(
-            f"cross-validation is implemented for tabular and timeseries data; got "
-            f"'{config.data.kind}'. Set data.split.folds to 0 for a single holdout split."
+            f"cross-validation is implemented for {sorted(_CV_BUILDERS)}; got '{kind}'. "
+            f"Set data.split.folds to 0 for a single holdout split."
         )
 
     split_cfg = config.data.split
-    frame = read_table(str(config.data.path))
-    # Only the sources that accept injected indices are reachable here; the guard
-    # above is what keeps that true, and naming them explicitly is what lets a type
-    # checker agree.
-    build = build_tabular_bundle if config.data.kind == "tabular" else build_timeseries_bundle
+    build = _CV_BUILDERS[kind]
+    n, labels = _cv_population(config)
 
-    if (
-        config.data.kind == "timeseries"
-        or split_cfg.resolved_strategy(config.data.kind) == "temporal"
-    ):
+    if kind == "timeseries" or split_cfg.resolved_strategy(kind) == "temporal":
         # **Not** k-fold. Shuffled folds put future rows in training and past rows
         # in test, which is the leakage the config validator refuses elsewhere;
         # doing it here under the name "cross-validation" would be the same bug
@@ -112,20 +119,39 @@ def build_cv_bundles(config: ExperimentConfig) -> Iterator[DataBundle]:
             horizon=split_cfg.horizon,
             gap=split_cfg.gap,
             expanding=split_cfg.expanding,
-        ).split(len(frame))
+        ).split(n)
     else:
-        labels = frame[config.data.target].to_numpy()
-        if config.task != "regression":
-            labels = labels.astype("int64")
         folds = CrossValidationSplitter(
             folds=split_cfg.folds,
             seed=config.runtime.seed,
             task=config.task,
             val_size=split_cfg.val_size,
-        ).split(len(frame), y=labels)
+        ).split(n, y=labels)
 
     for indices in folds:
         yield build(config, indices=indices)
+
+
+def _cv_population(config: ExperimentConfig) -> tuple[int, Any]:
+    """``(row count, labels)`` for the pool being folded.
+
+    Image data has no table to read: the pool is the **training folder**, and its
+    labels come from an ``ImageFolder`` directory scan rather than from decoding
+    pixels. Keeping that difference here rather than in ``build_cv_bundles`` is
+    what stops the folding logic from growing a per-kind branch.
+    """
+    from .sources.image import train_labels
+    from .sources.tabular import read_table
+
+    if config.data.kind == "image":
+        labels = np.asarray(train_labels(config), dtype="int64")
+        return len(labels), labels
+
+    frame = read_table(str(config.data.path))
+    labels = frame[config.data.target].to_numpy()
+    if config.task != "regression":
+        labels = labels.astype("int64")
+    return len(frame), labels
 
 
 def build_datamodule(config: ExperimentConfig) -> Any:

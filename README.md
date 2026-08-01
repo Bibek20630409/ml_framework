@@ -272,13 +272,26 @@ checkpoint, because a loader wants the best weights and only a resuming trainer
 wants the last state.
 
 **Cross-validation is an orchestration mode, not a Lightning feature.** It drives
-the splitter and the same protocol calls every backend implements, so
-`--folds 5` works for XGBoost too. Each fold re-fits its own scaler and imbalance
-correction — sharing one across folds would leak every fold's test set into every
-other fold's preprocessing. `cv.json` records the per-fold scores as well as the
-mean, because a mean of 0.85 across 0.84/0.86 and across 0.70/1.00 are the same
-number and completely different results. The CV estimate sits *beside* the
-holdout score rather than replacing it.
+the splitter and the same protocol calls every backend implements, so `--folds 5`
+works for XGBoost too. Each fold re-fits its own scaler and imbalance correction —
+sharing one across folds would leak every fold's test set into every other fold's
+preprocessing. `cv.json` records the per-fold scores as well as the mean, because
+a mean of 0.85 across 0.84/0.86 and across 0.70/1.00 are the same number and
+completely different results. The CV estimate sits *beside* the holdout score
+rather than replacing it.
+
+It adapts to the data kind rather than assuming one shape:
+
+| kind | folds are | why |
+|---|---|---|
+| tabular | stratified k-fold | the default |
+| timeseries | **rolling origin** | shuffled folds would leak the future |
+| image | k-fold over the **train directory** | `params.test_dir` is a decision made on disk; CV does not override it |
+| text | *not yet* | there is no text source to partition |
+
+For images that means "test" inside CV is a held-out slice of `data.path`, while
+the final bundle's `test_acc` still comes from `test_dir` — two numbers answering
+different questions. `cv_test_source` in the bundle records which.
 
 The result is **applied, not printed**: the winner lands in `bundle/config.json`,
 the full record (winner, ranges searched, every trial) in `bundle/hpo.json` and
