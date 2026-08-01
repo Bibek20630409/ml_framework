@@ -198,3 +198,76 @@ def test_training_with_folds_reports_a_cv_estimate_beside_the_holdout_score(imag
 
     cv = json.loads((Path(cfg.runtime.output_dir) / "cv.json").read_text(encoding="utf-8"))
     assert cv["folds"] == 3 and len(cv["per_fold"]) == 3
+
+
+# ── The holdout path's augmentation fix ───────────────────
+@pytest.mark.integration
+def test_holdout_validation_images_are_not_augmented(image_dirs, tmp_path):
+    """v1 carved the validation set out of the *augmented* training dataset, so
+    every validation image arrived randomly cropped and flipped — and early
+    stopping and checkpoint selection both read that score."""
+    bundle = build_bundle(image_config(image_dirs, tmp_path))
+
+    train_ops = {type(t).__name__ for t in bundle.train.x.dataset.transform.transforms}
+    val_ops = {type(t).__name__ for t in bundle.val.x.dataset.transform.transforms}
+    assert train_ops - val_ops, "the training view should carry extra augmentation"
+    assert not val_ops - train_ops, "val should be a strict subset of the train pipeline"
+
+
+@pytest.mark.integration
+def test_the_fix_changed_the_transform_not_the_partition(image_dirs, tmp_path):
+    """The same generator and the same `random_split` call, so which images land
+    in validation is unchanged at a given seed. Only the pipeline differs."""
+    import torch
+    from torchvision import datasets
+
+    cfg = image_config(image_dirs, tmp_path)
+    bundle = build_bundle(cfg)
+
+    # Reproduce v1's split exactly and compare the indices.
+    corpus = datasets.ImageFolder(cfg.data.path)
+    n = len(corpus)
+    n_val = max(1, int(cfg.data.split.val_size * n))
+    gen = torch.Generator().manual_seed(cfg.runtime.seed)
+    expected_train, expected_val = torch.utils.data.random_split(corpus, [n - n_val, n_val], gen)
+
+    assert list(bundle.train.x.indices) == list(expected_train.indices)
+    assert list(bundle.val.x.indices) == list(expected_val.indices)
+
+
+@pytest.mark.integration
+def test_an_explicit_val_dir_was_already_correct(image_dirs, tmp_path):
+    """The `val_dir` branch always used eval transforms; the bug was only in the
+    carved-out branch. Pinned so a future refactor keeps both right."""
+    train_dir, test_dir = image_dirs
+    cfg = image_config(image_dirs, tmp_path, **{"data.params.val_dir": str(test_dir)})
+    bundle = build_bundle(cfg)
+
+    train_ops = {type(t).__name__ for t in bundle.train.x.transform.transforms}
+    val_ops = {type(t).__name__ for t in bundle.val.x.transform.transforms}
+    assert train_ops - val_ops
+
+
+@pytest.mark.unit
+def test_the_unaugmented_view_shares_the_file_list(image_dirs, tmp_path):
+    """A shallow copy rather than a second directory walk — the walk is the
+    expensive part on a real corpus."""
+    from torchvision import datasets
+
+    from ml_framework.data.preprocess.image import ImagePreprocessor
+    from ml_framework.data.sources.image import eval_view
+
+    train_dir, _ = image_dirs
+    pre = ImagePreprocessor(img_size=8, augment=True)
+    train_tf = pre.train_transform()
+    original = datasets.ImageFolder(train_dir, transform=train_tf)
+
+    view = eval_view(original, pre.eval_transform())
+
+    assert view is not original
+    assert view.samples is original.samples  # shared, not re-scanned
+    assert len(view) == len(original)
+    # The original is untouched: a copy that mutated it in place would silently
+    # disable augmentation for *training*, which is the opposite bug.
+    assert original.transform is train_tf
+    assert view.transform is not train_tf

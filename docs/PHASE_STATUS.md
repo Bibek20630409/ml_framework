@@ -30,9 +30,9 @@ v1 *bundles* still load (`test_v1_bundle_compat.py`); v1 *configs* do not, and
 
 ## Test baseline
 
-**467 passed, 1 skipped** with every declared extra installed except DVC
+**471 passed, 1 skipped** with every declared extra installed except DVC
 (46/4 before P0 → 130/4 after P0 → 249/4 after P1 → 258/1 → 284/1 after P2 → 355/1 after P3 → 395/1 after P4 → 429/1 after P5 → 458/1 after P6 →
-**467/1**). Every phase gate is measured against this number — a phase that ends
+**471/1**). Every phase gate is measured against this number — a phase that ends
 with fewer passing tests than it started with has regressed something, regardless
 of what its own new tests say.
 
@@ -88,7 +88,7 @@ build *function* rather than a class — see `available_models` below).
 Verification commands (all clean):
 
 ```
-pytest                        # 467 passed, 1 skipped
+pytest                        # 471 passed, 1 skipped
 ruff check src tests
 black --check src tests
 isort --check-only src tests
@@ -684,11 +684,28 @@ since stratification needs them up front.
 `test_cross_validation_refuses_a_kind_it_cannot_partition`, now using `text` —
 which is genuinely unpartitionable rather than merely unimplemented.
 
-467 passed, 1 skipped (was 458/1).
+467 passed, 1 skipped (was 458/1); 471/1 after the augmentation fix below.
 
-### A related wart, deliberately not fixed
+### The related wart, now fixed
 
-The **non-CV** image path carves its validation set with `random_split` over the
-*augmented* dataset, so validation images are augmented too. The CV path does not
-have this problem. Fixing the holdout path would change val metrics for every
-existing image run, so it is recorded here rather than changed quietly.
+The **non-CV** image path carved its validation set with `random_split` over the
+*augmented* dataset, so every holdout validation image arrived randomly cropped
+and flipped. It was recorded here as deliberately unfixed; on request it is fixed.
+
+A transform belongs to the dataset, not to a `Subset` of it, so the fix is an
+un-augmented view of the same corpus — `eval_view()`, a shallow copy that rebinds
+one attribute rather than walking the directory tree a second time. The CV path
+now uses the same helper instead of building a second `ImageFolder`.
+
+**The partition is unchanged.** The same generator and the same `random_split`
+call decide which images land in validation at a given seed; only the pipeline
+each side goes through differs. There is a test that reproduces v1's split and
+compares indices.
+
+**Expect validation metrics on image runs to change, and to improve slightly.**
+They were previously measured on deliberately degraded inputs. This is not
+cosmetic: early stopping and `ModelCheckpoint` both read `val/loss`, so the fix
+changes which epoch gets selected as well as what the number says. Test metrics
+are unaffected — `test_dir` always used the eval transforms.
+
+471 passed, 1 skipped.

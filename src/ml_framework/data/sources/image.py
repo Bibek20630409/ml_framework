@@ -3,8 +3,8 @@ data/sources/image.py
 ─────────────────────
 ``ImageFolder`` directories → :class:`~ml_framework.data.types.DataBundle`.
 
-``ImageDataModule.setup`` verbatim, minus the DataLoaders. Two details survive
-unchanged because both were bug fixes:
+``ImageDataModule.setup``, minus the DataLoaders. Two v1 bug fixes survive
+unchanged, and one v1 bug is fixed here:
 
 * **``Subset`` label recovery.** When there is no explicit ``val_dir`` the train
   split comes from ``random_split``, which yields a ``Subset`` with no
@@ -14,6 +14,15 @@ unchanged because both were bug fixes:
 * **Imbalance is handled by sampling, not by loss weights.** The bundle therefore
   carries ``meta["sample_weights"]`` and no ``class_weights``; applying both
   would correct twice.
+* **Validation images are no longer augmented.** v1 carved the validation set out
+  of the *augmented* training dataset, so every validation image arrived randomly
+  cropped and flipped. A transform belongs to the dataset rather than to a
+  ``Subset`` of it, so the fix is a second un-augmented view — see
+  :func:`eval_view`. The partition at a given seed is unchanged; only the
+  pipeline each side goes through is. **Expect validation metrics on image runs to
+  differ from before, and to be slightly better**: they were previously measured
+  on deliberately degraded inputs, and early stopping and checkpoint selection
+  both read them.
 
 The sampler itself is not built here — ``meta`` carries the per-row weights and
 the Lightning adapter constructs the ``WeightedRandomSampler``. Keeping torch's
@@ -53,6 +62,27 @@ class ImageSourceParams(PydanticModel):
     # Optional: absent → the validation split is carved out of the train folder.
     val_dir: str | None = None
     test_dir: str | None = None
+
+
+def eval_view(dataset: Any, eval_tf: Any) -> Any:
+    """The same corpus, without augmentation.
+
+    A transform belongs to the *dataset*, not to a ``Subset`` of it, so carving a
+    validation set out of an augmented dataset leaves it augmented. Augmentation
+    exists to make training harder; measuring on augmented images measures the
+    augmentation, and the resulting validation score is pessimistic and noisy for
+    no reason — early stopping and checkpoint selection both read it.
+
+    A shallow copy rather than a second ``ImageFolder``: the file list, the class
+    map and the loader are read-only and shared, so this rebinds one attribute
+    instead of walking the directory tree again. On a large corpus that walk is
+    the expensive part.
+    """
+    import copy
+
+    view = copy.copy(dataset)
+    view.transform = eval_tf
+    return view
 
 
 def train_labels(config) -> list[int]:
@@ -102,10 +132,15 @@ def build_image_bundle(config, *, indices: Any = None) -> DataBundle:
         val_ds = datasets.ImageFolder(params.val_dir, transform=eval_tf)
         labels = list(full_train.targets)
     else:
+        from torch.utils.data import Subset
+
         n = len(full_train)
         n_val = max(1, int(config.data.split.val_size * n))
         gen = torch.Generator().manual_seed(config.runtime.seed)
-        train_ds, val_ds = torch.utils.data.random_split(full_train, [n - n_val, n_val], gen)
+        # The same generator and the same call, so the *partition* is unchanged at
+        # a given seed — only which transform pipeline each side goes through.
+        train_ds, val_part = torch.utils.data.random_split(full_train, [n - n_val, n_val], gen)
+        val_ds = Subset(eval_view(full_train, eval_tf), val_part.indices)
         # Subset → recover labels via the parent's .targets and the subset .indices.
         labels = [full_train.targets[i] for i in train_ds.indices]
 
@@ -155,24 +190,21 @@ def _fold_bundle(
 
     Two details matter and neither is cosmetic:
 
-    * **Validation and test get the *eval* transforms.** Augmentation exists to
-      make training harder; measuring on augmented images measures the
-      augmentation. That needs a second ``ImageFolder`` over the same directory,
-      because a transform belongs to the dataset rather than to the subset.
+    * **Validation and test get the *eval* transforms**, via :func:`eval_view` —
+      see there for why a ``Subset`` cannot carry its own.
     * **Sample weights are recomputed per fold**, from this fold's training labels.
       Reusing one weight vector across folds would weight each fold by another
       fold's class balance — the same category of mistake as sharing a fitted
       scaler, and just as invisible in the result.
     """
     from torch.utils.data import Subset
-    from torchvision import datasets
 
-    # A second view of the same directory, without augmentation.
-    eval_view = datasets.ImageFolder(config.data.path, transform=eval_tf)
+    # One un-augmented view of the same corpus, shared by val and test.
+    unaugmented = eval_view(full_train, eval_tf)
 
     train_ds = Subset(full_train, list(indices.train))
-    val_ds = Subset(eval_view, list(indices.val))
-    test_ds = Subset(eval_view, list(indices.test))
+    val_ds = Subset(unaugmented, list(indices.val))
+    test_ds = Subset(unaugmented, list(indices.test))
 
     # `Subset` has no `.targets`; reading it would silently return the *parent's*
     # full label list. Same bug the non-CV path documents, same recovery.

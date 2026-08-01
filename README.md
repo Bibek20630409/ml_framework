@@ -165,7 +165,10 @@ way with `SourceSpec`.
   regression** to avoid stratification crashes). Set `data.split.time_col` or
   `group_col` and `strategy: auto` switches to a temporal or grouped split — the two
   leakage modes a shuffled split hides
-- Scaling (`StandardScaler`, fit on train only), persisted for inference
+- Scaling (`StandardScaler`, fit on train only), persisted for inference. Image
+  augmentation applies to **training only** — validation and test images go
+  through the eval pipeline, so the score measures the model rather than the
+  augmentation
 - Imbalance handling — one explicit strategy: `smote | class_weights | none`
 - Gradient clipping, early stopping, best-checkpointing, LR scheduling
 - Metrics + CSV/WandB logging; final report, predictions, confusion matrix
