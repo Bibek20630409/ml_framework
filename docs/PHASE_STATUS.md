@@ -30,9 +30,9 @@ v1 *bundles* still load (`test_v1_bundle_compat.py`); v1 *configs* do not, and
 
 ## Test baseline
 
-**511 passed, 1 skipped** with every declared extra installed except DVC
-(46/4 before P0 → 130/4 after P0 → 249/4 after P1 → 258/1 → 284/1 after P2 → 355/1 after P3 → 395/1 after P4 → 429/1 after P5 → 458/1 after P6 → 471/1 after the image-augmentation fix →
-**511/1** after P7). Every phase gate is measured against this number — a phase that ends
+**549 passed, 1 skipped** with every declared extra installed except DVC
+(46/4 before P0 → 130/4 after P0 → 249/4 after P1 → 258/1 → 284/1 after P2 → 355/1 after P3 → 395/1 after P4 → 429/1 after P5 → 458/1 after P6 → 471/1 after the image-augmentation fix → 511/1 after P7 →
+**549/1** after the two NLP tasks). Every phase gate is measured against this number — a phase that ends
 with fewer passing tests than it started with has regressed something, regardless
 of what its own new tests say.
 
@@ -793,11 +793,110 @@ produce models whose class 0 means different things.
 
 ### Deliberate loose ends P8+ must close
 
-1. **`token_classification` and `seq2seq` are in the `Task` literal with no
-   `TaskSpec` row.** They are refused at config load, which is correct, but the
-   NLP surface is classification-only.
-2. **No multi-label text.** `multilabel` has no `TaskSpec` either.
+1. ~~`token_classification` and `seq2seq` have no `TaskSpec` row~~ — closed below.
+2. **No multi-label text.** `multilabel` has no `TaskSpec`, and by the rule stated
+   below that is correct until it has a source, a model and a loss.
 3. **Drift for text is a 501.** PSI over token ids is a number without a meaning;
    embedding-distance drift is the real answer and is not built.
 4. **`native_categorical` still has no consumer** (from P4).
 5. **Multi-series forecasting and `exog` consumption** (from P6).
+
+## Follow-up: token classification and seq2seq
+
+Not a phase — the first loose end from P7, closed on request. The NLP surface is
+no longer classification-only.
+
+### The rule this settled
+
+**A `TaskSpec` row means the framework can run the task.** Adding two rows is a
+ten-line change and would have made both configs validate — and then failed
+somewhere inside the fit loop, which is strictly worse than the refusal it
+replaced. So the rows arrived with what makes them true:
+
+| piece | `token_classification` | `seq2seq` |
+|---|---|---|
+| source | `read_token_corpus` — words + tags | `read_seq2seq_corpus` — source + target |
+| preprocessor | `TokenTextPreprocessor` (alignment) | `Seq2SeqPreprocessor` (two lengths) |
+| model | `nlp.hf_token` | `nlp.hf_seq2seq` |
+| loss | CE over positions, `ignore_index` | CE over positions, teacher-forced |
+| metrics | macro-F1, token-level | ROUGE-L / token-F1 / exact-match |
+| serving | one tag per **word** | generated strings |
+
+`multilabel` is still unregistered, for exactly this reason, and a test now pins
+that so the rule is not quietly abandoned the next time somebody wants a config to
+validate.
+
+### The two things that are actually hard
+
+**Word-to-sub-word alignment.** A corpus is tagged per *word*; the model consumes
+*sub-words*. Only the first piece of each word carries its tag — every
+continuation gets `IGNORE_INDEX`. The tempting alternative, repeating the tag
+across all pieces, does not raise: it makes one word's single decision count once
+per piece, silently re-weighting the corpus toward whichever words the tokenizer
+fragments most, which is exactly the rare proper nouns NER is about. It also makes
+the number incomparable with anything published. A test asserts the scored count
+equals the *word* count while the piece count is strictly larger.
+
+**Teacher forcing is not generation.** A seq2seq model trains with the reference
+prefix fed to the decoder at every step and is evaluated by generating without
+one. `val/loss` stays the early-stopping monitor because generating each
+validation epoch would multiply epoch time by the decode length — but it is *not*
+what the reported metrics measure, and the two can move in opposite directions.
+`report.txt` says so rather than leaving it to be discovered.
+
+### Decisions worth knowing
+
+**`OutputKind` grew two values and `Postprocess` grew one.** `token_labels` and
+`text` are not decoration on `labels`: a tagger emits one label per position in a
+variable-length sequence and a generator emits a string, so `evaluate()`,
+`predictions.csv` and the serving response each have to know which they hold.
+`Postprocess.generate` is honest about being the odd one — the other three are
+functions of the logits, while generation is an autoregressive loop that needs the
+*inputs*.
+
+**Ragged batches flatten rather than pad together.** Batches are padded to their
+own longest sequence, so `(B, T)` arrays from different batches cannot be
+concatenated. Dropping the ignored positions flattens both sides to 1-D over real
+tokens — which is also the only granularity at which the metrics mean anything.
+`predictions.csv` then has one row per token, and the sentence index is dropped
+rather than mislabelling every row.
+
+**One tokenizer in the bundle, not two.** Generation needs to turn ids back into
+text, which needs a tokenizer the model does not own. Rather than have the model
+carry a second copy — which could disagree with the preprocessor's about the
+vocabulary — `Inferencer` binds the loaded preprocessor onto the estimator, and
+the estimator borrows it. A test asserts `estimator.preprocessor is
+inf.preprocessor` and that no tokenizer exists under `model/`.
+
+**The tagging report states that it is token-level.** The NER convention (seqeval)
+is *entity*-level F1: a predicted entity must match the reference in both span and
+type. That is strictly harder, token-level figures run several points above it,
+and printing this under the bare name "F1" would invite a comparison that flatters
+it. Entity-level scoring is not implemented.
+
+**Macro-F1 leads for tagging, not accuracy.** `O` dominates a tagging corpus; a
+model that answers "not an entity" everywhere scores ~90% accuracy and is worth
+nothing.
+
+**Three generated-text metrics, all shallow, and the report says so.** ROUGE-L,
+token-F1 and exact-match are n-gram overlap against one reference, so a correct
+paraphrase scores near zero. Reported anyway because a number honest about being
+shallow beats no number, and because the alternatives (BERTScore, an LLM judge)
+are a model dependency this framework should not acquire by default. ROUGE-L and
+token-F1 are both reported because they disagree in a specific way — token-F1
+ignores word order — and a test pins that disagreement.
+
+**Stratification is now a property of the task, not "is it regression".** Four
+call sites in `splitters.py` spelled "don't stratify" as `task == "regression"`,
+which quietly asserted that every other task has one class label per row. True
+until token tagging, then wrong. Now a `STRATIFIED_TASKS` table.
+
+### Newly deliberate loose ends
+
+1. **Entity-level (seqeval) scoring for NER.** Token-level is what is computed and
+   the report says so.
+2. **`num_beams > 1` is honoured but untuned**, and beam search is not in the
+   search space — it costs linearly on every evaluation pass.
+3. **A seq2seq model cannot resize its vocabulary.** Adding tokens to the
+   preprocessor's tokenizer would leave the embedding table behind.
+4. **Drift for text remains a 501** (from P7).

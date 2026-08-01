@@ -10,10 +10,14 @@ A :class:`TaskSpec` is consumed by early stopping, checkpointing, HPO direction,
 postprocessing. Adding a task becomes "add a row (+ its metrics)" rather than a
 six-file grep.
 
-Rows exist only for tasks the framework can actually run today
-(binary/multiclass/regression); ``forecasting`` arrives in P6 and the text tasks
-in P7, each via :func:`register_task_spec`. ``get_task_spec`` on an unregistered
-task says so rather than silently defaulting.
+**A row means the framework can run the task.** That is the rule this table is
+kept to, and it is why ``token_classification`` and ``seq2seq`` were absent until
+there was a source, a model and an evaluation path for each: a row that merely
+lets a config validate would trade an honest refusal at load time for a confusing
+failure somewhere in the fit loop. ``get_task_spec`` on an unregistered task says
+so rather than silently defaulting.
+
+Still unregistered, and for that reason: ``multilabel``.
 """
 
 from __future__ import annotations
@@ -21,7 +25,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 
-from .types import Direction, FrameworkError, OutputKind, Postprocess, Task
+from .types import IGNORE_INDEX, Direction, FrameworkError, OutputKind, Postprocess, Task
 
 
 class UnknownTaskError(FrameworkError):
@@ -64,7 +68,28 @@ class TaskSpec:
 
     @property
     def is_classification(self) -> bool:
+        """Whether one row yields one class.
+
+        ``token_classification`` is deliberately **not** included even though it
+        predicts classes: its predictions are one-per-token over a variable-length
+        sequence, so every consumer that branches on this flag (the confusion
+        matrix, ``predictions.csv``, the serving response) would produce the wrong
+        shape. It gets its own branch instead of a flag that is true in name only.
+        """
         return self.output_kind in ("labels", "probabilities")
+
+    @property
+    def ignore_index(self) -> int | None:
+        """Label value the loss and the metrics must skip, or ``None``.
+
+        Read by ``BaseModel._build_criterion`` and by ``predict_split``, so a task
+        that pads its targets declares it once here instead of each of them
+        hardcoding -100.
+        """
+        value = self.meta.get("ignore_index")
+        # `meta` is deliberately typed `object` so it cannot become a typed
+        # dumping ground; the narrowing belongs at the one accessor that reads it.
+        return int(value) if isinstance(value, int) else None
 
     def compute(self, y_true, y_pred, y_prob=None, *, prefix: str = "") -> dict[str, float]:
         """This task's metrics for one set of predictions."""
@@ -140,9 +165,11 @@ register_task_spec(
 register_task_spec(
     TaskSpec(
         name="forecasting",
-        # MASE rather than MAE: a scale-free number whose 1.0 is a *meaning* — the
-        # seasonal-naive forecast. "MAE 4.2" says nothing without knowing the
-        # series; "MASE 0.8" says the model beats doing nothing.
+        # MASE rather than MAE because it is scale-free: "MAE 4.2" says nothing
+        # without knowing whether the series runs in single digits or millions.
+        # It is *not* a pass mark — over a multi-step horizon values above 1 are
+        # normal. See `metrics.mase`, and `evaluate._write_forecast`, which prints
+        # no verdict for the same reason.
         primary_metric="mase",
         direction="min",
         output_kind="series",
@@ -152,5 +179,45 @@ register_task_spec(
         # Seasonality is a property of the data, not of the task, so the source
         # sets it. Recorded here as the default for a non-seasonal series.
         meta={"seasonality": 1},
+    )
+)
+register_task_spec(
+    TaskSpec(
+        name="token_classification",
+        # Macro-F1, not accuracy. Token tagging is overwhelmingly dominated by the
+        # `O` class — a model that predicts "not an entity" for every token scores
+        # around 90% accuracy on a typical NER corpus while being worth nothing.
+        primary_metric="f1",
+        direction="max",
+        output_kind="token_labels",
+        postprocess="softmax",
+        metric_names=("acc", "f1", "precision", "recall"),
+        description="One label per token (NER, POS tagging).",
+        # Both the loss and the metrics skip these positions: sub-word
+        # continuations, padding, and the special tokens the tokenizer adds. See
+        # `data.preprocess.text.TokenTextPreprocessor` for why a *word*-level tag
+        # cannot simply be repeated across the sub-words it became.
+        meta={"ignore_index": IGNORE_INDEX, "scoring": "token-level, not entity-level"},
+    )
+)
+register_task_spec(
+    TaskSpec(
+        name="seq2seq",
+        # Reference-overlap, and shallow: see `metrics.rouge_l`. ROUGE-L leads
+        # because it is the summarization convention and because it is the least
+        # brittle of the three — exact_match is near-zero for anything longer than
+        # a phrase, and token_f1 ignores word order entirely.
+        primary_metric="rouge_l",
+        direction="max",
+        output_kind="text",
+        # Not a function of the logits: generation is an autoregressive loop that
+        # needs the inputs, which is why `Postprocess` had to grow a fourth value
+        # rather than this task reusing `identity` and lying about it.
+        postprocess="generate",
+        metric_names=("rouge_l", "token_f1", "exact_match"),
+        # `val/loss` stays the monitor. Generating on every validation epoch to
+        # score ROUGE would multiply epoch time by the decode length, and
+        # teacher-forced loss tracks quality closely enough to stop on.
+        description="Generate a target string from a source string.",
     )
 )

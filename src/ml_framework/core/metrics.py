@@ -161,6 +161,115 @@ def mase(y_true, y_pred, *, seasonality: int = 1) -> float:
     return float(np.abs(yp - yt).mean() / naive_error)
 
 
+# ── Generated text ────────────────────────────────────────
+# These take **strings**, not numbers, which is why they sit apart. They are all
+# reference-based n-gram overlap measures: cheap, deterministic, dependency-free,
+# and blunt. None of them knows that "the cat sat" and "a feline was seated" mean
+# the same thing. Reported because a number that is honest about being shallow
+# beats no number at all, and because the alternatives (BERTScore, an LLM judge)
+# are a model dependency this framework should not acquire by default.
+
+
+def _norm_tokens(text: object) -> list[str]:
+    """Lowercased whitespace tokens.
+
+    Deliberately not the model's tokenizer: a metric that changed when you swapped
+    checkpoints would be uncomparable between runs, which is the one thing a
+    metric has to be.
+    """
+    return str(text).lower().split()
+
+
+def _pairs(y_true, y_pred) -> list[tuple[str, str]]:
+    yt = [str(v) for v in np.asarray(y_true, dtype=object).reshape(-1)]
+    yp = [str(v) for v in np.asarray(y_pred, dtype=object).reshape(-1)]
+    if len(yt) != len(yp):
+        raise ValueError(f"reference/prediction counts differ: {len(yt)} vs {len(yp)}")
+    return list(zip(yt, yp, strict=True))
+
+
+def exact_match(y_true, y_pred) -> float:
+    """Fraction of predictions equal to their reference, after stripping.
+
+    The strictest and least forgiving of the three. Useful for short, constrained
+    outputs (a normalized date, a SQL clause, a yes/no) and close to useless for
+    summarization, where two correct summaries are almost never the same string.
+    """
+    pairs = _pairs(y_true, y_pred)
+    if not pairs:
+        return float("nan")
+    return float(np.mean([t.strip() == p.strip() for t, p in pairs]))
+
+
+def token_f1(y_true, y_pred) -> float:
+    """Mean per-pair F1 over multiset token overlap (the SQuAD measure).
+
+    Order-insensitive: a prediction with the right words in the wrong order scores
+    the same as one in the right order. :func:`rouge_l` is the companion that
+    cares about order, which is why both are reported rather than either alone.
+    """
+    pairs = _pairs(y_true, y_pred)
+    if not pairs:
+        return float("nan")
+
+    scores = []
+    for reference, prediction in pairs:
+        ref, pred = _norm_tokens(reference), _norm_tokens(prediction)
+        if not ref or not pred:
+            # Both empty is a match; one empty is a miss. Computing precision
+            # against an empty prediction would divide by zero.
+            scores.append(float(not ref and not pred))
+            continue
+        from collections import Counter
+
+        overlap = sum((Counter(ref) & Counter(pred)).values())
+        if overlap == 0:
+            scores.append(0.0)
+            continue
+        prec, rec = overlap / len(pred), overlap / len(ref)
+        scores.append(2 * prec * rec / (prec + rec))
+    return float(np.mean(scores))
+
+
+def _lcs_length(a: list[str], b: list[str]) -> int:
+    """Longest common subsequence length, the standard O(len(a)*len(b)) table."""
+    if not a or not b:
+        return 0
+    previous = [0] * (len(b) + 1)
+    for token in a:
+        current = [0]
+        for j, other in enumerate(b):
+            current.append(previous[j] + 1 if token == other else max(current[j], previous[j + 1]))
+        previous = current
+    return previous[-1]
+
+
+def rouge_l(y_true, y_pred) -> float:
+    """Mean per-pair ROUGE-L F-measure: F1 over the longest common subsequence.
+
+    A *subsequence*, not a substring, so it rewards getting the right words in the
+    right order without demanding they be adjacent. This is the summarization
+    convention.
+    """
+    pairs = _pairs(y_true, y_pred)
+    if not pairs:
+        return float("nan")
+
+    scores = []
+    for reference, prediction in pairs:
+        ref, pred = _norm_tokens(reference), _norm_tokens(prediction)
+        if not ref or not pred:
+            scores.append(float(not ref and not pred))
+            continue
+        lcs = _lcs_length(ref, pred)
+        if lcs == 0:
+            scores.append(0.0)
+            continue
+        prec, rec = lcs / len(pred), lcs / len(ref)
+        scores.append(2 * prec * rec / (prec + rec))
+    return float(np.mean(scores))
+
+
 # ── Name → function table ─────────────────────────────────
 # `TaskSpec.metric_names` indexes into this.
 _LABEL_METRICS: dict[str, MetricFn] = {
@@ -174,6 +283,9 @@ _LABEL_METRICS: dict[str, MetricFn] = {
     "r2": r2,
     "mase": mase,
     "smape": smape,
+    "exact_match": exact_match,
+    "token_f1": token_f1,
+    "rouge_l": rouge_l,
 }
 # Metrics that consume probabilities rather than hard predictions.
 _PROBA_METRICS: dict[str, MetricFn] = {

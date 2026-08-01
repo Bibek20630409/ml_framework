@@ -148,7 +148,10 @@ class DataBundle:
         """
         if self.task == "binary":
             return 2
-        if self.task == "multiclass":
+        if self.task in ("multiclass", "token_classification"):
+            # For a tagger this is the size of the *tag* vocabulary. It reaches the
+            # manifest, which is what lets `predictions.csv` and the serving
+            # response name tags instead of printing integers.
             return self.output_dim
         return None
 

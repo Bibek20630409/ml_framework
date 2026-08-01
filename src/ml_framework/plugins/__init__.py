@@ -86,6 +86,8 @@ def model_class(name: str) -> type:
         "cnn": ".cnn",
         "ts.lstm": ".ts.lstm",
         "nlp.hf_text": ".nlp.hf_text",
+        "nlp.hf_token": ".nlp.hf_token",
+        "nlp.hf_seq2seq": ".nlp.hf_seq2seq",
     }
     if key in lazy:
         importlib.import_module(lazy[key], __name__)

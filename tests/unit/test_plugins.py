@@ -176,6 +176,8 @@ def test_builtin_model_specs_are_registered():
         "ts.prophet",
         "ts.lstm",
         "nlp.hf_text",
+        "nlp.hf_token",
+        "nlp.hf_seq2seq",
     }
     assert set(MODELS.names()) == set(available_models()) == expected
     assert set(plugins.BUILTINS) == expected

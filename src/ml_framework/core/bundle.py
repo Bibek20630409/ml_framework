@@ -272,8 +272,16 @@ def head_width(manifest: Manifest) -> int:
     self-serializing model for its own directory — and two copies of this rule
     would eventually disagree about binary.
     """
-    if manifest.task == "multiclass":
+    if manifest.task in ("multiclass", "token_classification"):
+        # A tagger's head is one logit per tag *at every position*, and the
+        # one-logit binary convention does not reach it: even a two-tag corpus gets
+        # a two-wide head, because the loss is cross-entropy over positions rather
+        # than a single sigmoid.
         return int(manifest.signature.output.n_classes or 0)
+    if manifest.task == "seq2seq":
+        # The head is the checkpoint's vocabulary. Reporting a width here would be
+        # reporting something the framework neither chose nor can check.
+        return 0
     return 1
 
 

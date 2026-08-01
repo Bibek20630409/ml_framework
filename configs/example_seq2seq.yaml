@@ -1,0 +1,73 @@
+# ── Example seq2seq config (schema v2) ───────────────────────────────
+# Load with:  mlf train --config configs/example_seq2seq.yaml
+# Needs the nlp and lightning extras:  pip install -e '.[nlp,lightning]'
+#
+# Summarization, translation, text normalization — anything where the target is
+# another string rather than a class. Still `data.kind: text`.
+
+task: seq2seq
+
+runtime:
+  seed: 42
+  output_dir: outputs
+  num_workers: -1
+  accelerator: auto
+
+data:
+  kind: text
+  path: data/pairs.csv           # CSV, Parquet or JSONL
+  target: target                 # the target-text column; never label-encoded
+  split:
+    val_size: 0.15
+    test_size: 0.15
+    folds: 0
+  params:
+    text_col: source             # the source-text column
+
+model:
+  name: nlp.hf_seq2seq
+  params:
+    # BART rather than T5 as the default for one unglamorous reason: T5's
+    # tokenizer needs `sentencepiece`, which the `[nlp]` extra does not pull. Name
+    # a T5 checkpoint here and it works once sentencepiece is installed.
+    model_name: facebook/bart-base
+    max_length: 128              # source truncation
+    # Target truncation *and* the decode budget. Raising it costs time twice:
+    # once in training, once on every evaluation pass.
+    max_target_length: 64
+    # 1 is greedy. Beams improve output and cost linearly in time, paid on every
+    # evaluation pass.
+    num_beams: 1
+    freeze_encoder: false
+
+fit:
+  budget:
+    max_epochs: 3
+  patience: 2
+  batch_size: 8                  # generation is memory-hungrier than classification
+  # lr / optimizer / weight_decay / scheduler come from the plugin's fine-tuning
+  # defaults — see configs/example_text.yaml.
+
+tune:
+  enabled: false
+
+logging:
+  backend: none
+
+# ── The one thing to understand before reading the numbers ───────────
+#
+# **Training and evaluation do not measure the same thing.**
+#
+# Training is *teacher forcing*: the decoder is fed the reference prefix at every
+# position, so it never has to survive its own mistakes. That is what `val/loss`
+# measures, and it is what early stopping monitors — because generating on every
+# validation epoch would multiply epoch time by the decode length.
+#
+# The reported metrics come from real generation on the test split. A model can
+# improve on the loss while getting *worse* at generating, and this is the usual
+# way that goes unnoticed.
+#
+# ROUGE-L, token-F1 and exact-match are all n-gram overlap against a single
+# reference. None of them knows that "the cat sat" and "a feline was seated" mean
+# the same thing, so a correct paraphrase scores near zero. Read them as a floor
+# and read the samples in `report.txt` as the real evidence.

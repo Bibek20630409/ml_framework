@@ -45,11 +45,20 @@ import torch.nn as nn
 from pydantic import BaseModel as PydanticModel
 from torchmetrics import Accuracy, F1Score, MeanAbsoluteError, MeanSquaredError
 
+from .types import IGNORE_INDEX
+
 # Tasks whose head is a single continuous output. `forecasting` joins `regression`
 # here rather than getting its own branch: predicting the next value of a series
 # and predicting a target from features are the same *loop* — what differs is the
 # data the source hands over, which is the source's business.
 CONTINUOUS_TASKS = frozenset({"regression", "forecasting"})
+
+# Tasks whose target is a *sequence* of labels rather than one per row, so the
+# loss flattens (B, T, C) against (B, T) and both loss and metrics skip
+# `IGNORE_INDEX`. Grouped because the arithmetic is identical for a token tagger
+# scoring tags and a generator scoring vocabulary entries — what differs is the
+# size of C and whether the numbers are worth reporting per-class.
+SEQUENCE_TASKS = frozenset({"token_classification", "seq2seq"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -176,6 +185,12 @@ class BaseModel(pl.LightningModule):
             return nn.CrossEntropyLoss(weight=w)
         if self.task in CONTINUOUS_TASKS:
             return nn.MSELoss()
+        if self.task in SEQUENCE_TASKS:
+            # `ignore_index` is the whole reason this is a separate branch. The
+            # padded positions in a batch are not a class to be predicted — they
+            # are absence — and counting them would let a model score well by
+            # learning to predict padding, which is most of a short sequence.
+            return nn.CrossEntropyLoss(ignore_index=IGNORE_INDEX, weight=w)
         raise ValueError(f"Unknown task: {self.task}")
 
     # ── Metrics ───────────────────────────────────────────
@@ -193,6 +208,28 @@ class BaseModel(pl.LightningModule):
             self.test_acc = Accuracy(task="multiclass", num_classes=nc)
             self.val_f1 = F1Score(task="multiclass", num_classes=nc, average="macro")
             self.test_f1 = F1Score(task="multiclass", num_classes=nc, average="macro")
+        elif self.task == "token_classification":
+            nc = self.output_dim
+            # `ignore_index` again, for the same reason and with the same value:
+            # torchmetrics would otherwise treat -100 as a class and report a
+            # figure dominated by padding.
+            self.train_acc = Accuracy(task="multiclass", num_classes=nc, ignore_index=IGNORE_INDEX)
+            self.val_acc = Accuracy(task="multiclass", num_classes=nc, ignore_index=IGNORE_INDEX)
+            self.test_acc = Accuracy(task="multiclass", num_classes=nc, ignore_index=IGNORE_INDEX)
+            self.val_f1 = F1Score(
+                task="multiclass", num_classes=nc, average="macro", ignore_index=IGNORE_INDEX
+            )
+            self.test_f1 = F1Score(
+                task="multiclass", num_classes=nc, average="macro", ignore_index=IGNORE_INDEX
+            )
+        elif self.task == "seq2seq":
+            # No torchmetrics at all. Accuracy over a 30k-entry vocabulary is a
+            # number nobody acts on, and instantiating a confusion-matrix-backed
+            # metric that wide costs real memory per step. `val/loss` is the
+            # monitor; the reported metrics are reference-overlap scores computed
+            # from *generated* text after training, which is the only place
+            # generation is cheap enough to run.
+            pass
         elif self.task in CONTINUOUS_TASKS:
             self.train_mae = MeanAbsoluteError()
             self.val_mae = MeanAbsoluteError()
@@ -229,6 +266,29 @@ class BaseModel(pl.LightningModule):
             if stage in ("val", "test"):
                 getattr(self, f"{stage}_f1")(preds, y.long())
                 self.log(f"{stage}/f1", getattr(self, f"{stage}_f1"), prog_bar=True)
+
+        elif self.task == "token_classification":
+            # (B, T, C) against (B, T): flattened to (B*T, C) and (B*T), which is
+            # what CrossEntropyLoss wants and what makes the padded positions
+            # droppable by value rather than by bookkeeping.
+            flat_logits = logits.reshape(-1, logits.shape[-1])
+            flat_targets = y.reshape(-1).long()
+            loss = self.criterion(flat_logits, flat_targets)
+            preds = flat_logits.argmax(dim=1)
+            getattr(self, f"{stage}_acc")(preds, flat_targets)
+            self.log(f"{stage}/loss", loss, prog_bar=True)
+            self.log(f"{stage}/acc", getattr(self, f"{stage}_acc"), prog_bar=True)
+            if stage in ("val", "test"):
+                getattr(self, f"{stage}_f1")(preds, flat_targets)
+                self.log(f"{stage}/f1", getattr(self, f"{stage}_f1"), prog_bar=True)
+
+        elif self.task == "seq2seq":
+            # Teacher forcing: the decoder is fed the *reference* prefix at every
+            # position, so this loss is not what generation quality will be. It is
+            # a fine thing to stop on and a bad thing to report, which is why the
+            # reported metrics come from generated text instead.
+            loss = self.criterion(logits.reshape(-1, logits.shape[-1]), y.reshape(-1).long())
+            self.log(f"{stage}/loss", loss, prog_bar=True)
 
         elif self.task in CONTINUOUS_TASKS:
             logits = logits.squeeze(1)

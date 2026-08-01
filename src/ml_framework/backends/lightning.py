@@ -135,6 +135,7 @@ class LightningEstimator:
         checkpoint_path: str | Path | None = None,
         batch_size: int = DEFAULT_EVAL_BATCH_SIZE,
         device: Any | None = None,
+        preprocessor: Any = None,
     ) -> None:
         self.module = module
         self.task = task
@@ -142,7 +143,22 @@ class LightningEstimator:
         self.checkpoint_path = Path(checkpoint_path) if checkpoint_path else None
         self.batch_size = batch_size
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # Only the `generate` path uses it, and only to turn token ids back into
+        # strings. Handing the estimator the *same* preprocessor the data went
+        # through — rather than letting a generative model carry a second copy of
+        # the tokenizer — is what stops the two from disagreeing about the
+        # vocabulary. `Inferencer` attaches it after loading a bundle.
+        self.preprocessor = preprocessor
         self.module.to(self.device).eval()
+
+    def attach_preprocessor(self, preprocessor: Any) -> None:
+        """Late-bind the preprocessor, for the load-from-bundle path.
+
+        ``backend.load()`` sees only the manifest; the preprocessor is loaded
+        separately by :class:`~ml_framework.core.inference.Inferencer`, which calls
+        this once it has both.
+        """
+        self.preprocessor = preprocessor
 
     # ── internals ──
     def _to_device(self, inputs: Any) -> Any:
@@ -174,6 +190,11 @@ class LightningEstimator:
         can never disagree about what a logit means.
         """
         post = self.task_spec.postprocess
+        if self.task_spec.output_kind == "token_labels":
+            # (B, T, C): argmax over the last axis leaves one label per position.
+            # Deliberately *not* flattened here — the padding mask lives with the
+            # labels, so dropping the padded positions is `predict_split`'s job.
+            return logits.argmax(dim=-1).cpu().numpy(), torch.softmax(logits, dim=-1).cpu().numpy()
         if post == "sigmoid":
             prob = torch.sigmoid(logits.squeeze(1))
             preds = (prob > 0.5).long()
@@ -182,12 +203,45 @@ class LightningEstimator:
             return logits.argmax(dim=1).cpu().numpy(), torch.softmax(logits, dim=1).cpu().numpy()
         return logits.squeeze(1).cpu().numpy(), None
 
+    @torch.no_grad()
+    def generate(self, inputs: Any) -> np.ndarray:
+        """Autoregressive decode → an array of strings.
+
+        The one prediction path that is not a function of the logits, which is
+        what ``Postprocess.generate`` names. The model produces ids and the
+        preprocessor turns them back into text, because the tokenizer that made
+        them is the preprocessor's.
+        """
+        if self.preprocessor is None:
+            raise UnsupportedCapability(
+                f"task '{self.task}' generates text, which needs the bundle's tokenizer "
+                f"to decode. This estimator was built without a preprocessor attached."
+            )
+        ids = self.module.generate_ids(self._to_device(inputs))
+        return np.asarray(self.preprocessor.decode(ids), dtype=object)
+
+    def batch_predictions(self, inputs: Any) -> tuple[np.ndarray, np.ndarray | None]:
+        """``(predictions, probabilities)`` for one batch, whatever the task.
+
+        The single routing point. ``predict`` and the backend's ``predict_split``
+        both go through it, so a generative model cannot end up decoded one way by
+        the serving path and another way by the evaluation path.
+        """
+        if self.task_spec.postprocess == "generate":
+            return self.generate(inputs), None
+        return self.decode(self.logits(inputs))
+
     # ── contract ──
     def predict(self, inputs: Any) -> np.ndarray:
-        preds, _ = self.decode(self.logits(inputs))
+        preds, _ = self.batch_predictions(inputs)
         return preds
 
     def predict_proba(self, inputs: Any) -> np.ndarray:
+        if self.task_spec.postprocess == "generate":
+            raise UnsupportedCapability(
+                f"task '{self.task}' produces text; a generated string has no class "
+                f"distribution behind it"
+            )
         _, prob = self.decode(self.logits(inputs))
         if prob is None:
             raise UnsupportedCapability(
@@ -343,6 +397,9 @@ class LightningBackend(BaseBackend):
             bundle.task,
             checkpoint_path=best_path,
             batch_size=cfg.fit.batch_size,
+            # Generation needs the tokenizer to turn ids back into text, and this
+            # is the one the data went through.
+            preprocessor=bundle.preprocessor,
         )
         return FitResult(estimator=estimator, val_metrics=val_metrics)
 
@@ -526,24 +583,54 @@ class LightningBackend(BaseBackend):
         )
         dm.setup()
 
+        spec = get_task_spec(bundle.task)
         preds: list[np.ndarray] = []
         probs: list[np.ndarray] = []
         labels: list[np.ndarray] = []
         with torch.no_grad():
             for batch in dm.split_dataloader(split):
                 x, y = (batch[0], batch[1]) if isinstance(batch, (list, tuple)) else (batch, None)
-                batch_preds, batch_probs = est.decode(est.logits(x))
+                batch_preds, batch_probs = est.batch_predictions(x)
+
+                if spec.output_kind == "token_labels" and y is not None:
+                    # Ragged by nature: batches are padded to their own longest
+                    # sequence, so (B, T) arrays from different batches cannot be
+                    # concatenated. Dropping the ignored positions — sub-word
+                    # continuations, specials, padding — flattens both sides to 1-D
+                    # over *real* tokens, which concatenates and is also the only
+                    # granularity the metrics mean anything at.
+                    keep = np.asarray(y.cpu()) != spec.ignore_index
+                    labels.append(np.asarray(y.cpu())[keep])
+                    preds.append(np.asarray(batch_preds)[keep])
+                    if batch_probs is not None:
+                        probs.append(np.asarray(batch_probs)[keep])
+                    continue
+
                 preds.append(batch_preds)
                 if batch_probs is not None:
                     probs.append(batch_probs)
-                if y is not None:
+                if y is None:
+                    continue
+                if spec.output_kind == "text":
+                    # The references are token ids too; they have to come back
+                    # through the same tokenizer as the predictions or the string
+                    # metrics compare text against numbers.
+                    labels.append(np.asarray(est.preprocessor.decode(y), dtype=object))
+                else:
                     labels.append(y.cpu().numpy() if hasattr(y, "cpu") else np.asarray(y))
+
+        index = target.index
+        if labels and index is not None and len(np.concatenate(labels)) != len(index):
+            # Token tagging emits one row per *token* while `index` addresses
+            # sentences, and a mismatched index silently mislabels every row of
+            # predictions.csv. Dropping it is honest; padding it out would not be.
+            index = None
 
         return Predictions(
             y_true=np.concatenate(labels) if labels else None,
             y_pred=np.concatenate(preds),
             y_prob=np.concatenate(probs) if probs else None,
-            index=target.index,
+            index=index,
         )
 
     # ── HPO ──

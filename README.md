@@ -118,7 +118,7 @@ src/ml_framework/
 ├── serving/api.py       FastAPI: /health /predict /predict_proba
 ├── utils/               logging, seed, platform-aware workers
 └── cli.py               `mlf` entry point
-configs/                 example_tabular · example_gbdt · example_image · example_timeseries · example_text
+configs/                 example_tabular · example_gbdt · example_image · example_timeseries · example_text · example_ner · example_seq2seq
 tests/                   unit · integration · serving · backends · data
 ```
 
@@ -184,6 +184,13 @@ way with `SourceSpec`.
 | `multiclass` | `CrossEntropyLoss` (class weights) | acc, macro-F1, ROC-AUC |
 | `regression` | `MSELoss` | MAE, RMSE, R² |
 | `forecasting` | `MSELoss` (windowed) / per-model | **MASE**, sMAPE, MAE, RMSE |
+| `token_classification` | `CrossEntropyLoss` (per position, padding ignored) | **macro-F1**, accuracy — token-level |
+| `seq2seq` | `CrossEntropyLoss` (teacher-forced) | **ROUGE-L**, token-F1, exact match |
+
+A task has a row in this table only when the framework can actually run it — a
+row that merely lets a config validate would trade an honest refusal at load time
+for a confusing failure inside the fit loop. `multilabel` is in the `Task`
+vocabulary and deliberately has no row.
 
 ## Backends
 
@@ -193,7 +200,7 @@ implementations — and adding CatBoost was ~40 lines, not a new backend.
 
 | backend | shape | models |
 |---|---|---|
-| `lightning` | epoch loop + validation callbacks | `mlp`, `cnn`, `ts.lstm`, `nlp.hf_text` |
+| `lightning` | epoch loop + validation callbacks | `mlp`, `cnn`, `ts.lstm`, `nlp.hf_text`, `nlp.hf_token`, `nlp.hf_seq2seq` |
 | `gbdt` | one-shot `fit(X, y, eval_set=…)` + native early stopping | `xgboost`, `lightgbm`, `catboost` |
 | `forecast` | fit-per-series, no X/y, predict-by-horizon | `ts.naive`, `ts.arima`, `ts.prophet` |
 
@@ -439,3 +446,56 @@ unusable from curl.
 
 `/drift` answers **501** for text: PSI over token ids is a number without a
 meaning, and inventing one would be worse than reporting that there is none.
+
+
+## Beyond text classification
+
+`data.kind: text` covers three tasks, and the **task** is what decides what a
+label is:
+
+| task | model | one input row produces | config |
+|---|---|---|---|
+| `binary` / `multiclass` | `nlp.hf_text` | one class | `example_text.yaml` |
+| `token_classification` | `nlp.hf_token` | one class **per token** | `example_ner.yaml` |
+| `seq2seq` | `nlp.hf_seq2seq` | a **string** | `example_seq2seq.yaml` |
+
+All three ride the `lightning` backend. Still three backends.
+
+```bash
+curl -X POST localhost:8000/predict -d '{"inputs": ["Ada works at Acme"]}'
+# {"tokens": [["Ada","works","at","Acme"]], "labels": [["B-PER","O","O","B-ORG"]]}
+
+curl -X POST localhost:8000/predict -d '{"inputs": ["summarize: ..."]}'
+# {"generated": ["..."]}
+```
+
+Tags come back per **word**, not per sub-word. The model predicts at sub-word
+positions, but you sent words — re-deriving the alignment client-side would mean
+owning a copy of the tokenizer, which is the coupling shipping it in the bundle
+removed.
+
+> **Token tagging is scored per token, not per entity.** The NER convention
+> (seqeval) requires a predicted entity to match the reference in both span *and*
+> type. That is strictly harder; token-level figures run several points above it
+> and are not comparable with published results. `report.txt` says this in the
+> file rather than leaving it to be assumed. Macro-F1 leads rather than accuracy,
+> because `O` dominates a tagging corpus — a model answering "not an entity"
+> everywhere scores ~90% accuracy and is worth nothing.
+
+> **A seq2seq model is trained one way and evaluated another.** Training is
+> teacher-forced: the decoder is fed the reference prefix at every step, so it
+> never has to survive its own mistakes. That is what `val/loss` measures, and it
+> stays the early-stopping monitor because generating every validation epoch would
+> multiply epoch time by the decode length. The reported metrics come from real
+> generation, and the two can move in opposite directions. ROUGE-L, token-F1 and
+> exact-match are all n-gram overlap against one reference, so a correct
+> paraphrase scores near zero — read them as a floor and read the samples in
+> `report.txt` as the evidence.
+
+The subtle part of token tagging is the **word-to-sub-word alignment**. A corpus is
+tagged per word; the model consumes sub-words, and "Acme" may arrive as
+`["ac", "##me"]`. Only the first piece carries the word's tag; continuations are
+excluded from both loss and metrics. Repeating the tag across every piece — the
+obvious alternative — does not raise. It makes one word's single decision count
+once per piece, re-weighting the corpus toward whichever words the tokenizer
+fragments most, which is exactly the rare proper nouns NER is about.

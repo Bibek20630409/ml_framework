@@ -189,6 +189,25 @@ class ConfidenceResponse(BaseModel):
     labels: list[str] | None = None
 
 
+class TokenLabelsResponse(BaseModel):
+    """One tag per **word**, per input row.
+
+    Not per sub-word. The model predicts at sub-word positions, but a caller sent
+    words and gets words back — anything else would make the response impossible to
+    line up with the request without re-running the tokenizer client-side, which is
+    the coupling the bundled tokenizer exists to remove.
+    """
+
+    tokens: list[list[str]]
+    labels: list[list[str]]
+
+
+class GenerationResponse(BaseModel):
+    """Generated text, one string per input row."""
+
+    generated: list[str]
+
+
 class ForecastResponse(BaseModel):
     forecast: list[float]
     index: list[str] | None = None
@@ -213,6 +232,15 @@ RESPONSE_MODELS: dict[str, type[BaseModel]] = {
     "timeseries": ForecastResponse,
 }
 
+# `text` covers three tasks whose *outputs* have nothing in common — one class, one
+# class per token, or a string — so the response cannot be chosen by data kind
+# alone. Keyed by the manifest's `signature.output.kind`, which is the field that
+# actually describes what comes out; anything absent falls back to the table above.
+RESPONSE_BY_OUTPUT_KIND: dict[str, type[BaseModel]] = {
+    "token_labels": TokenLabelsResponse,
+    "text": GenerationResponse,
+}
+
 # Drift is a distributional comparison over named numeric features. Computing PSI
 # over token ids or pixel bytes would produce a number with no meaning, so /drift
 # answers 501 for those kinds instead — see api.py.
@@ -228,7 +256,15 @@ def request_model(data_kind: str) -> type[BaseModel]:
         ) from None
 
 
-def response_model(data_kind: str) -> type[BaseModel]:
+def response_model(data_kind: str, output_kind: str | None = None) -> type[BaseModel]:
+    """The response shape for a bundle.
+
+    ``output_kind`` wins when it is known, because what a model *emits* is a
+    sharper question than what it *consumes* — three text tasks share one data
+    kind and produce three different things.
+    """
+    if output_kind and output_kind in RESPONSE_BY_OUTPUT_KIND:
+        return RESPONSE_BY_OUTPUT_KIND[output_kind]
     try:
         return RESPONSE_MODELS[data_kind]
     except KeyError:
@@ -244,8 +280,11 @@ def supports_drift(data_kind: str) -> bool:
 __all__ = [
     "DRIFT_CAPABLE_KINDS",
     "REQUEST_MODELS",
+    "RESPONSE_BY_OUTPUT_KIND",
     "RESPONSE_MODELS",
     "ConfidenceResponse",
+    "GenerationResponse",
+    "TokenLabelsResponse",
     "ForecastRequest",
     "ForecastResponse",
     "ImageItem",

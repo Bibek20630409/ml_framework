@@ -49,8 +49,10 @@ from .schemas import (
     ConfidenceResponse,
     ForecastRequest,
     ForecastResponse,
+    GenerationResponse,
     PayloadError,
     ProbaResponse,
+    TokenLabelsResponse,
     request_model,
     response_model,
     supports_drift,
@@ -235,10 +237,62 @@ def create_app(
             upper=None if upper is None else [float(v) for v in upper],
         )
 
+    def _token_labels(body: dict[str, Any]) -> TokenLabelsResponse:
+        """The token-classification branch of ``/predict``.
+
+        A tagger returns a *variable-length* answer per row, so it cannot use the
+        flat ``predictions`` list the other classification models share. Words are
+        echoed back beside their tags: the model tagged sub-words, and re-deriving
+        the alignment client-side would require the caller to own a copy of the
+        tokenizer — exactly what shipping it in the bundle removed.
+        """
+        inf, _, model_input = _parse(body)
+        rows = [str(text).split() for text in model_input]
+
+        names = inf.class_names or []
+        out: list[list[str]] = []
+        for row in rows:
+            # One row at a time: the estimator flattens nothing, so each call gets
+            # back one label per sub-word position, and only the first sub-word of
+            # each word carries this word's decision.
+            tags = inf.predict([row])
+            word_ids = inf.preprocessor.encode_words([row]).word_ids(batch_index=0)
+            per_word: dict[int, int] = {}
+            for position, word_id in enumerate(word_ids):
+                if word_id is not None and word_id not in per_word:
+                    per_word[word_id] = int(np.asarray(tags).reshape(-1)[position])
+            out.append(
+                [
+                    (
+                        (names[per_word[i]] if 0 <= per_word.get(i, -1) < len(names) else "O")
+                        if i in per_word
+                        # A word past `max_length` was truncated away and has no
+                        # prediction. Saying so beats inventing one.
+                        else "<truncated>"
+                    )
+                    for i in range(len(row))
+                ]
+            )
+        return TokenLabelsResponse(tokens=rows, labels=out)
+
+    def _generate(body: dict[str, Any]) -> GenerationResponse:
+        """The seq2seq branch of ``/predict``: strings in, strings out."""
+        inf, _, model_input = _parse(body)
+        return GenerationResponse(generated=[str(v) for v in inf.predict(model_input)])
+
     @app.post("/predict", dependencies=auth)
     def predict(body: dict[str, Any]) -> Any:
-        if _get_inferencer().data_kind == "timeseries":
+        inf = _get_inferencer()
+        if inf.data_kind == "timeseries":
             return _forecast(body)
+        # Routed on what the model *emits*, from the manifest. Three text tasks
+        # share `kind: text` and produce three unrelated shapes.
+        output_kind = inf.signature.output.kind
+        if output_kind == "token_labels":
+            return _token_labels(body)
+        if output_kind == "text":
+            return _generate(body)
+
         inf, _, model_input = _parse(body)
         preds = inf.predict(model_input)
         if supports_drift(inf.data_kind):
@@ -246,7 +300,7 @@ def create_app(
         if collectors.predictions is not None and inf.produces_proba:
             for p in preds:
                 collectors.predictions.labels(predicted_class=str(int(p))).inc()
-        model = response_model(inf.data_kind)
+        model = response_model(inf.data_kind, inf.signature.output.kind)
         return model(predictions=[float(p) for p in preds], labels=_labels(inf, preds))
 
     def _require_proba() -> Inferencer:

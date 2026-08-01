@@ -40,7 +40,7 @@ from pathlib import Path
 from typing import Any
 
 from ...core.plugins import check_requirements
-from ...core.types import Requirement
+from ...core.types import IGNORE_INDEX, Requirement
 from .base import BasePreprocessor, PreprocessorError
 
 # Declared here rather than in the plugin because this is the lowest module that
@@ -63,6 +63,11 @@ DEFAULT_MODEL_NAME = "distilbert-base-uncased"
 # grows quadratically with length in an attention stack, so the default is the
 # short end and lengthening it is a deliberate act.
 DEFAULT_MAX_LENGTH = 128
+
+# Generation targets are short -- a summary, a translation, a normalized field --
+# and the decode loop runs one step per token, so this is the axis that decides
+# how long evaluating a seq2seq model takes.
+DEFAULT_TARGET_LENGTH = 64
 
 
 class TextPreprocessor(BasePreprocessor):
@@ -185,10 +190,181 @@ class TextPreprocessor(BasePreprocessor):
         self._tokenizer = self._load_tokenizer(path)
 
 
+class TokenTextPreprocessor(TextPreprocessor):
+    """Tokenizer plus **word to sub-word label alignment**, for per-token tagging.
+
+    The alignment is the entire content of this class, and the reason token
+    classification is not just classification with a bigger output. A corpus is
+    tagged per *word* (``["Ada", "works", "at", "Acme"]`` becomes
+    ``["B-PER", "O", "O", "B-ORG"]``), but the model consumes *sub-words*, and
+    "Acme" may arrive as ``["ac", "##me"]``. Something has to decide what the
+    second piece is labelled.
+
+    **The first piece gets the word's tag; every continuation gets
+    ``IGNORE_INDEX``.** The tempting alternative -- repeat the tag across all
+    pieces -- is wrong in a way that flatters the score: one word's single
+    decision then counts once per piece, so the corpus is silently re-weighted
+    toward whichever words the tokenizer splits most, which is exactly the rare
+    proper nouns entity recognition is about. It also makes the reported figure
+    incomparable with anything published.
+
+    Truncation is the other trap: a sentence cut at ``max_length`` loses its tail
+    words, and their tags must go with them. Alignment reads ``word_ids()`` off
+    the encoding rather than counting the original list, so truncation is handled
+    by construction rather than by a length check that can drift out of step.
+    """
+
+    def _require_fast(self) -> Any:
+        """Fast tokenizers only -- ``word_ids()`` exists nowhere else.
+
+        A clear refusal here beats an ``AttributeError`` inside the collate
+        function on the first batch, which is where this would otherwise surface.
+        """
+        tokenizer = self.tokenizer
+        if not getattr(tokenizer, "is_fast", False):
+            raise PreprocessorError(
+                f"token classification needs a fast tokenizer to align word tags to "
+                f"sub-words, and '{self.model_name}' resolved to a slow one. Pick a "
+                f"checkpoint that ships a tokenizer.json."
+            )
+        return tokenizer
+
+    def encode_words(self, word_lists: Sequence[Sequence[str]]) -> Any:
+        """Pre-split words to a batch encoding that remembers word boundaries."""
+        return self._require_fast()(
+            [[str(w) for w in words] for words in word_lists],
+            is_split_into_words=True,
+            padding=True,
+            truncation=True,
+            max_length=self.max_length,
+            return_tensors="pt",
+        )
+
+    def align_tags(self, encoding: Any, tag_lists: Sequence[Sequence[int]]) -> Any:
+        """Word-level tags to one label per sub-word, padded with ``IGNORE_INDEX``."""
+        import torch
+
+        aligned: list[list[int]] = []
+        for row, tags in enumerate(tag_lists):
+            previous: int | None = None
+            labels: list[int] = []
+            for word_id in encoding.word_ids(batch_index=row):
+                if word_id is None:
+                    # [CLS], [SEP], padding: not a word, so not a decision.
+                    labels.append(IGNORE_INDEX)
+                elif word_id != previous:
+                    labels.append(int(tags[word_id]))
+                else:
+                    labels.append(IGNORE_INDEX)
+                previous = word_id
+            aligned.append(labels)
+        return torch.tensor(aligned, dtype=torch.long)
+
+    def transform(self, x: Any) -> Any:
+        """Serving: one sentence or several.
+
+        Raw strings are split on whitespace so a caller need not pre-tokenize;
+        pre-split word lists pass through. Both shapes are accepted because both
+        are unambiguous, which a bare list of strings would not be if the class
+        also took a single pre-split sentence.
+        """
+        if isinstance(x, str):
+            return self.encode_words([x.split()])
+        rows = list(x)
+        if rows and isinstance(rows[0], str):
+            return self.encode_words([str(r).split() for r in rows])
+        return self.encode_words(rows)
+
+    @property
+    def collate_fn(self) -> Callable[[Sequence[Any]], Any]:
+        return self._collate
+
+    def _collate(self, batch: Sequence[Any]) -> Any:
+        encoding = self.encode_words([item[0] for item in batch])
+        return encoding, self.align_tags(encoding, [item[1] for item in batch])
+
+
+class Seq2SeqPreprocessor(TextPreprocessor):
+    """Source and target text, encoded as one batch.
+
+    Two lengths, not one: a summary is far shorter than its input, and truncating
+    both at ``max_length`` would either waste most of the target budget or cut the
+    source in half. ``max_target_length`` exists for that reason, and it is also
+    the knob that decides how long evaluation takes -- generation runs one decoder
+    step per token.
+
+    Pad positions in the target become ``IGNORE_INDEX`` before the loss sees them.
+    Left as the pad id they are *learnable*, and since padding is most of a short
+    target in a mixed batch, a model could score well on the loss by learning to
+    predict nothing.
+
+    ``labels`` rides **inside** the encoding rather than beside it, because
+    transformers builds ``decoder_input_ids`` from it -- the right-shift that makes
+    teacher forcing work. Performing that shift by hand is a well-known way to
+    train a model that predicts the token it was just handed.
+    """
+
+    def __init__(
+        self,
+        *,
+        model_name: str = DEFAULT_MODEL_NAME,
+        max_length: int = DEFAULT_MAX_LENGTH,
+        max_target_length: int = DEFAULT_TARGET_LENGTH,
+    ) -> None:
+        super().__init__(model_name=model_name, max_length=max_length)
+        self.max_target_length = int(max_target_length)
+
+    def params(self) -> dict[str, Any]:
+        return {**super().params(), "max_target_length": self.max_target_length}
+
+    def encode_targets(self, targets: Sequence[str]) -> Any:
+        import torch
+
+        labels = self.tokenizer(
+            text_target=[str(t) for t in targets],
+            padding=True,
+            truncation=True,
+            max_length=self.max_target_length,
+            return_tensors="pt",
+        ).input_ids
+        pad_id = self.tokenizer.pad_token_id
+        if pad_id is None:
+            return labels
+        return torch.where(labels == pad_id, torch.full_like(labels, IGNORE_INDEX), labels)
+
+    def decode(self, token_ids: Any) -> list[str]:
+        """Generated -- or reference -- ids back to strings.
+
+        ``IGNORE_INDEX`` is not a token id, so reference labels must be put back to
+        the pad id before they can be decoded. That is the inverse of what
+        :meth:`encode_targets` did, and it is easy to forget until the references
+        come out of the tokenizer as an index error.
+        """
+        import torch
+
+        ids = torch.as_tensor(token_ids)
+        pad_id = self.tokenizer.pad_token_id or 0
+        ids = torch.where(ids == IGNORE_INDEX, torch.full_like(ids, pad_id), ids)
+        return [str(t) for t in self.tokenizer.batch_decode(ids, skip_special_tokens=True)]
+
+    @property
+    def collate_fn(self) -> Callable[[Sequence[Any]], Any]:
+        return self._collate
+
+    def _collate(self, batch: Sequence[Any]) -> Any:
+        encoding = self.encode([item[0] for item in batch])
+        labels = self.encode_targets([item[1] for item in batch])
+        encoding["labels"] = labels
+        return encoding, labels
+
+
 __all__ = [
     "DEFAULT_MAX_LENGTH",
     "DEFAULT_MODEL_NAME",
+    "DEFAULT_TARGET_LENGTH",
     "NLP_REQUIREMENTS",
     "TOKENIZER_DIR",
+    "Seq2SeqPreprocessor",
     "TextPreprocessor",
+    "TokenTextPreprocessor",
 ]

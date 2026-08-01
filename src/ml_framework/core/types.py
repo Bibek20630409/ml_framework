@@ -49,11 +49,28 @@ DataKind = Literal["tabular", "image", "text", "timeseries"]
 Payload = Literal["arrays", "frame", "dataset", "series"]
 
 # The shape of what a model emits, recorded in the bundle manifest's signature.
-OutputKind = Literal["labels", "probabilities", "values", "series"]
+#
+# `token_labels` and `text` are not decoration on `labels`/`values`: a per-token
+# tagger emits one label per *position* in a variable-length sequence, and a
+# generative model emits a string. Both break the "one row in, one number out"
+# assumption that `labels` carries, and the serving layer, `evaluate()` and
+# `predictions.csv` each have to know which they are holding.
+OutputKind = Literal["labels", "probabilities", "values", "series", "token_labels", "text"]
 
 # Canonical head postprocessing. One value per task, applied in exactly one place
 # (the estimator) rather than being re-derived at every call site.
-Postprocess = Literal["sigmoid", "softmax", "identity"]
+#
+# `generate` is the odd one and says so honestly: the others are functions of the
+# logits alone, while generation is an autoregressive loop that needs the *inputs*.
+# Naming it here keeps the estimator's routing table complete rather than pushing
+# a per-model special case into the backend.
+Postprocess = Literal["sigmoid", "softmax", "identity", "generate"]
+
+# Positions the loss and the metrics must ignore: padding in a token-tagged
+# sequence, and pad tokens in a generation target. -100 is torch's
+# `CrossEntropyLoss` default `ignore_index` and HuggingFace's convention for the
+# same thing, so using it means neither has to be told.
+IGNORE_INDEX: Final[int] = -100
 
 # Optimisation direction for a metric.
 Direction = Literal["min", "max"]

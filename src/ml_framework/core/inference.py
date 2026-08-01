@@ -132,6 +132,13 @@ class Inferencer:
         estimator = backend.load(art, manifest)
 
         preprocessor = cls._load_preprocessor(art, manifest)
+        # A generative estimator needs the tokenizer to decode what it produced,
+        # and `backend.load()` sees only the manifest. Binding here — where both
+        # halves exist — keeps one tokenizer in the bundle instead of making the
+        # model carry a second copy that can disagree with the first.
+        attach = getattr(estimator, "attach_preprocessor", None)
+        if attach is not None and preprocessor is not None:
+            attach(preprocessor)
         reference = cls._load_reference_stats(art)
         log.info(
             "loaded bundle: model=%s backend=%s task=%s",

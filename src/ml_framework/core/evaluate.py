@@ -30,7 +30,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from .metrics import accuracy, mae, mase, rmse, smape
+from .metrics import accuracy, exact_match, f1, mae, mase, rmse, rouge_l, smape, token_f1
 from .protocols import Predictions
 from .task import get_task_spec
 
@@ -66,6 +66,10 @@ def evaluate(
 
     if spec.is_classification:
         metrics = _write_classification(out, labels, preds, class_names)
+    elif spec.output_kind == "token_labels":
+        metrics = _write_token_classification(out, labels, preds, class_names)
+    elif spec.output_kind == "text":
+        metrics = _write_generation(out, labels, preds)
     elif spec.output_kind == "series":
         metrics = _write_forecast(out, labels, preds)
     else:
@@ -88,6 +92,109 @@ def _write_classification(
     (out / REPORT_NAME).write_text(f"Accuracy: {acc:.4f}\n\n{report}", encoding="utf-8")
     (out / CONFUSION_NAME).write_text(str(confusion_matrix(labels, preds)), encoding="utf-8")
     return {"test_acc": acc}
+
+
+def _write_token_classification(
+    out: Path, labels: np.ndarray, preds: np.ndarray, class_names: list[str] | None
+) -> dict[str, float]:
+    """One row per *token*, and a report that says which number it is reporting.
+
+    Two things make this its own branch rather than a reuse of
+    ``_write_classification``.
+
+    **Macro-F1 leads, not accuracy.** Token tagging is dominated by the `O` class:
+    a model that answers "not an entity" everywhere scores around 90% on a typical
+    NER corpus and is worth nothing. Reporting accuracy first would make that model
+    look good.
+
+    **The report states that this is token-level scoring.** The standard for NER is
+    *entity*-level F1 (seqeval), which requires a predicted entity to match the
+    reference in both span and type — strictly harder, and the number papers quote.
+    Token-level is what this framework computes, and printing it under the bare
+    name "F1" would invite a comparison that flatters it by several points.
+    """
+    from sklearn.metrics import classification_report
+
+    present = sorted(set(np.unique(labels).tolist()) | set(np.unique(preds).tolist()))
+    names = None
+    if class_names:
+        names = [class_names[i] if 0 <= i < len(class_names) else str(i) for i in present]
+
+    report = classification_report(
+        labels, preds, labels=present, target_names=names, digits=4, zero_division=0
+    )
+    acc, macro_f1 = accuracy(labels, preds), f1(labels, preds)
+    log.info("Token-level macro-F1: %.4f | accuracy: %.4f\n%s", macro_f1, acc, report)
+    (out / REPORT_NAME).write_text(
+        "\n".join(
+            [
+                f"Macro-F1 (token-level): {macro_f1:.4f}",
+                f"Accuracy (token-level): {acc:.4f}",
+                f"Tokens scored:          {len(labels)}",
+                "",
+                report,
+                "Scored per token, over the first sub-word of each word only —",
+                "sub-word continuations, padding and special tokens are excluded.",
+                "",
+                "This is NOT entity-level F1. The NER convention (seqeval) requires a",
+                "predicted entity to match the reference in both span and type, which",
+                "is strictly harder; token-level figures run several points higher and",
+                "are not comparable with published results.",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    return {"test_f1": macro_f1, "test_acc": acc}
+
+
+def _write_generation(out: Path, labels: np.ndarray, preds: np.ndarray) -> dict[str, float]:
+    """Reference-overlap scores, and an honest note about what they miss.
+
+    No confusion matrix: there are no classes to confuse. All three metrics are
+    n-gram overlap against a single reference, so none of them knows that "the cat
+    sat" and "a feline was seated" mean the same thing — they will score a correct
+    paraphrase near zero. Reported anyway because a shallow number that says so
+    beats no number, and because the alternatives (BERTScore, an LLM judge) are a
+    model dependency the framework should not acquire by default.
+    """
+    scores = {
+        "test_rouge_l": rouge_l(labels, preds),
+        "test_token_f1": token_f1(labels, preds),
+        "test_exact_match": exact_match(labels, preds),
+    }
+    log.info(
+        "ROUGE-L: %.4f | token-F1: %.4f | exact match: %.4f",
+        scores["test_rouge_l"],
+        scores["test_token_f1"],
+        scores["test_exact_match"],
+    )
+
+    samples = [
+        f"  reference: {str(labels[i])[:120]}\n  predicted: {str(preds[i])[:120]}"
+        for i in range(min(3, len(preds)))
+    ]
+    (out / REPORT_NAME).write_text(
+        "\n".join(
+            [
+                f"ROUGE-L:     {scores['test_rouge_l']:.4f}",
+                f"token F1:    {scores['test_token_f1']:.4f}",
+                f"exact match: {scores['test_exact_match']:.4f}",
+                "",
+                "All three compare against one reference by n-gram overlap. A correct",
+                "paraphrase scores near zero on all of them, so read them as a floor",
+                "and read the samples below as the real evidence.",
+                "",
+                "Note also that val/loss during training is teacher-forced — the",
+                "decoder saw the reference prefix at every step — while these numbers",
+                "come from real generation. The two can move in opposite directions.",
+                "",
+                "Samples:",
+                *samples,
+            ]
+        ),
+        encoding="utf-8",
+    )
+    return scores
 
 
 def _write_regression(out: Path, labels: np.ndarray, preds: np.ndarray) -> dict[str, float]:

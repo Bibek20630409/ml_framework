@@ -16,7 +16,19 @@ from pydantic import BaseModel as PydanticModel
 from pydantic import Field
 
 from ...core.types import Requirement
-from ...data.preprocess.text import DEFAULT_MAX_LENGTH, DEFAULT_MODEL_NAME, NLP_REQUIREMENTS
+from ...data.preprocess.text import (
+    DEFAULT_MAX_LENGTH,
+    DEFAULT_MODEL_NAME,
+    DEFAULT_TARGET_LENGTH,
+    NLP_REQUIREMENTS,
+)
+
+# BART rather than T5 as the seq2seq default, for one unglamorous reason: T5's
+# tokenizer needs `sentencepiece`, which is a separate install the `[nlp]` extra
+# does not pull. A default that fails on a correctly-installed extra is not a
+# default. Name a T5 checkpoint explicitly and it works, once sentencepiece is
+# present.
+DEFAULT_SEQ2SEQ_MODEL = "facebook/bart-base"
 
 # torch arrives through the Lightning backend; transformers through `[nlp]`. Both
 # are needed before this plugin can build anything, and both are answered by
@@ -52,4 +64,48 @@ class HFTextParams(PydanticModel):
     freeze_encoder: bool = False
 
 
-__all__ = ["HF_TEXT_REQUIREMENTS", "TORCH_REQUIREMENTS", "HFTextParams"]
+class HFTokenParams(PydanticModel):
+    """``model.params`` for ``nlp.hf_token``.
+
+    No ``max_target_length`` and no ``num_beams``: a tagger emits exactly one
+    decision per input token, so there is nothing to decode and nothing to search
+    over. ``extra="forbid"`` means setting one is an error rather than a knob that
+    does nothing.
+    """
+
+    model_config = {"frozen": True, "extra": "forbid"}
+
+    model_name: str = DEFAULT_MODEL_NAME
+    # Truncation cuts *words* off the end of a sentence, and their tags go with
+    # them. A tagging corpus with long sentences wants this raised.
+    max_length: int = Field(default=DEFAULT_MAX_LENGTH, gt=0)
+    freeze_encoder: bool = False
+
+
+class HFSeq2SeqParams(PydanticModel):
+    """``model.params`` for ``nlp.hf_seq2seq``.
+
+    ``max_target_length`` is read by the source as well as the model, like
+    ``model_name`` and for the same reason: one place to set one thing. It bounds
+    both the training target and the decode loop, so raising it costs time twice.
+    """
+
+    model_config = {"frozen": True, "extra": "forbid"}
+
+    model_name: str = DEFAULT_SEQ2SEQ_MODEL
+    max_length: int = Field(default=DEFAULT_MAX_LENGTH, gt=0)
+    max_target_length: int = Field(default=DEFAULT_TARGET_LENGTH, gt=0)
+    # 1 is greedy decoding. Beams improve output and cost linearly in time, which
+    # is paid on every evaluation pass — hence a default that does not surprise.
+    num_beams: int = Field(default=1, ge=1)
+    freeze_encoder: bool = False
+
+
+__all__ = [
+    "DEFAULT_SEQ2SEQ_MODEL",
+    "HF_TEXT_REQUIREMENTS",
+    "TORCH_REQUIREMENTS",
+    "HFSeq2SeqParams",
+    "HFTextParams",
+    "HFTokenParams",
+]

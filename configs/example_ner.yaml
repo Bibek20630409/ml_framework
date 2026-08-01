@@ -1,0 +1,70 @@
+# ── Example token-classification config (schema v2) ──────────────────
+# Load with:  mlf train --config configs/example_ner.yaml
+# Needs the nlp and lightning extras:  pip install -e '.[nlp,lightning]'
+#
+# Named-entity recognition, part-of-speech tagging — anything that labels every
+# token rather than the document. `data.kind` is still `text`; what changes is the
+# task, because the task is what decides what a label *is*.
+
+task: token_classification
+
+runtime:
+  seed: 42
+  output_dir: outputs
+  num_workers: -1
+  accelerator: auto
+
+data:
+  kind: text
+  # JSONL is the natural fit: {"tokens": ["Ada", "works"], "tags": ["B-PER", "O"]}
+  # one object per line. A CSV export that flattened both to space-separated
+  # strings is read the same way — refusing either would be picking a favourite
+  # file format rather than a data model.
+  path: data/ner.jsonl
+  target: tags                   # the per-token tag column
+  split:
+    val_size: 0.15
+    test_size: 0.15
+    folds: 0                     # >= 2 → k-fold over sentences (unstratified)
+  params:
+    text_col: tokens             # the per-token word column
+
+model:
+  name: nlp.hf_token
+  params:
+    model_name: distilbert-base-uncased
+    # Truncation cuts *words* off the end of a sentence and their tags go with
+    # them. Raise this for a corpus of long sentences; the tail is simply not
+    # scored otherwise.
+    max_length: 128
+    freeze_encoder: false
+
+fit:
+  budget:
+    max_epochs: 3
+  patience: 2
+  batch_size: 16
+  # lr / optimizer / weight_decay / scheduler come from the plugin's fine-tuning
+  # defaults — see configs/example_text.yaml for what they are and why.
+
+tune:
+  enabled: false
+
+logging:
+  backend: none
+
+# ── Two things to know about the score ───────────────────────────────
+#
+# 1. The primary metric is **macro-F1, not accuracy**. Tagging corpora are
+#    dominated by the `O` class: a model that answers "not an entity" everywhere
+#    scores around 90% accuracy and is worth nothing.
+#
+# 2. `report.txt` reports **token-level** figures, and says so. The NER convention
+#    (seqeval) is *entity*-level F1, which requires a predicted entity to match the
+#    reference in both span and type. That is strictly harder; token-level numbers
+#    run several points higher and are not comparable with published results.
+#
+# Only the first sub-word of each word is scored. A word-level tag repeated across
+# every piece a word splits into would count one decision several times, weighted
+# by how badly the tokenizer fragments that word — which flatters exactly the rare
+# proper nouns entity recognition is about.

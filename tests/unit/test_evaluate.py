@@ -144,6 +144,6 @@ def test_an_unregistered_task_says_so(tmp_path):
     with pytest.raises(UnknownTaskError):
         evaluate(
             Predictions(y_true=np.array([1.0]), y_pred=np.array([1.0])),
-            "seq2seq",
+            "multilabel",
             output_dir=tmp_path,
         )

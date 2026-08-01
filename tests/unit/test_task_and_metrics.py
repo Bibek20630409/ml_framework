@@ -19,20 +19,29 @@ from ml_framework.core.task import (
 # ── The table ─────────────────────────────────────────────
 @pytest.mark.unit
 def test_the_currently_runnable_tasks_have_rows():
-    assert available_tasks() == ["binary", "forecasting", "multiclass", "regression"]
+    assert available_tasks() == [
+        "binary",
+        "forecasting",
+        "multiclass",
+        "regression",
+        "seq2seq",
+        "token_classification",
+    ]
 
 
 @pytest.mark.unit
 def test_unregistered_task_says_so_instead_of_defaulting():
     """A task in the Literal but without a row must fail loudly.
 
-    The text tasks get their rows with the NLP work; until then silently treating
-    one as
-    regression would produce plausible-looking wrong metrics.
+    `multilabel` is the remaining one: it has no source, no model and no loss, so
+    silently treating it as multiclass would produce plausible-looking wrong
+    metrics. The rule the table is kept to is that **a row means the framework can
+    run the task** — which is why the text tasks got theirs only once they had a
+    source, a model and an evaluation path, rather than to let a config validate.
     """
-    assert not has_task_spec("seq2seq")
-    with pytest.raises(UnknownTaskError, match="No TaskSpec for task 'seq2seq'"):
-        get_task_spec("seq2seq")
+    assert not has_task_spec("multilabel")
+    with pytest.raises(UnknownTaskError, match="No TaskSpec for task 'multilabel'"):
+        get_task_spec("multilabel")
 
 
 @pytest.mark.unit

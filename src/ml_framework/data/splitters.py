@@ -33,6 +33,21 @@ from ..core.types import FrameworkError
 log = logging.getLogger(__name__)
 
 
+# Tasks with exactly one class label per row -- the only thing stratification can
+# balance. Everything else falls back to an unstratified fold: a regression target
+# is continuous, a forecast is a series, a token-tagged sentence carries one label
+# *per token*, and a seq2seq target is a string. Previously spelled
+# `task == "regression"` at four call sites, which quietly asserted that every
+# non-regression task has a row label -- true until token tagging arrived, and
+# then wrong in a way that surfaces as an sklearn error deep in a split.
+STRATIFIED_TASKS: frozenset[str] = frozenset({"binary", "multiclass"})
+
+
+def stratifies(task: str) -> bool:
+    """Whether ``task`` has a per-row class label to balance folds against."""
+    return task in STRATIFIED_TASKS
+
+
 class SplitError(FrameworkError):
     """A split could not be produced (empty side, missing time/group column)."""
 
@@ -95,17 +110,17 @@ class RandomSplitter:
 
         _check_sizes(self.val_size, self.test_size)
         idx = np.arange(n)
-        is_reg = self.task == "regression"
-        if not is_reg and y is None:
+        unstratified = not stratifies(self.task)
+        if not unstratified and y is None:
             raise SplitError(f"task '{self.task}' requires labels to stratify the split")
-        stratify = None if is_reg else y
+        stratify = None if unstratified else y
 
         if n >= self.holdout_threshold:
             log.info("n=%d >= %d → stratified holdout", n, self.holdout_threshold)
             tmp, test = train_test_split(
                 idx, test_size=self.test_size, random_state=self.seed, stratify=stratify
             )
-            strat2 = None if is_reg else y[tmp]  # type: ignore[index]
+            strat2 = None if unstratified else y[tmp]  # type: ignore[index]
             rel_val = self.val_size / (1.0 - self.test_size)
             train, val = train_test_split(
                 tmp, test_size=rel_val, random_state=self.seed, stratify=strat2
@@ -114,11 +129,11 @@ class RandomSplitter:
             log.info("n=%d < %d → fold-derived split", n, self.holdout_threshold)
             splitter = (
                 KFold(n_splits=5, shuffle=True, random_state=self.seed)
-                if is_reg
+                if unstratified
                 else StratifiedKFold(n_splits=5, shuffle=True, random_state=self.seed)
             )
             train, hold = next(iter(splitter.split(idx, y)))
-            strat3 = None if is_reg else y[hold]  # type: ignore[index]
+            strat3 = None if unstratified else y[hold]  # type: ignore[index]
             val, test = train_test_split(
                 hold, test_size=0.5, random_state=self.seed, stratify=strat3
             )
@@ -254,14 +269,14 @@ class CrossValidationSplitter:
         if n < self.folds:
             raise SplitError(f"cannot make {self.folds} folds from {n} rows")
 
-        is_reg = self.task == "regression"
-        if not is_reg and y is None:
+        unstratified = not stratifies(self.task)
+        if not unstratified and y is None:
             raise SplitError(f"task '{self.task}' requires labels to stratify the folds")
 
         idx = np.arange(n)
         splitter = (
             KFold(n_splits=self.folds, shuffle=True, random_state=self.seed)
-            if is_reg
+            if unstratified
             else StratifiedKFold(n_splits=self.folds, shuffle=True, random_state=self.seed)
         )
 
@@ -270,7 +285,7 @@ class CrossValidationSplitter:
             # `val_size` is a fraction of the *whole* dataset, so the validation
             # set stays the size the config asked for rather than shrinking with k.
             rel_val = min(0.5, max(1.0 / len(rest), self.val_size * n / len(rest)))
-            stratify = None if is_reg else y[rest]  # type: ignore[index]
+            stratify = None if unstratified else y[rest]  # type: ignore[index]
             train, val = train_test_split(
                 rest, test_size=rel_val, random_state=self.seed, stratify=stratify
             )
