@@ -39,6 +39,19 @@ Extras: `lightning`, `gbdt`, `image`, `serve`, `hpo`, `parquet`, `diagnostics`,
 
 ## Quickstart
 
+0. **See what this install can train.** The only command that takes no config:
+
+   ```bash
+   mlf models              # every registered model, its backend, and whether it is ready
+   mlf models --show       # plus tasks, data kinds and each model's own search space
+   mlf models --all        # plus third-party plugins that failed to *import*
+   ```
+
+   It deliberately lists models whose optional extra is **missing**, each with the
+   `pip install` line that fixes it. Listing only what happens to be installed
+   would describe the machine rather than the framework, and would make an
+   uninstalled extra indistinguishable from a model that does not exist.
+
 1. **Write one YAML config** (copy `configs/example_tabular.yaml`). Set `task`,
    `data.path`, `data.target`. That's the only file you edit per project.
 

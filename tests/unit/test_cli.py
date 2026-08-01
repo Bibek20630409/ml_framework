@@ -237,3 +237,130 @@ def test_tune_emit_config_writes_the_winner(tmp_path):
 
     assert cli.main(["tune", "--config", str(path), "--emit-config", str(dest)]) == 0
     assert ExperimentConfig.from_yaml(dest).model.name == "xgboost"
+
+
+# ── `mlf models` ──────────────────────────────────────────
+@pytest.fixture
+def unavailable_model():
+    """A registered spec whose requirement can never be satisfied.
+
+    Registered rather than mocked so the row travels the real `describe()` path,
+    and removed afterwards so the registry other tests read is unchanged.
+    """
+    from ml_framework.core.plugins import ModelSpec
+    from ml_framework.core.registry import MODELS
+    from ml_framework.core.types import Capabilities, Requirement
+
+    MODELS.register(
+        ModelSpec(
+            name="zz.imaginary",
+            backend="gbdt",
+            build=lambda ctx: None,
+            tasks=frozenset({"binary"}),
+            data_kinds=frozenset({"tabular"}),
+            requires=(Requirement("no_such_lib_anywhere", extra="gbdt", min_version="9.9"),),
+            capabilities=Capabilities(),
+            description="Needs a library nobody has.",
+        )
+    )
+    yield "zz.imaginary"
+    MODELS._specs.pop("zz.imaginary", None)
+
+
+@pytest.mark.unit
+def test_models_command_needs_no_config(capsys):
+    """The only command that describes the *framework* rather than a run.
+
+    Requiring `--config` would make "what can I train?" answerable only by someone
+    who already had a config, which is backwards.
+    """
+    assert cli.main(["models"]) == 0
+
+    out = capsys.readouterr().out
+    assert "mlp" in out and "xgboost" in out
+    assert "lightning" in out and "gbdt" in out
+
+
+@pytest.mark.unit
+def test_a_model_whose_extra_is_missing_is_listed_with_the_fix(capsys, unavailable_model):
+    """Listing only what happens to be installed would describe the machine rather
+    than the framework — and would make an uninstalled extra indistinguishable
+    from a model that does not exist."""
+    assert cli.main(["models"]) == 0
+
+    out = capsys.readouterr().out
+    assert "zz.imaginary" in out
+    assert "no_such_lib_anywhere is not installed" in out
+    assert "pip install 'ml-framework[gbdt]'" in out
+
+
+@pytest.mark.unit
+def test_a_plugin_that_failed_to_import_is_hidden_until_all(capsys):
+    """A genuine bug and a missing extra are different things.
+
+    Mixing them in the default listing would make a syntax error in a third-party
+    plugin look like a dependency the user forgot to install.
+    """
+    from ml_framework.core.plugins import PluginLoadError
+    from ml_framework.core.registry import MODELS
+
+    MODELS._load_errors["zz.broken"] = PluginLoadError("SyntaxError in third_party.py")
+    try:
+        cli.main(["models"])
+        default = capsys.readouterr().out
+        cli.main(["models", "--all"])
+        everything = capsys.readouterr().out
+    finally:
+        MODELS._load_errors.pop("zz.broken", None)
+
+    assert "zz.broken" not in default
+    assert "failed to load and are hidden" in default
+    assert "zz.broken" in everything
+    assert "SyntaxError in third_party.py" in everything
+
+
+@pytest.mark.unit
+def test_show_adds_tasks_kinds_and_the_models_own_search_space(capsys):
+    assert cli.main(["models", "--show"]) == 0
+
+    out = capsys.readouterr().out
+    assert "tasks:" in out and "data:" in out
+    # Declarative spaces are printed by key; `mlp`'s is conditional and says so.
+    assert "model.params.max_depth" in out
+    assert "defined in code" in out
+
+
+@pytest.mark.unit
+def test_show_does_not_claim_to_print_the_effective_space(capsys):
+    """It prints the *model's own* space. Merging the backend's would mean
+    importing the backend, and importing the Lightning one imports torch — which
+    would make `mlf models --show` the one command that cannot run on a bare
+    install."""
+    cli.main(["models", "--show"])
+
+    out = capsys.readouterr().out
+    assert "the backend adds lr/batch_size" in out
+    # `cnn` declares no space of its own; the Lightning backend it rides declares
+    # lr and batch_size. If the effective space were being printed, `cnn` would
+    # show them — so "none of its own" is the evidence that it is not.
+    cnn_block = out.split("cnn ", 1)[1].split("lightgbm", 1)[0]
+    assert "none of its own" in cnn_block
+    assert "fit.params.lr" not in cnn_block
+
+
+@pytest.mark.unit
+def test_listing_the_registry_imports_no_optional_runtime():
+    """The property the whole plugin design protects, checked where it is
+    observable: registering a plugin must not import its runtime."""
+    import subprocess
+    import sys
+
+    probe = (
+        "import sys; from ml_framework import cli; cli.main(['models']); "
+        "leaked = sorted(k for k in ('torch','xgboost','transformers','prophet') "
+        "if k in sys.modules); print('LEAKED=' + ','.join(leaked))"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", probe], capture_output=True, text=True, check=True
+    )
+    assert "LEAKED=\n" in result.stdout or result.stdout.rstrip().endswith("LEAKED=")

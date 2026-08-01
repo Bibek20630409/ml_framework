@@ -4,6 +4,7 @@ cli.py
 `mlf` command-line entry point. All commands load a validated YAML config and
 accept dotted ``--set key=value`` overrides.
 
+    mlf models         [--all] [--show]
     mlf lr             --config configs/example_tabular.yaml
     mlf tune           --config configs/example_tabular.yaml --emit-config configs/tuned.yaml
     mlf train          --config configs/example_tabular.yaml --set fit.budget.max_epochs=5
@@ -15,6 +16,13 @@ accept dotted ``--set key=value`` overrides.
 ``mlf train`` **tunes by default**, under a per-backend budget (see
 ``config/defaults.py``) — 300 s for trees, 900 s for neural nets. ``--no-tune``
 skips it; ``--tune-budget``/``--tune-trials`` turn it up just as easily.
+
+``mlf models`` is the only command that takes no config: it answers "what can this
+install train, and what would it take to widen that" from the plugin registry
+alone. It deliberately lists models whose optional extra is **missing**, with the
+``pip install`` line that fixes each — a listing of only what happens to be
+installed would describe the machine rather than the framework, and would make an
+uninstalled extra indistinguishable from a model that does not exist.
 """
 
 from __future__ import annotations
@@ -104,9 +112,87 @@ def _apply_tune_args(cfg: ExperimentConfig, args: argparse.Namespace) -> Experim
     return cfg.with_overrides(overrides) if overrides else cfg
 
 
+def _format_search_space(spec: Any) -> list[str]:
+    """The model's own declared search space, one line per knob.
+
+    Deliberately *not* the effective space: merging in the backend's would mean
+    importing the backend, and importing the Lightning backend imports torch — on
+    a bare install that would turn `mlf models --show` into the one command that
+    cannot run. The lines say which half they are.
+    """
+    if spec.suggest is not None:
+        return ["search space: defined in code (conditional on other values)"]
+    if not spec.search_space:
+        return ["search space: none of its own (the backend's still applies)"]
+    return ["search space (this model's own; the backend adds lr/batch_size):"] + [
+        f"  {key} = {value}" for key, value in sorted(spec.search_space.items())
+    ]
+
+
+def _print_models(*, include_failed: bool, show_detail: bool) -> int:
+    """``mlf models`` — the registry, rendered.
+
+    Reads :data:`~ml_framework.core.registry.MODELS` and nothing else, so it works
+    on an install with no optional extra present at all. That is the property the
+    whole plugin design exists to protect: registering a plugin must not import
+    its runtime, and this command is what makes the property visible.
+    """
+    from .core.registry import MODELS
+
+    rows = MODELS.describe()
+    failed = set(MODELS.load_errors())
+    if not include_failed:
+        # A plugin that failed to *import* is a different thing from one whose
+        # extra is missing, and mixing them would make a genuine bug look like an
+        # uninstalled dependency. Hidden by default, never swallowed.
+        rows = [row for row in rows if row["name"] not in failed]
+
+    if not rows:
+        print("no models registered")
+        return 0
+
+    width = max(len(row["name"]) for row in rows)
+    pad = " " * (width + 9)
+    print(f"{'MODEL'.ljust(width)}  READY  BACKEND     DESCRIPTION")
+    for row in sorted(rows, key=lambda r: r["name"]):
+        spec = None if row["name"] in failed else MODELS.get_spec(row["name"])
+        backend = spec.backend if spec is not None else "-"
+        ready = "yes  " if row["available"] else "NO   "
+        print(f"{row['name'].ljust(width)}  {ready}  {backend:<10}  {row['description']}")
+
+        for reason in row["missing"]:
+            print(f"{pad}{reason}")
+        if row["install"]:
+            print(f"{pad}fix: {row['install']}")
+
+        if show_detail and spec is not None:
+            print(f"{pad}tasks: {', '.join(sorted(spec.tasks)) or 'any'}")
+            print(f"{pad}data:  {', '.join(sorted(spec.data_kinds)) or 'any'}")
+            for line in _format_search_space(spec):
+                print(f"{pad}{line}")
+
+    hidden = len(failed) if not include_failed else 0
+    if hidden:
+        print(f"\n{hidden} plugin(s) failed to load and are hidden; `mlf models --all` shows them")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="mlf", description="ML Framework CLI")
     sub = parser.add_subparsers(dest="command", required=True)
+
+    # The one command that takes no config: it describes the framework, not a run.
+    models_p = sub.add_parser("models", help="List registered models and what they need")
+    models_p.add_argument(
+        "--all",
+        action="store_true",
+        help="Also list plugins that failed to import (a bug, not a missing extra)",
+    )
+    models_p.add_argument(
+        "--show",
+        action="store_true",
+        help="Add each model's tasks, data kinds and its own search space",
+    )
 
     lr = sub.add_parser("lr", help="Run the LR range test")
     _add_config_args(lr)
@@ -184,6 +270,13 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     setup_logging()
+
+    if args.command == "models":
+        # Importing the plugin package is what populates the registry, and it is
+        # required to be dependency-free — see plugins/__init__.py.
+        import ml_framework.plugins  # noqa: F401
+
+        return _print_models(include_failed=args.all, show_detail=args.show)
 
     if args.command == "migrate-config":
         from pydantic import ValidationError
