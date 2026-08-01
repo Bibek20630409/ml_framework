@@ -48,6 +48,27 @@ pin them to either world.
 **That test is the only expected skip.** Any *other* skip means a package went
 missing.
 
+### The suite does not need the network (after the first run)
+
+The NLP tests fine-tune ~90 KB random checkpoints pulled from the HuggingFace hub.
+`from_pretrained` revalidates against the hub on **every** call, even for a fully
+cached model — a HEAD request per file — and when DNS fails rather than answering
+cleanly, `huggingface_hub` retries five times with exponential backoff and then
+raises. Measured against an unreachable endpoint: **~37 s of backoff and a
+`ConnectionError` for one cached tokenizer**.
+
+That is not hypothetical. A blip mid-run once turned six passing NLP tests into
+errors and stretched the suite from 5m37s to 11m42s.
+
+`tests/conftest.py` now sets `HF_HUB_OFFLINE=1` at **import** time, once it has
+confirmed on disk that every test checkpoint is cached. Import time because the
+variable is read into a module constant when `huggingface_hub` is imported —
+setting it one line later does nothing, silently. A cold or partial cache is left
+online so the first run can download.
+
+Verified by pointing `HF_ENDPOINT` at an unreachable address: 49 NLP tests pass
+without touching it.
+
 P2's own version of the same check — `test_config.py::
 test_an_uninstalled_model_reports_the_pip_extra_at_load`, which exercises the
 refusal one layer up now that the config validator resolves plugins — is
