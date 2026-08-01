@@ -142,7 +142,7 @@ def create_app(
     # The bundle is loaded lazily, so the request schema cannot be a static
     # annotation without forcing a load at import time. The body is validated
     # explicitly instead, against the model chosen from the manifest.
-    def _parse(body: dict[str, Any]) -> tuple[Inferencer, Any, np.ndarray]:
+    def _parse(body: dict[str, Any]) -> tuple[Inferencer, Any, Any]:
         inf = _get_inferencer()
         try:
             req = request_model(inf.data_kind).model_validate(body)
@@ -157,25 +157,30 @@ def create_app(
                 status_code=413, detail=f"too many instances: {n_rows} > {max_instances}"
             )
         # Checked rather than caught: a kind whose request schema cannot yet build
-        # model input is a 501, but an AttributeError raised *inside* to_array is a
-        # bug and must not be reported as "not implemented".
-        to_array = getattr(req, "to_array", None)
-        if to_array is None:
+        # model input is a 501, but an AttributeError raised *inside*
+        # to_model_input is a bug and must not be reported as "not implemented".
+        to_model_input = getattr(req, "to_model_input", None)
+        if to_model_input is None:
             raise HTTPException(
                 status_code=501,
                 detail=f"serving data kind '{inf.data_kind}' is not implemented yet",
             )
         try:
-            arr = to_array(inf.feature_cols)
+            model_input = to_model_input(inf.feature_cols)
         except PayloadError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
+        # A feature *count* only exists for a fixed-width payload. Text arrives as
+        # strings of no fixed length and the bundle records `n_features` as 0, so
+        # this check does not apply to it rather than applying wrongly.
         expected = inf.n_features
-        if expected and arr.shape[1] != expected:
-            raise HTTPException(
-                status_code=422, detail=f"expected {expected} features, got {arr.shape[1]}"
-            )
-        return inf, req, arr
+        if expected and isinstance(model_input, np.ndarray) and model_input.ndim == 2:
+            if model_input.shape[1] != expected:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"expected {expected} features, got {model_input.shape[1]}",
+                )
+        return inf, req, model_input
 
     def _labels(inf: Inferencer, preds: np.ndarray) -> list[str] | None:
         """Human-readable class names, when the bundle records them."""
@@ -234,10 +239,10 @@ def create_app(
     def predict(body: dict[str, Any]) -> Any:
         if _get_inferencer().data_kind == "timeseries":
             return _forecast(body)
-        inf, _, arr = _parse(body)
-        preds = inf.predict(arr)
+        inf, _, model_input = _parse(body)
+        preds = inf.predict(model_input)
         if supports_drift(inf.data_kind):
-            _get_tracker().observe(arr)  # feed the rolling drift window
+            _get_tracker().observe(model_input)  # feed the rolling drift window
         if collectors.predictions is not None and inf.produces_proba:
             for p in preds:
                 collectors.predictions.labels(predicted_class=str(int(p))).inc()
@@ -263,9 +268,9 @@ def create_app(
     @app.post("/predict_proba", response_model=ProbaResponse, dependencies=auth)
     def predict_proba(body: dict[str, Any]) -> ProbaResponse:
         _require_proba()
-        inf, _, arr = _parse(body)
+        inf, _, model_input = _parse(body)
         try:
-            probs = inf.predict_proba(arr)
+            probs = inf.predict_proba(model_input)
         except UnsupportedCapability as exc:
             # From the manifest, not from a hardcoded task check.
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -278,9 +283,9 @@ def create_app(
     def predict_with_confidence(body: dict[str, Any]) -> ConfidenceResponse:
         """``Inferencer.predict_with_confidence`` exposed over HTTP."""
         _require_proba()
-        inf, _, arr = _parse(body)
+        inf, _, model_input = _parse(body)
         try:
-            preds, conf = inf.predict_with_confidence(arr)
+            preds, conf = inf.predict_with_confidence(model_input)
         except UnsupportedCapability as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return ConfidenceResponse(

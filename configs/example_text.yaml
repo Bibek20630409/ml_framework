@@ -1,0 +1,75 @@
+# ── Example text-classification config (schema v2) ───────────────────
+# Load with:  mlf train --config configs/example_text.yaml
+# Needs the nlp and lightning extras:  pip install -e '.[nlp,lightning]'
+#
+# Text classification is `multiclass` (or `binary`) with `data.kind: text`. There
+# is deliberately no `text_classification` task: task decides the loss, the
+# metrics and the head; kind decides ingestion. Keeping them orthogonal is what
+# lets the task list grow additively rather than as a product of the two.
+
+task: binary
+
+runtime:
+  seed: 42
+  output_dir: outputs
+  num_workers: -1
+  # A transformer on CPU is slow but works; `auto` picks the GPU when there is one.
+  accelerator: auto
+
+data:
+  kind: text
+  # CSV, Parquet or JSONL. One column of raw text, one of labels.
+  path: data/reviews.csv
+  target: label                  # the label column; string labels are encoded
+  split:
+    val_size: 0.15
+    test_size: 0.15
+    folds: 0                     # >= 2 → k-fold cross-validation over the corpus
+  params:
+    # Which column holds the text. Optional: with one obvious candidate it is
+    # sniffed, and with several the run *refuses* rather than picking one — a
+    # model trained on the wrong column scores badly instead of failing.
+    text_col: text
+
+model:
+  name: nlp.hf_text
+  params:
+    # The checkpoint. This also selects the **tokenizer**, and there is no second
+    # place to set one: tokenizing with one vocabulary and running another
+    # checkpoint's weights produces ids the model never saw, with no error.
+    model_name: distilbert-base-uncased
+    # Truncation length. Attention cost grows with sequence length, and batches
+    # are padded to their own longest member rather than to this — so raising it
+    # costs only on the documents that need it.
+    max_length: 128
+    # true → train the classification head only. Much faster, much weaker.
+    freeze_encoder: false
+
+fit:
+  budget:
+    # Fine-tuning converges in 2-4 epochs and overfits after. This is a budget,
+    # not a target: early stopping and best-checkpoint selection still apply.
+    max_epochs: 3
+  patience: 2
+  batch_size: 16
+  params:
+    # These four are the plugin's own `fit_defaults` written out, so this file
+    # shows what a text run actually uses. Delete the block and the same values
+    # are filled in; set one and yours wins.
+    #
+    # The learning rate is the load-bearing number. The framework's default of
+    # 1e-3 is right for a network trained from scratch and destroys a pretrained
+    # encoder in the first few steps — while the run looks entirely healthy and
+    # scores near chance.
+    lr: 2.0e-5
+    optimizer: adamw
+    weight_decay: 0.01
+    scheduler: cosine
+
+tune:
+  enabled: false                 # true → Optuna over lr / weight_decay / batch_size
+  # The search narrows lr to 1e-5..5e-5 for this model rather than inheriting the
+  # backend's from-scratch range, where most trials would be damage.
+
+logging:
+  backend: none                  # none | csv | mlflow | wandb

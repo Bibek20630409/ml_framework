@@ -366,8 +366,18 @@ class ExperimentConfig(BaseModel):
         get_task_spec(self.task)
 
         spec: ModelSpec = validate_combination(self.task, self.data.kind, self.model.name)
+        updates: dict[str, Any] = {}
+        if spec.fit_defaults:
+            # The user's own keys win: `self.fit.params` holds only what was
+            # written, since the backend's schema supplies the rest at fit time.
+            # That is what makes "defaults the user did not set" answerable here
+            # and *not* answerable for `batch_size` or `budget`, which are typed
+            # fields whose defaults are indistinguishable from an explicit value.
+            merged = {**dict(spec.fit_defaults), **dict(self.fit.params)}
+            if merged != dict(self.fit.params):
+                updates["fit"] = self.fit.model_copy(update={"params": merged})
         if spec.params_model is None:
-            return self
+            return self.model_copy(update=updates) if updates else self
         try:
             resolved = spec.params_model.model_validate(dict(self.model.params))
         except ValidationError as exc:
@@ -382,9 +392,8 @@ class ExperimentConfig(BaseModel):
                     for e in exc.errors()
                 )
             ) from exc
-        return self.model_copy(
-            update={"model": self.model.model_copy(update={"params": resolved.model_dump()})}
-        )
+        updates["model"] = self.model.model_copy(update={"params": resolved.model_dump()})
+        return self.model_copy(update=updates)
 
     # ── Loaders ───────────────────────────────────────────
     @classmethod

@@ -261,6 +261,22 @@ def check_requirements(manifest: Manifest, *, what: str | None = None) -> None:
     )
 
 
+def head_width(manifest: Manifest) -> int:
+    """The model's output width, recovered from the signature.
+
+    Binary is the asymmetric case: two classes, one logit. Reading ``n_classes``
+    directly would build a two-logit head, and the weights would not load into it.
+
+    Lives here rather than on a backend because more than one thing rebuilds a
+    model from a manifest — the Lightning backend for a checkpoint, a
+    self-serializing model for its own directory — and two copies of this rule
+    would eventually disagree about binary.
+    """
+    if manifest.task == "multiclass":
+        return int(manifest.signature.output.n_classes or 0)
+    return 1
+
+
 # ── v1 compatibility ──────────────────────────────────────
 def is_v1_bundle(bundle_dir: str | Path) -> bool:
     """A v1 bundle: ``metadata.json`` + ``model.ckpt``, no manifest.

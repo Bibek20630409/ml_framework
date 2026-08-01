@@ -175,6 +175,7 @@ def test_builtin_model_specs_are_registered():
         "ts.arima",
         "ts.prophet",
         "ts.lstm",
+        "nlp.hf_text",
     }
     assert set(MODELS.names()) == set(available_models()) == expected
     assert set(plugins.BUILTINS) == expected
@@ -207,7 +208,9 @@ def test_builtin_source_specs_are_registered():
     from ml_framework.core import available_datamodules
 
     assert (
-        set(SOURCES.names()) == set(available_datamodules()) == {"tabular", "image", "timeseries"}
+        set(SOURCES.names())
+        == set(available_datamodules())
+        == {"tabular", "image", "text", "timeseries"}
     )
 
 

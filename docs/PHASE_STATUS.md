@@ -12,7 +12,7 @@ Tracks progress against [ml_framework_architecture_plan.md](../ml_framework_arch
 | P4 — AutoML | **done** | `a300c38` |
 | P5 — DL hardening | **done** | `3296920` |
 | P6 — Time-series | **done** | `01bd2aa` |
-| P7 — NLP | not started | — |
+| P7 — NLP | **done** | this branch |
 | P8 — Zero-config | not started | — |
 | P9 — Deployment polish | not started | — |
 
@@ -30,9 +30,9 @@ v1 *bundles* still load (`test_v1_bundle_compat.py`); v1 *configs* do not, and
 
 ## Test baseline
 
-**471 passed, 1 skipped** with every declared extra installed except DVC
-(46/4 before P0 → 130/4 after P0 → 249/4 after P1 → 258/1 → 284/1 after P2 → 355/1 after P3 → 395/1 after P4 → 429/1 after P5 → 458/1 after P6 →
-**471/1**). Every phase gate is measured against this number — a phase that ends
+**511 passed, 1 skipped** with every declared extra installed except DVC
+(46/4 before P0 → 130/4 after P0 → 249/4 after P1 → 258/1 → 284/1 after P2 → 355/1 after P3 → 395/1 after P4 → 429/1 after P5 → 458/1 after P6 → 471/1 after the image-augmentation fix →
+**511/1** after P7). Every phase gate is measured against this number — a phase that ends
 with fewer passing tests than it started with has regressed something, regardless
 of what its own new tests say.
 
@@ -643,13 +643,14 @@ nothing.
    needs *a* time axis; that affects the labels of the seasonality it finds, not
    whether it finds one.
 4. **`native_categorical` still has no consumer** (from P4).
-5. **CV remains unimplemented for image data** (from P5).
+5. ~~CV remains unimplemented for image data~~ — closed below, and text followed
+   in P7, so cross-validation now covers all four kinds.
 
 ## Follow-up: cross-validation for image data
 
 Not a phase — a loose end from P5, closed on request. Cross-validation now covers
-**tabular, timeseries and image**; only `text` remains, and only because there is
-no text source to partition (P7).
+**tabular, timeseries and image**; `text` followed in P7, once there was a text
+source to partition.
 
 The blocker was never mechanical. The image source reads two separate directories
 — `ImageFolder(data.path)` for train and `ImageFolder(params.test_dir)` for test —
@@ -709,3 +710,94 @@ changes which epoch gets selected as well as what the number says. Test metrics
 are unaffected — `test_dir` always used the eval transforms.
 
 471 passed, 1 skipped.
+
+## P7 — NLP — **done**
+
+Text classification as `multiclass`/`binary` with `data.kind: text`. No
+`text_classification` task: task decides loss, metrics and head; kind decides
+ingestion, and keeping them orthogonal is what stops the task `Literal` from
+growing as a product.
+
+- **`data/preprocess/text.py`** — the tokenizer, as a preprocessor.
+- **`data/sources/text.py`** — CSV/Parquet/JSONL → lazy `TextDataset` of strings.
+- **`plugins/nlp/hf_text.py`** — fine-tunes a HuggingFace encoder, on the
+  **Lightning backend**. No fourth backend: a fine-tune is an epoch loop with
+  validation callbacks, which is what `lightning` already is.
+- **HF-directory artifact format** — `model/hf_model/` via `save_pretrained`.
+- **`ModelSpec.fit_defaults`** — fine-tuning hyperparameters, applied not printed.
+- **Text CV** — came free; the source accepts injected indices like the other three.
+
+### Gates met
+
+**The tokenizer round-trips through the bundle.** Proved the only way that
+distinguishes it from a silent re-download: the test *adds a token* to the
+tokenizer before saving and asserts the loaded one still knows it, and that a
+fresh `from_pretrained(model_name)` does not. Asserting merely that a tokenizer
+loads would pass just as happily if the loader went back to the hub.
+
+**Text `/predict` accepts raw strings.** `{"inputs": ["great movie"]}` → labels.
+Asking clients to send token ids would make each of them responsible for using the
+right vocabulary — the exact skew the bundled tokenizer prevents — and would make
+the endpoint unusable from curl.
+
+### Decisions worth knowing
+
+**The tokenizer is fitted state, not configuration.** It maps strings to ids
+through a vocabulary, and a model fed ids from a different vocabulary produces
+confident nonsense — no shape error, no exception, just a model that looks like it
+trained badly. So it lives in `preprocessor/tokenizer/` and is loaded from there.
+A missing directory **raises** rather than falling back to the hub: failing loudly
+at load time beats scoring wrong at request time.
+
+**A checkpoint directory, not a Lightning checkpoint.** A `.ckpt` round-trips the
+weights, but rebuilding the architecture to put them in calls
+`from_pretrained(model_name)` — which needs the hub, or a warm cache, *at load
+time*. That failure appears in a serving container, not in CI. The backend
+discovers `save_artifact`/`load_artifact` by name and uses the checkpoint path for
+every model that does not define them, so this is a model capability rather than a
+branch in the backend. `last.ckpt` still rides along: resuming is a property of
+the loop, not of the file the loop produced.
+
+**Splits hold strings; tokenization happens per batch.** Padding then follows the
+batch rather than the corpus, and attention cost grows with the padded length — so
+on text with a long tail, which is all text, up-front tokenization is most of the
+compute. It also keeps a fold cheap: k folds would otherwise re-tokenize the whole
+corpus k times to produce k partitions of it.
+
+**`ModelSpec.fit_defaults`, and why a model gets to have an opinion about the
+loop.** The framework default is `lr: 1e-3` with Adam. That is correct for a
+network trained from scratch and destroys a pretrained encoder in the first few
+steps — while the run looks entirely healthy and scores near chance. `nlp.hf_text`
+declares `lr: 2e-5`, AdamW, `weight_decay: 0.01`, cosine; the config validator
+applies them to keys the user did not write, so `config.json` records what actually
+ran. Scoped to `fit.params` deliberately: `batch_size` and `budget` are typed
+fields whose defaults are indistinguishable from an explicit value, so "the user
+did not set it" is not answerable for them.
+
+**The search-space merge order flipped, to backend-then-model.** Previously the
+backend won, which made a model unable to narrow `fit.params.lr`. The Lightning
+backend proposes 1e-4..1e-2 — a range in which most trials would wreck a
+pretrained encoder, so a search would spend its budget confirming that. Now the
+more specific declaration wins. No existing plugin declared a `fit.params.*` key,
+so the change is behaviour-preserving for everything shipped before P7, and a test
+pins it.
+
+**Two guesses the source refuses to make.** Which column holds the text (with
+several candidates and no conventional name it raises and lists them) and which
+tokenizer (always the model's checkpoint, never a separate `data.params` knob).
+Both wrong guesses produce a model that scores badly rather than one that fails.
+
+**String labels are encoded in sorted order**, not order of appearance — otherwise
+shuffling the input file renumbers the classes and two runs over the same data
+produce models whose class 0 means different things.
+
+### Deliberate loose ends P8+ must close
+
+1. **`token_classification` and `seq2seq` are in the `Task` literal with no
+   `TaskSpec` row.** They are refused at config load, which is correct, but the
+   NLP surface is classification-only.
+2. **No multi-label text.** `multilabel` has no `TaskSpec` either.
+3. **Drift for text is a 501.** PSI over token ids is a number without a meaning;
+   embedding-distance drift is the real answer and is not built.
+4. **`native_categorical` still has no consumer** (from P4).
+5. **Multi-series forecasting and `exog` consumption** (from P6).

@@ -42,7 +42,12 @@ from ..core.plugins import SourceSpec
 from ..core.protocols import BuildContext
 from ..core.registry import MODELS, register_source
 from ..core.types import Requirement
-from .sources import build_image_bundle, build_tabular_bundle, build_timeseries_bundle
+from .sources import (
+    build_image_bundle,
+    build_tabular_bundle,
+    build_text_bundle,
+    build_timeseries_bundle,
+)
 from .types import DataBundle
 
 if TYPE_CHECKING:
@@ -51,6 +56,7 @@ if TYPE_CHECKING:
 _BUNDLE_BUILDERS = {
     "tabular": build_tabular_bundle,
     "image": build_image_bundle,
+    "text": build_text_bundle,
     "timeseries": build_timeseries_bundle,
 }
 
@@ -61,6 +67,7 @@ _CV_BUILDERS = {
     "tabular": build_tabular_bundle,
     "timeseries": build_timeseries_bundle,
     "image": build_image_bundle,
+    "text": build_text_bundle,
 }
 
 
@@ -142,9 +149,17 @@ def _cv_population(config: ExperimentConfig) -> tuple[int, Any]:
     """
     from .sources.image import train_labels
     from .sources.tabular import read_table
+    from .sources.text import text_labels
 
     if config.data.kind == "image":
         labels = np.asarray(train_labels(config), dtype="int64")
+        return len(labels), labels
+
+    if config.data.kind == "text":
+        # Read through the source's own encoder rather than off the raw column, so
+        # folds stratify on exactly the integers training will see. String labels
+        # encoded twice by two rules is a way to stratify on the wrong thing.
+        labels = text_labels(config)
         return len(labels), labels
 
     frame = read_table(str(config.data.path))
@@ -221,6 +236,21 @@ register_source(
         payload="series",
         requires=(),
         description="Time-ordered table with a value column; ordered by split.time_col.",
+    )
+)
+register_source(
+    SourceSpec(
+        name="text",
+        data_kind="text",
+        build=build_text_bundle,
+        # Raw strings, lazily; the tokenizer runs per batch in the preprocessor's
+        # collate_fn so padding is to the batch rather than to the corpus.
+        payload="dataset",
+        # Reading and folding a text corpus needs neither transformers nor torch.
+        # The tokenizer's requirements are declared by the *model*, which is what
+        # makes them a `pip install` hint at model-selection time.
+        requires=(),
+        description="CSV/Parquet/JSONL with a text column and a label column.",
     )
 )
 register_source(

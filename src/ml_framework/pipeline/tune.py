@@ -20,10 +20,11 @@ problems this module exists to fix:
 the config layer already had and already tested. That is the whole reason search
 spaces are keyed by dotted config paths.
 
-The effective space is ``model.search_space | backend.search_space() |
+The effective space is ``backend.search_space() | model.search_space |
 tune.overrides``, in that order, so ``lr`` and ``batch_size`` are declared once on
-the Lightning backend rather than repeated in every neural plugin, and a YAML
-``tune.overrides`` block can narrow either.
+the Lightning backend rather than repeated in every neural plugin, a model that
+disagrees about one of them wins, and a YAML ``tune.overrides`` block can narrow
+any of it.
 
 **Nothing here imports an Optuna integration package.** Pruning is per-backend,
 reached through ``backend.trial_hooks(trial)``; this module knows only that hooks
@@ -112,8 +113,14 @@ def effective_space(config: ExperimentConfig) -> dict[str, ParamSpec]:
     backend = get_backend(spec.backend)
 
     space: dict[str, ParamSpec] = {}
-    space.update(dict(spec.search_space))
+    # Backend first, model second: the backend declares the knobs that belong to
+    # the *loop* (lr, batch_size) once instead of every neural plugin repeating
+    # them, and a model that has an opinion about one of them overrides it. The
+    # specific beats the general — `nlp.hf_text` narrows lr to the fine-tuning band
+    # because the backend's from-scratch range would spend most trials destroying
+    # a pretrained encoder.
     space.update(dict(backend.search_space()))
+    space.update(dict(spec.search_space))
     space.update(_coerce_overrides(config.tune.overrides))
     return space
 

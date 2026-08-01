@@ -159,6 +159,13 @@ class ModelSpec:
     # which also writes the defaulted values back so `config.json` records the
     # fully-materialized effective params.
     params_model: type[PydanticModel] | None = None
+    # Defaults for `fit.params` keys the user did not write, applied by
+    # `ExperimentConfig._resolve_plugin_params`. The one model property that is
+    # about the *loop*: a pretrained encoder needs a fine-tuning learning rate,
+    # and the framework's from-scratch default of 1e-3 destroys it silently. Only
+    # `fit.params` is covered — `batch_size` and `budget` are typed fields with
+    # real defaults, so "the user did not set it" is not answerable for them.
+    fit_defaults: Mapping[str, Any] = field(default_factory=dict)
     # Tie-break for zero-config model selection (higher wins).
     auto_priority: int = 0
     description: str = ""

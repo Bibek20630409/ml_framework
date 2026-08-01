@@ -99,6 +99,9 @@ dev = [
     "xgboost>=2.0",
     "lightgbm>=4.0",
     "catboost>=1.2",
+    # The NLP tests fine-tune a ~90 KB random DistilBert from the hub rather than
+    # importorskip-ing themselves away. They need network on the first run only.
+    "transformers>=4.40",
     "pytest-cov>=4.1.0",
     "httpx>=0.27.0",
     "black>=24.0.0",

@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import logging
 import shutil
+from collections.abc import Mapping
 from datetime import timedelta
 from pathlib import Path
 from typing import Any, ClassVar, Literal, cast
@@ -144,7 +145,17 @@ class LightningEstimator:
         self.module.to(self.device).eval()
 
     # ── internals ──
-    def _to_tensor(self, inputs: Any) -> torch.Tensor:
+    def _to_device(self, inputs: Any) -> Any:
+        """Move model input to the device, whatever shape it is.
+
+        A ``Mapping`` passes through as a mapping — a tokenized text batch is
+        ``input_ids`` plus ``attention_mask``, and flattening it into one float
+        matrix would be meaningless. The model's ``forward`` is what understands
+        the dict; this only relocates it. (An HF ``BatchEncoding`` is a Mapping, so
+        it takes this branch.)
+        """
+        if isinstance(inputs, Mapping):
+            return {k: (v.to(self.device) if hasattr(v, "to") else v) for k, v in inputs.items()}
         if isinstance(inputs, torch.Tensor):
             return inputs.to(self.device)
         return torch.tensor(np.asarray(inputs, dtype="float32"), dtype=torch.float32).to(
@@ -153,7 +164,7 @@ class LightningEstimator:
 
     @torch.no_grad()
     def logits(self, inputs: Any) -> torch.Tensor:
-        return self.module(self._to_tensor(inputs))
+        return self.module(self._to_device(inputs))
 
     def decode(self, logits: torch.Tensor) -> tuple[np.ndarray, np.ndarray | None]:
         """(hard predictions, probabilities) for this task, from raw logits.
@@ -410,20 +421,30 @@ class LightningBackend(BaseBackend):
         target_dir = Path(dest)
         target_dir.mkdir(parents=True, exist_ok=True)
         source = getattr(est, "checkpoint_path", None)
+
+        # `last.ckpt` rides along beside the model so `--resume` has something to
+        # continue from after the run directory is cleaned. It is *not* the
+        # manifest's artifact — that stays the best weights — because a loader
+        # wants those and only a resuming trainer wants the last optimizer state.
+        # Written for every model, including one with its own format: resuming is
+        # a property of the loop, not of the file the loop produced.
+        if source and Path(source).parent.joinpath(LAST_FILE).exists():
+            shutil.copyfile(Path(source).parent / LAST_FILE, target_dir / LAST_FILE)
+
+        own_format = getattr(getattr(est, "module", None), "save_artifact", None)
+        if own_format is not None:
+            # A model may own its serialization — see `plugins/nlp/hf_text.py`,
+            # where a Lightning checkpoint would round-trip the weights but need
+            # the HuggingFace hub to rebuild the architecture to put them in. The
+            # hook is discovered by name so the backend never learns which models
+            # have one.
+            return cast("ArtifactRef", own_format(target_dir))
+
         if source is None or not Path(source).exists():
             raise FileNotFoundError(
                 "LightningEstimator has no checkpoint to save; it was not produced by fit()"
             )
         shutil.copyfile(source, target_dir / MODEL_FILE)
-
-        # `last.ckpt` rides along beside the model so `--resume` has something to
-        # continue from after the run directory is cleaned. It is *not* the
-        # manifest's artifact — that stays the best checkpoint — because a loader
-        # wants the best weights and only a resuming trainer wants the last state.
-        last = Path(source).parent / LAST_FILE
-        if last.exists():
-            shutil.copyfile(last, target_dir / LAST_FILE)
-
         return ArtifactRef(path=f"{target_dir.name}/{MODEL_FILE}", format=ARTIFACT_FORMAT)
 
     def load(self, bundle_dir: str | Path, manifest: Any) -> LightningEstimator:
@@ -451,6 +472,13 @@ class LightningBackend(BaseBackend):
         # which is optional from P3), so their class may not be in the v1 registry
         # yet in a process that has only ever loaded bundles.
         model_cls = cast("type[BaseModel]", model_class(manifest.model.name))
+
+        own_format = getattr(model_cls, "load_artifact", None)
+        if own_format is not None:
+            return LightningEstimator(
+                own_format(root / manifest.model.artifact, manifest), manifest.task
+            )
+
         module = model_cls.load_from_checkpoint(
             str(root / manifest.model.artifact),
             input_dim=manifest.signature.input.n_features,
@@ -469,13 +497,13 @@ class LightningBackend(BaseBackend):
     def _output_dim(manifest: Any) -> int:
         """The head width, recovered from the signature.
 
-        Binary is the asymmetric case: two classes, one logit. Reading
-        ``n_classes`` directly would build a two-logit head and the checkpoint
-        would not load.
+        Delegates to :func:`~ml_framework.core.bundle.head_width`: a
+        self-serializing model rebuilds itself from the same manifest, and two
+        copies of the binary-is-one-logit rule would eventually disagree.
         """
-        if manifest.task == "multiclass":
-            return int(manifest.signature.output.n_classes or 0)
-        return 1
+        from ..core.bundle import head_width
+
+        return head_width(manifest)
 
     # ── prediction ──
     def predict_split(self, est: Any, bundle: Any, split: str) -> Predictions:
@@ -491,6 +519,10 @@ class LightningBackend(BaseBackend):
             # 0 workers: an evaluation pass is not worth a process pool, and
             # spawning one mid-run is a reliable source of Windows surprises.
             num_workers=0,
+            # The same batching rule training used. Without it a text split
+            # arrives as a list of raw strings and the model is handed something
+            # it has no way to read.
+            collate_fn=getattr(bundle.preprocessor, "collate_fn", None),
         )
         dm.setup()
 

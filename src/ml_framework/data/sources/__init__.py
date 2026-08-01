@@ -11,10 +11,13 @@ a module must be importable with zero optional dependencies installed.
 
 from .image import build_image_bundle, train_labels
 from .tabular import build_tabular_bundle, read_table
+from .text import build_text_bundle, text_labels
 from .timeseries import build_timeseries_bundle
 
 __all__ = [
     "train_labels",
+    "text_labels",
+    "build_text_bundle",
     "build_tabular_bundle",
     "build_image_bundle",
     "build_timeseries_bundle",

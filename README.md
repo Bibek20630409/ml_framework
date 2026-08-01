@@ -112,13 +112,13 @@ src/ml_framework/
 │   ├── inference.py     Inferencer.from_artifacts(dir)
 │   └── registry.py      MODELS / BACKENDS / SOURCES
 ├── backends/            one per fit-loop shape — lightning.py owns pl.Trainer
-├── plugins/             mlp · cnn · gbdt/ (xgboost…) · ts/ (naive, arima, prophet, lstm)
+├── plugins/             mlp · cnn · gbdt/ (xgboost…) · ts/ (naive…) · nlp/ (hf_text)
 ├── data/                sources · preprocess · splitters · lightning_adapter
 ├── pipeline/            train · tune · lr_finder
 ├── serving/api.py       FastAPI: /health /predict /predict_proba
 ├── utils/               logging, seed, platform-aware workers
 └── cli.py               `mlf` entry point
-configs/                 example_tabular · example_gbdt · example_image · example_timeseries
+configs/                 example_tabular · example_gbdt · example_image · example_timeseries · example_text
 tests/                   unit · integration · serving · backends · data
 ```
 
@@ -193,7 +193,7 @@ implementations — and adding CatBoost was ~40 lines, not a new backend.
 
 | backend | shape | models |
 |---|---|---|
-| `lightning` | epoch loop + validation callbacks | `mlp`, `cnn`, `ts.lstm` |
+| `lightning` | epoch loop + validation callbacks | `mlp`, `cnn`, `ts.lstm`, `nlp.hf_text` |
 | `gbdt` | one-shot `fit(X, y, eval_set=…)` + native early stopping | `xgboost`, `lightgbm`, `catboost` |
 | `forecast` | fit-per-series, no X/y, predict-by-horizon | `ts.naive`, `ts.arima`, `ts.prophet` |
 
@@ -377,3 +377,65 @@ curl -X POST localhost:8000/predict -d '{"horizon": 7}'
 > values above 1 are normal. To judge whether a model earns its keep, train
 > `ts.naive` on the same split and compare. `report.txt` deliberately prints no
 > verdict for this reason.
+
+
+## Text
+
+Text classification is `binary`/`multiclass` with `data.kind: text` — there is no
+`text_classification` task. Task decides loss, metrics and head; kind decides
+ingestion. Keeping them orthogonal is what lets the task list grow additively
+instead of as a product of the two.
+
+```yaml
+task: binary
+data:
+  kind: text
+  path: data/reviews.csv     # CSV, Parquet or JSONL
+  target: label              # string labels are encoded; the names come back out
+model:
+  name: nlp.hf_text
+  params: {model_name: distilbert-base-uncased, max_length: 128}
+```
+
+```bash
+pip install -e '.[nlp,lightning]'
+mlf train --config configs/example_text.yaml
+curl -X POST localhost:8000/predict -d '{"inputs": ["great movie"]}'
+# {"predictions": [1.0], "labels": ["pos"]}
+```
+
+`nlp.hf_text` rides the **lightning** backend rather than a fourth one: fine-tuning
+a transformer is an epoch loop with validation callbacks, exactly like training a
+CNN. What differs is the batch shape and the file format, and both are the model's
+business.
+
+**The bundle is self-contained.** The fine-tuned weights are written with
+`save_pretrained` into `model/hf_model/` and the tokenizer into
+`preprocessor/tokenizer/`. A Lightning checkpoint would round-trip the weights,
+but rebuilding the architecture to put them in calls `from_pretrained(model_name)`
+— which needs the HuggingFace hub, or a warm cache, *at load time*. That failure
+shows up in a serving container rather than in CI. Serving a text bundle needs no
+network.
+
+> **The tokenizer is fitted state, not configuration.** It maps strings to ids
+> through a vocabulary, and a model fed ids from a *different* vocabulary produces
+> confident nonsense: no shape error, no exception, just a model that looks like it
+> trained badly. That is why it ships in the bundle, why `model.params.model_name`
+> is the only place a checkpoint is named, and why a bundle with no tokenizer
+> directory refuses to load rather than quietly re-downloading one.
+
+**Fine-tuning defaults are applied, not documented.** The framework default is
+`lr: 1e-3` with Adam — right for a network trained from scratch, and destructive to
+a pretrained encoder within the first few steps, while the run looks entirely
+healthy and scores near chance. `nlp.hf_text` declares `lr: 2e-5`, AdamW,
+`weight_decay: 0.01` and a cosine schedule; the config validator fills in the keys
+you did not write, and `config.json` records what actually ran. Tuning narrows the
+learning rate to 1e-5..5e-5 for the same reason, instead of inheriting the
+backend's from-scratch range.
+
+Requests carry raw strings. Sending token ids would make every client responsible
+for using the right vocabulary — the skew above — and would make the endpoint
+unusable from curl.
+
+`/drift` answers **501** for text: PSI over token ids is a number without a
+meaning, and inventing one would be worse than reporting that there is none.

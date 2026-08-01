@@ -95,8 +95,20 @@ class TabularRequest(BaseModel):
             out[i] = [row[name] for name in feature_names]
         return out
 
+    def to_model_input(self, feature_names: list[str]) -> np.ndarray:
+        """The generic hook ``/predict`` calls. For tabular it is the matrix."""
+        return self.to_array(feature_names)
+
 
 class TextRequest(BaseModel):
+    """Raw strings. Tokenization is the *bundle's* job, not the caller's.
+
+    The alternative — asking clients to send token ids — would make every client
+    responsible for using the right vocabulary, which is the train/serve skew the
+    tokenizer-in-the-bundle design exists to prevent. It would also make the
+    endpoint impossible to use from curl.
+    """
+
     model_config = {"extra": "forbid"}
 
     inputs: list[str] = Field(..., min_length=1, description="Raw text, one per row.")
@@ -104,6 +116,15 @@ class TextRequest(BaseModel):
     @property
     def n_rows(self) -> int:
         return len(self.inputs)
+
+    def to_model_input(self, feature_names: list[str]) -> list[str]:
+        """Strings, unchanged.
+
+        ``feature_names`` is accepted and ignored so the hook has one signature
+        across kinds; a text bundle records no feature names, because a token
+        sequence has no columns.
+        """
+        return list(self.inputs)
 
 
 class ImageItem(BaseModel):
