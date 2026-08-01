@@ -157,3 +157,21 @@ markers = [
     "integration: end-to-end training tests",
     "serving: FastAPI endpoint tests",
 ]
+
+
+[tool.coverage.run]
+source = ["ml_framework"]
+# The generated-code and __main__ paths are not what the floor is about.
+omit = ["*/__main__.py"]
+
+[tool.coverage.report]
+# Matches the CI gate, so `pytest --cov` locally fails for the same reason CI
+# does rather than passing quietly and being a surprise on push.
+fail_under = 80
+show_missing = true
+exclude_also = [
+    # A `Protocol` body is a signature, not code that can run.
+    '^\s*\.\.\.$',
+    'if TYPE_CHECKING:',
+    'raise NotImplementedError',
+]

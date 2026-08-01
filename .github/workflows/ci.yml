@@ -34,7 +34,11 @@ jobs:
       - name: Type check
         run: mypy src
       - name: Test
-        run: pytest --cov=ml_framework --cov-report=term-missing
+        # `--cov-fail-under` is the point: before this, CI *measured* coverage and
+        # enforced nothing, so the number could drift down indefinitely without
+        # failing a build. The floor lives here rather than only in pyproject so
+        # it is visible in the job log next to the run that enforces it.
+        run: pytest --cov=ml_framework --cov-report=term-missing --cov-fail-under=80
 
   # The P3 phase gate, enforced rather than asserted. torch is genuinely absent
   # here — no meta-path trickery — so this is the only place the claim "a GBDT

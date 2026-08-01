@@ -28,6 +28,7 @@ import numpy as np
 from pydantic import BaseModel as PydanticModel
 from pydantic import Field
 
+from ..core.export import ExportResult, unsupported
 from ..core.protocols import (
     ArtifactRef,
     BuildContext,
@@ -269,6 +270,31 @@ class ForecastBackend(BaseBackend):
 
     def params_model(self) -> type[PydanticModel]:
         return ForecastFitParams
+
+    # Pickle only. The reason is on `save()` above and has not changed: Prophet
+    # and statsmodels expose no portable serialization of a *fitted* model, so
+    # there is nothing to convert to. Listing `onnx` here and failing at runtime
+    # would be worse than refusing at the table.
+    export_formats: ClassVar[tuple[str, ...]] = ("pickle",)
+
+    def export(self, est: Any, dest: Path, fmt: str, *, manifest: Any = None) -> ExportResult:
+        if fmt not in self.export_formats:
+            unsupported(
+                self.name,
+                fmt,
+                self.export_formats,
+                "a fitted Prophet/statsmodels model has no portable graph form",
+            )
+        import joblib
+
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        joblib.dump(est, dest)
+        log.info("exported pickle -> %s", dest)
+        return ExportResult(
+            path=dest,
+            format="pickle",
+            notes="joblib pickle; loads only with the same library versions",
+        )
 
     def model_size(self, est: Any) -> dict[str, Any]:
         """Series count — the analogue of a parameter or tree count here."""

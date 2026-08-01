@@ -14,7 +14,7 @@ Tracks progress against [ml_framework_architecture_plan.md](../ml_framework_arch
 | P6 — Time-series | **done** | `01bd2aa` |
 | P7 — NLP | **done** | `e06c299` |
 | P8 — Zero-config | **done** | `62672eb` |
-| P9 — Deployment polish | not started | — |
+| P9 — Deployment polish | **done** | this branch |
 
 ## Version
 
@@ -30,9 +30,9 @@ v1 *bundles* still load (`test_v1_bundle_compat.py`); v1 *configs* do not, and
 
 ## Test baseline
 
-**621 passed, 1 skipped** with every declared extra installed except DVC
-(46/4 before P0 → 130/4 after P0 → 249/4 after P1 → 258/1 → 284/1 after P2 → 355/1 after P3 → 395/1 after P4 → 429/1 after P5 → 458/1 after P6 → 471/1 after the image-augmentation fix → 511/1 after P7 → 549/1 after the two NLP tasks → 555/1 after `mlf models` → 563/1 after the HF cache pin →
-**621/1** after P8). Every phase gate is measured against this number — a phase that ends
+**641 passed, 1 skipped** with every declared extra installed except DVC
+(46/4 before P0 → 130/4 after P0 → 249/4 after P1 → 258/1 → 284/1 after P2 → 355/1 after P3 → 395/1 after P4 → 429/1 after P5 → 458/1 after P6 → 471/1 after the image-augmentation fix → 511/1 after P7 → 549/1 after the two NLP tasks → 555/1 after `mlf models` → 563/1 after the HF cache pin → 621/1 after P8 →
+**641/1** after P9). Every phase gate is measured against this number — a phase that ends
 with fewer passing tests than it started with has regressed something, regardless
 of what its own new tests say.
 
@@ -109,7 +109,7 @@ build *function* rather than a class — see `available_models` below).
 Verification commands (all clean):
 
 ```
-pytest                        # 621 passed, 1 skipped
+pytest                        # 641 passed, 1 skipped, 91% coverage
 ruff check src tests
 black --check src tests
 isort --check-only src tests
@@ -1044,3 +1044,117 @@ now owns that message.
 5. **Entity-level NER scoring, seq2seq vocabulary resizing** (from P7).
 6. **Multi-series forecasting and `exog` consumption** (from P6).
 7. **`native_categorical` still has no consumer** (from P4).
+
+## P9 — Deployment polish — **done**
+
+The exit gate is two claims and both are now checked by tests: **exported ONNX
+matches native predictions**, and **CI enforces ≥80% coverage**.
+
+- **`core/export.py`** — the format vocabulary and the refusal.
+- **`backend.export()`** — on all three backends, plus a refusing default.
+- **`mlf export --format onnx|torchscript|native|pickle`**
+- **`deploy.py` + `mlf dockerfile`** — an image built from what the bundle declares.
+- **Per-backend Prometheus labels** on both collectors.
+- **Coverage floor** — measured 91%, enforced at 80%.
+
+### The exit gate, measured
+
+Seven rows through a graph traced at batch size one:
+
+    max abs diff   5.96e-08
+    argmax agrees  yes
+    tolerance      1e-5 (stated, not tuned until green)
+
+Seven rows rather than one is deliberate — it proves the dynamic batch axis.
+Without `dynamic_axes` the artifact is frozen at whatever was traced and fails on
+the second row, which a one-row test would never catch.
+
+`opset_version` is pinned at 17 rather than left to torch's default, which moves
+between releases and would silently change what a deployment target must support.
+
+### Export is a backend method, and refusing is a normal outcome
+
+Only the backend knows what its estimator physically is — a checkpoint, a booster,
+a pickled statsmodels object. A central exporter with `if backend == …` in it would
+need editing for every new backend, which is the coupling the plugin design exists
+to remove.
+
+| backend | formats | why not more |
+|---|---|---|
+| `lightning` | onnx, torchscript | — |
+| `gbdt` | native | a booster has no traced graph, and its own `.json`/`.cbm` is what every runtime for that library already reads |
+| `forecast` | pickle | Prophet and statsmodels expose no portable form of a *fitted* model |
+
+**An unsupported combination raises.** Writing *some* file when the user asked for
+ONNX would be discovered at deployment time by a runtime that cannot load it — or
+worse, by one that loads it and scores differently. The error names what the
+backend *can* produce, turning a dead end into a next step.
+
+### Two things the export path does not silently assume
+
+**Tracing exports the graph, not the preprocessing.** The bundle's scaler and image
+transforms stay behind. An ONNX file fed raw unscaled features produces confident
+nonsense with no error, so the note travels back through `ExportResult.notes` and
+the CLI prints it.
+
+**The traced object is verified before anything is written.** `jit.trace` cannot
+walk a `LightningModule` — its `trainer` property raises when detached, which a
+loaded bundle always is — so the *inner network* is traced instead. That
+substitution assumes `forward` is exactly `self.network(x)`. Rather than assume it,
+the module's own output and the network's are compared first, and export refuses if
+they differ. One extra forward pass buys the difference between an assumption and a
+check.
+
+Text bundles are refused earlier still: tracing a tokenized batch would bake that
+batch's sequence length into the graph, so every future request would be silently
+truncated or padded to it. The HuggingFace directory is already portable.
+
+### Per-bundle Dockerfiles
+
+The repository Dockerfile's fixed targets (`serve`, `serve-gbdt`) are guesses about
+which case you are in. A bundle already knows: `manifest.requires` lists exactly
+what its backend needs, recorded at training time by the plugin that needed it.
+`mlf dockerfile` reads that and installs those extras and no others — so a booster
+image has no torch in it because the *bundle* says so, not because someone picked
+the right target. A third-party plugin declaring its own extra gets a correct image
+without `deploy.py` knowing the plugin exists.
+
+Generated rather than committed: a Dockerfile checked in next to the code goes
+stale the moment a plugin's requirements change, and the staleness is invisible
+until an image fails to serve.
+
+### Monitoring
+
+Both collectors gained `backend` and `model` labels. Without them, two containers
+scraped into one Prometheus produce indistinguishable timeseries that **silently
+add together** — a booster's predictions and a transformer's arriving as one
+counter. Cardinality is bounded: one value pair per served bundle, fixed for the
+life of the process.
+
+`monitoring/drift.py` reading `signature.feature_names` was already true — it has
+read `manifest.signature.input.features` since the signature landed, so that plan
+item needed verifying rather than implementing.
+
+### Coverage
+
+**91% measured, 80% enforced.** Before this, `ci.yml` ran `--cov` and enforced
+nothing, so the number could drift down indefinitely without failing a build. The
+floor is now in both `ci.yml` and `pyproject.toml`, so a local `pytest --cov` fails
+for the same reason CI does rather than passing quietly and surprising someone on
+push.
+
+The plan's "duplicate root HTML docs" item was already moot — no such files exist
+in the repository.
+
+### Deliberate loose ends
+
+1. **GBDT has no ONNX path.** Deliberate, per the table above, and it means
+   `mlf export --format onnx` works for exactly one of three backends.
+2. **`skl2onnx` is declared in the `export` extra and unused**, like `datasets` in
+   `nlp`. Left alone.
+3. **The generated Dockerfile is not built in CI**, so it is checked for content
+   rather than for actually producing a working image.
+4. **Text and seq2seq cannot be traced** — refused with a reason.
+5. Everything still open from P4–P8: `native_categorical` has no consumer,
+   multi-series forecasting, `exog`, entity-level NER scoring, seq2seq vocabulary
+   resizing, text drift.

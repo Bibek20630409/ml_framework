@@ -22,6 +22,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, ClassVar
 
+from ..core.export import ExportResult, unsupported
 from ..core.protocols import (
     ArtifactRef,
     Budget,
@@ -152,6 +153,19 @@ class BaseBackend:
     def params_model(self) -> type | None:
         """Pydantic schema validating ``fit.params``. ``None`` means unvalidated."""
         return None
+
+    # Formats this backend can produce. Empty means "none", and the default
+    # `export` below turns that into a refusal that says so.
+    export_formats: ClassVar[tuple[str, ...]] = ()
+
+    def export(self, est: Estimator, dest: Path, fmt: str, *, manifest: Any = None) -> ExportResult:
+        """Refuse by default, naming what this backend *can* do.
+
+        A backend that grows an export format overrides this. One that never will
+        inherits an error message that is already correct — which is the point of
+        putting the default here rather than making every backend write one.
+        """
+        unsupported(self.name, fmt, self.export_formats)
 
     def model_size(self, est: Estimator) -> dict[str, Any]:
         """Size, in whatever unit is meaningful for this loop shape.

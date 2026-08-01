@@ -14,6 +14,8 @@ accept dotted ``--set key=value`` overrides.
     mlf train          --config configs/example_gbdt.yaml --no-tune
     mlf train          --config configs/example_gbdt.yaml --tune-budget 10m --tune-trials 50
     mlf serve          --artifacts outputs --host 0.0.0.0 --port 8000
+    mlf export         --artifacts outputs --format onnx -o model.onnx
+    mlf dockerfile     --artifacts outputs -o Dockerfile.serve
     mlf migrate-config -i configs/old.yaml -o configs/new.yaml
 
 ``mlf train`` **tunes by default**, under a per-backend budget (see
@@ -50,6 +52,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import ExperimentConfig
+from .core.export import EXPORT_FORMATS
 from .core.types import FrameworkError
 from .utils import setup_logging
 
@@ -322,6 +325,24 @@ def build_parser() -> argparse.ArgumentParser:
     init_p.add_argument("--output", "-o", required=True, metavar="PATH", help="Where to write it")
     init_p.add_argument("--force", action="store_true", help="Overwrite an existing file")
 
+    export_p = sub.add_parser("export", help="Convert a trained bundle to another format")
+    export_p.add_argument("--artifacts", "-a", default="outputs", help="Artifact bundle dir")
+    export_p.add_argument(
+        "--format",
+        "-f",
+        required=True,
+        choices=list(EXPORT_FORMATS),
+        help="Target format. Refused, never substituted, where the backend cannot produce it",
+    )
+    export_p.add_argument("--output", "-o", required=True, metavar="PATH", help="Where to write")
+
+    docker_p = sub.add_parser(
+        "dockerfile", help="Write a Dockerfile tailored to one bundle's dependencies"
+    )
+    docker_p.add_argument("--artifacts", "-a", default="outputs", help="Artifact bundle dir")
+    docker_p.add_argument("--output", "-o", default="Dockerfile.serve", metavar="PATH")
+    docker_p.add_argument("--force", action="store_true", help="Overwrite an existing file")
+
     lr = sub.add_parser("lr", help="Run the LR range test")
     _add_config_args(lr)
 
@@ -409,6 +430,44 @@ def main(argv: list[str] | None = None) -> int:
 
         registry = MODELS if args.command == "models" else BACKENDS
         return _print_plugins(registry, include_failed=args.all, show_detail=args.show)
+
+    if args.command == "export":
+        from .core.export import UnsupportedExportError
+        from .core.inference import Inferencer
+        from .core.registry import get_backend
+
+        try:
+            inf = Inferencer.from_artifacts(args.artifacts)
+            backend = get_backend(inf.backend_name)
+            result = backend.export(
+                inf.estimator, Path(args.output), args.format, manifest=inf.manifest
+            )
+        except (UnsupportedExportError, FrameworkError, FileNotFoundError) as exc:
+            log.error("%s", exc)
+            return 1
+
+        print(f"wrote {result.path} ({result.format})")
+        if result.notes:
+            # Not decoration: "preprocessing is NOT included" is the difference
+            # between an artifact that works and one that scores nonsense.
+            print(f"note: {result.notes}")
+        return 0
+
+    if args.command == "dockerfile":
+        from .deploy import render_dockerfile
+
+        destination = Path(args.output)
+        if destination.exists() and not args.force:
+            log.error("%s exists; pass --force to overwrite", destination)
+            return 1
+        try:
+            text = render_dockerfile(args.artifacts)
+        except (FrameworkError, FileNotFoundError) as exc:
+            log.error("%s", exc)
+            return 1
+        destination.write_text(text, encoding="utf-8")
+        print(f"wrote {destination}")
+        return 0
 
     if args.command == "init":
         from .config.autoconfig import render_config, synthesize

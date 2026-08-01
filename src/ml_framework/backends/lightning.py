@@ -36,7 +36,15 @@ import torch
 from pydantic import BaseModel as PydanticModel
 from pydantic import Field
 
+from ..core.export import (
+    ONNX_REQUIREMENTS,
+    ExportResult,
+    UnsupportedExportError,
+    example_input_shape,
+    unsupported,
+)
 from ..core.lit_model import OptimSettings
+from ..core.plugins import check_requirements
 from ..core.protocols import (
     ArtifactRef,
     BuildContext,
@@ -116,6 +124,14 @@ ARTIFACT_FORMAT = "lightning-checkpoint"
 # BatchNorm uses running statistics and dropout is off — but a default keeps
 # predict_split usable when no config is in scope.
 DEFAULT_EVAL_BATCH_SIZE = 256
+# 17 is broadly supported by onnxruntime and old enough that a deployment target a
+# year behind still loads it. Pinned rather than left to torch's default, which
+# moves between releases and would silently change what the artifact requires.
+ONNX_OPSET = 17
+# How closely the traced network must reproduce the module's own output before an
+# artifact is written. Tight on purpose: this is the same computation twice, not
+# two runtimes, so any real difference means `forward` does something extra.
+TRACE_PARITY_ATOL = 1e-6
 
 
 # ── Estimator ─────────────────────────────────────────────
@@ -675,6 +691,94 @@ class LightningBackend(BaseBackend):
     def params_model(self) -> type[PydanticModel]:
         """Pydantic schema for ``fit.params`` on this backend."""
         return LightningFitParams
+
+    # A traced graph, and the same graph in torch's own format. Both need a
+    # fixed-width float input, which is why a text bundle is refused rather than
+    # traced -- see `core.export.example_input_shape`.
+    export_formats: ClassVar[tuple[str, ...]] = ("onnx", "torchscript")
+
+    def export(self, est: Any, dest: Path, fmt: str, *, manifest: Any = None) -> ExportResult:
+        """Trace the module to ONNX or TorchScript.
+
+        **Tracing exports the graph, not the preprocessing.** The bundle's scaler
+        and image transforms stay behind, so whatever loads this artifact must
+        apply them itself. Said in the returned notes and printed by the CLI,
+        because an ONNX file fed raw unscaled features produces confident nonsense
+        with no error -- the same shape of failure as a mismatched tokenizer.
+
+        The example shape comes from the **manifest**, so export works against a
+        bundle alone, which is the situation it exists for.
+        """
+        import torch
+
+        if fmt not in self.export_formats:
+            unsupported(self.name, fmt, self.export_formats)
+        if manifest is None:
+            raise UnsupportedExportError(
+                "exporting a traced graph needs the bundle manifest to know the "
+                "input shape; load the bundle rather than the estimator alone"
+            )
+
+        shape = example_input_shape(manifest)
+        module = est.module.eval()
+        example = torch.zeros(shape, dtype=torch.float32)
+
+        # Trace the inner network, not the LightningModule around it. `jit.trace`
+        # walks a module's attributes, and `LightningModule.trainer` raises when
+        # the module is detached from a Trainer -- which a loaded bundle always is.
+        #
+        # That substitution assumes `forward` is exactly `self.network(x)`, which
+        # is true for every model that can reach this line (text is refused
+        # earlier). Assuming it silently would be the wrong kind of shortcut, so
+        # it is checked below instead.
+        graph = getattr(module, "network", module)
+        with torch.no_grad():
+            expected = module(example)
+            actual = graph(example)
+        if not torch.allclose(expected, actual, atol=TRACE_PARITY_ATOL):
+            raise UnsupportedExportError(
+                f"model '{manifest.model.name}' does something in forward() beyond "
+                f"calling its network, so tracing the network alone would drop it. "
+                f"Exporting would produce an artifact that scores differently from "
+                f"the bundle."
+            )
+
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if fmt == "torchscript":
+            # `trace` rather than `script`: the plugin bodies use ordinary Python
+            # control flow that `script` rejects, and a traced graph is what a
+            # torchscript consumer expects anyway.
+            with torch.no_grad():
+                traced = torch.jit.trace(graph, example)
+            traced.save(str(dest))
+            note = "traced graph; preprocessing is NOT included"
+        else:
+            check_requirements(ONNX_REQUIREMENTS, what="ONNX export")
+            with torch.no_grad():
+                torch.onnx.export(
+                    graph,
+                    # A 1-tuple, not a bare tensor: torch types the second argument
+                    # as the *args tuple the module is called with, and a single
+                    # tensor is the one-argument case spelled ambiguously.
+                    (example,),
+                    str(dest),
+                    input_names=["input"],
+                    output_names=["output"],
+                    # Without this the batch size is frozen at whatever was traced
+                    # and the artifact can only ever score one row at a time.
+                    dynamic_axes={"input": {0: "batch"}, "output": {0: "batch"}},
+                    opset_version=ONNX_OPSET,
+                    # torch 2.9+ defaults to the dynamo exporter, which needs
+                    # `onnxscript` -- a dependency the `[export]` extra does not
+                    # declare, so the default would fail on a correctly-installed
+                    # machine. The TorchScript path needs nothing extra and
+                    # produces the artifact this opset pin was chosen for.
+                    dynamo=False,
+                )
+            note = f"opset {ONNX_OPSET}, dynamic batch; preprocessing is NOT included"
+
+        log.info("exported %s -> %s", fmt, dest)
+        return ExportResult(path=dest, format=fmt, notes=note)  # type: ignore[arg-type]
 
     def model_size(self, est: Any) -> dict[str, Any]:
         return {"trainable_parameters": int(est.count_parameters())}

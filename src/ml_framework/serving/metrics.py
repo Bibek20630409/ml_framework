@@ -27,6 +27,19 @@ log = logging.getLogger(__name__)
 PREDICTIONS_TOTAL = "mlf_predictions_total"
 FEATURE_PSI = "mlf_feature_psi"
 
+# Which model produced a sample, on every series.
+#
+# Without these, two containers scraped into one Prometheus produce timeseries
+# that are indistinguishable and silently *add together* -- a booster's
+# predictions and a transformer's arriving as one counter. The labels are also
+# what lets one Grafana dashboard answer "is the gbdt fleet drifting?" rather
+# than needing a panel per deployment.
+#
+# Cardinality is bounded and small: one value pair per served bundle, fixed for
+# the life of the process. This is the safe kind of label -- unlike, say, a
+# request id, which would multiply series without limit.
+IDENTITY_LABELS: tuple[str, ...] = ("backend", "model")
+
 
 @dataclass(frozen=True, slots=True)
 class Collectors:
@@ -78,12 +91,12 @@ def get_collectors() -> Collectors:
     predictions = _existing(REGISTRY, PREDICTIONS_TOTAL) or Counter(
         PREDICTIONS_TOTAL,
         "Model predictions, labelled by predicted class",
-        ["predicted_class"],
+        ["predicted_class", *IDENTITY_LABELS],
     )
     drift = _existing(REGISTRY, FEATURE_PSI) or Gauge(
         FEATURE_PSI,
         "Input feature drift (PSI) vs the training reference distribution",
-        ["feature"],
+        ["feature", *IDENTITY_LABELS],
     )
     _CACHE = Collectors(predictions=predictions, drift=drift)
     return _CACHE
@@ -102,6 +115,15 @@ def instrument(app: Any) -> bool:
         return False
     Instrumentator().instrument(app).expose(app, include_in_schema=False)
     return True
+
+
+def identity(inferencer: Any) -> dict[str, str]:
+    """The label values for a loaded bundle.
+
+    Taken from the manifest, so they describe what is actually being served rather
+    than what a deployment was named.
+    """
+    return {"backend": inferencer.backend_name, "model": inferencer.model_name}
 
 
 def reset_for_tests() -> None:

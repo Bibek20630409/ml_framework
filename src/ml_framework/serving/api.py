@@ -44,7 +44,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException
 
 from ..core.inference import Inferencer
 from ..core.types import UnsupportedCapability
-from .metrics import get_collectors, instrument
+from .metrics import get_collectors, identity, instrument
 from .schemas import (
     ConfidenceResponse,
     ForecastRequest,
@@ -137,7 +137,12 @@ def create_app(
 
             inf = _get_inferencer()
             state["tracker"] = DriftTracker(
-                inf.reference_stats, inf.feature_cols, gauge=collectors.drift
+                inf.reference_stats,
+                # Already the manifest's `signature.input.features` -- the serving
+                # layer has not guessed at feature names since the signature landed.
+                inf.feature_cols,
+                gauge=collectors.drift,
+                labels=identity(inf),
             )
         return state["tracker"]
 
@@ -298,8 +303,9 @@ def create_app(
         if supports_drift(inf.data_kind):
             _get_tracker().observe(model_input)  # feed the rolling drift window
         if collectors.predictions is not None and inf.produces_proba:
+            tags = identity(inf)
             for p in preds:
-                collectors.predictions.labels(predicted_class=str(int(p))).inc()
+                collectors.predictions.labels(predicted_class=str(int(p)), **tags).inc()
         model = response_model(inf.data_kind, inf.signature.output.kind)
         return model(predictions=[float(p) for p in preds], labels=_labels(inf, preds))
 

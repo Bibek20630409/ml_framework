@@ -310,6 +310,17 @@ class TrainingBackend(Protocol):
         """Pydantic schema validating ``fit.params`` for this backend."""
         ...
 
+    def export(self, est: Estimator, dest: Path, fmt: str, *, manifest: Any = None) -> Any:
+        """Convert ``est`` to ``fmt`` at ``dest``, or refuse.
+
+        On the backend because only the backend knows what its estimator
+        physically is. A central exporter would need a branch per backend, which
+        is the coupling the plugin design exists to remove. Refusing is a normal
+        outcome — a Prophet model has no ONNX graph — and it must raise rather
+        than write something that is not the requested format.
+        """
+        ...
+
 
 @runtime_checkable
 class Preprocessor(Protocol):

@@ -79,12 +79,17 @@ class DriftTracker:
         window: int = 1000,
         min_samples: int = 30,
         gauge=None,
+        labels: dict | None = None,
     ):
         self.reference = reference
         self.feature_cols = feature_cols
         self.min_samples = min_samples
         self.buf: deque = deque(maxlen=window)
         self.gauge = gauge
+        # Identity labels (backend, model) applied to every point this tracker
+        # reports. Passed in rather than read here so this module stays free of
+        # the serving layer -- drift is computed the same way offline.
+        self.labels = dict(labels or {})
 
     def observe(self, x: np.ndarray) -> None:
         for row in np.atleast_2d(x):
@@ -96,5 +101,5 @@ class DriftTracker:
         drift = compute_drift(self.reference, np.array(self.buf), self.feature_cols)
         if self.gauge is not None:
             for feat, val in drift.items():
-                self.gauge.labels(feature=feat).set(val)
+                self.gauge.labels(feature=feat, **self.labels).set(val)
         return drift

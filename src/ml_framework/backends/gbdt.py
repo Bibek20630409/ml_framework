@@ -40,6 +40,7 @@ import numpy as np
 from pydantic import BaseModel as PydanticModel
 from pydantic import Field
 
+from ..core.export import ExportResult, unsupported
 from ..core.protocols import (
     ArtifactRef,
     BuildContext,
@@ -617,6 +618,39 @@ class GbdtBackend(BaseBackend):
 
     def params_model(self) -> type[PydanticModel]:
         return GbdtFitParams
+
+    # Native only, and not for lack of effort. A booster's own `.json`/`.cbm`/
+    # `.txt` is what every serving runtime for that library already reads, loads
+    # faster than a converted graph, and preserves behaviour exactly. ONNX
+    # conversion would need `onnxmltools`, produce a larger artifact, and
+    # introduce a second implementation of the same tree traversal that can
+    # disagree with the first at the boundary of a split. Portability nobody asked
+    # for, bought with all three.
+    export_formats: ClassVar[tuple[str, ...]] = ("native",)
+
+    def export(self, est: Any, dest: Path, fmt: str, *, manifest: Any = None) -> ExportResult:
+        """Write the library's own model file.
+
+        The same bytes `save()` puts in the bundle -- deliberately, because the
+        bundle artifact *is* the portable form for a booster. Exposing it through
+        `mlf export` is about giving one command for "get me the deployable file"
+        across backends, not about producing something new.
+        """
+        if fmt not in self.export_formats:
+            unsupported(self.name, fmt, self.export_formats, "a booster has no traced graph")
+
+        # The same unwrapping `save()` does: a GbdtEstimator wraps the library
+        # object, and the adapter table is keyed on the library object itself.
+        model = getattr(est, "model", est)
+        adapter = adapter_for_estimator(model)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        adapter.save(model, dest)
+        log.info("exported native %s model -> %s", adapter.library, dest)
+        return ExportResult(
+            path=dest,
+            format="native",
+            notes=f"{adapter.library}'s own format, loadable by that library directly",
+        )
 
     def model_size(self, est: Any) -> dict[str, Any]:
         """Tree and node counts — the GBDT analogue of ``count_parameters()``.
