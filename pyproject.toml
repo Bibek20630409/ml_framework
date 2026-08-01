@@ -64,7 +64,12 @@ hpo = ["optuna>=3.4.0", "optuna-integration[pytorch_lightning]>=3.4.0"]
 gbdt = ["xgboost>=2.0", "lightgbm>=4.0", "catboost>=1.2"]
 timeseries = ["statsmodels>=0.14", "prophet>=1.1"]
 nlp = ["transformers>=4.40", "tokenizers", "datasets"]
-export = ["onnx", "onnxruntime", "skl2onnx"]
+# `onnxscript` is required by the dynamo ONNX exporter, which is torch 2.9+'s
+# default and the only one with a future — the TorchScript exporter it replaced is
+# deprecated and unsupported on Python 3.14+. Declared rather than relied upon:
+# leaving it out is what forced `dynamo=False` in `backends/lightning.py`, and a
+# machine that happens to have it installed transitively would have hidden that.
+export = ["onnx", "onnxruntime", "onnxscript>=0.7", "skl2onnx"]
 # Parquet ingestion. Declared even though `mlflow` happens to require pyarrow
 # unconditionally: relying on that is a hidden coupling, and it breaks exactly
 # where it matters most — a slim serving image built without the mlops extra.

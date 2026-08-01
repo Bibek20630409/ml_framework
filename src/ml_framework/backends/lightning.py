@@ -768,12 +768,21 @@ class LightningBackend(BaseBackend):
                     # and the artifact can only ever score one row at a time.
                     dynamic_axes={"input": {0: "batch"}, "output": {0: "batch"}},
                     opset_version=ONNX_OPSET,
-                    # torch 2.9+ defaults to the dynamo exporter, which needs
-                    # `onnxscript` -- a dependency the `[export]` extra does not
-                    # declare, so the default would fail on a correctly-installed
-                    # machine. The TorchScript path needs nothing extra and
-                    # produces the artifact this opset pin was chosen for.
-                    dynamo=False,
+                    # The dynamo exporter, now that `[export]` declares
+                    # `onnxscript`. The TorchScript exporter this replaced is
+                    # deprecated and unsupported on Python 3.14+, so `dynamo=False`
+                    # was a pin with no future. Measured across 1/7/64 rows: same
+                    # opset, same dynamic batch axis, and a max abs difference that
+                    # stays four orders of magnitude inside ONNX_TOLERANCE.
+                    dynamo=True,
+                    # NOT cosmetic, and not a preference. The dynamo exporter writes
+                    # a U+2705 to stdout when it succeeds; on Windows, where the
+                    # console is cp1252, encoding it raises UnicodeEncodeError *from
+                    # inside a successful export*. A correct artifact would be
+                    # reported as a failure. This is the same class of bug as the
+                    # UTF-8 stdout fix in `utils/logging.py`, arriving via a
+                    # dependency rather than our own logging.
+                    verbose=False,
                 )
             note = f"opset {ONNX_OPSET}, dynamic batch; preprocessing is NOT included"
 

@@ -43,6 +43,10 @@ EXPORT_FORMATS: Final[tuple[ExportFormat, ...]] = ("onnx", "torchscript", "nativ
 ONNX_REQUIREMENTS: tuple[Requirement, ...] = (
     Requirement("onnx", extra="export"),
     Requirement("onnxruntime", extra="export"),
+    # The dynamo exporter's own dependency. Checked here rather than left to
+    # torch, whose failure for a missing `onnxscript` arrives from inside the
+    # exporter and does not name the pip extra that fixes it.
+    Requirement("onnxscript", extra="export"),
 )
 
 

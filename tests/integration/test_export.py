@@ -100,6 +100,68 @@ def test_exported_onnx_matches_native_predictions(tmp_path):
 
 
 @pytest.mark.integration
+def test_the_exported_file_declares_the_opset_we_promised(tmp_path):
+    """The pin is a promise to a deployment target, so assert it on the artifact.
+
+    The dynamo exporter builds at opset 18 and *down-converts* to the requested
+    17, warning that conversion "may not be successful". It succeeds for the ops
+    an MLP uses — but that is op-dependent, not a blanket guarantee. Reading
+    `opset_import` off the produced file means an op that fails to down-convert
+    fails the build, instead of silently shipping an opset-18 artifact to a
+    runtime that was promised 17.
+    """
+    pytest.importorskip("onnx", reason="the export extra is not installed")
+    import onnx
+
+    from ml_framework.backends.lightning import ONNX_OPSET
+
+    bundle = _train(tmp_path, "mlp")
+    inf = Inferencer.from_artifacts(bundle)
+    destination = tmp_path / "model.onnx"
+
+    get_backend(inf.backend_name).export(inf.estimator, destination, "onnx", manifest=inf.manifest)
+
+    model = onnx.load(str(destination))
+    default_domain = {i.domain or "ai.onnx": i.version for i in model.opset_import}
+    assert default_domain["ai.onnx"] == ONNX_OPSET
+
+    # And the batch axis is a symbol, not the width it was traced at. Without this
+    # the artifact scores one row and fails on the second.
+    batch_dim = model.graph.input[0].type.tensor_type.shape.dim[0]
+    assert batch_dim.dim_param, "batch axis was frozen to a constant"
+
+
+@pytest.mark.integration
+def test_export_survives_a_console_that_cannot_encode_a_check_mark(tmp_path):
+    """A successful export must not be reported as a failure by its own logging.
+
+    The dynamo exporter prints U+2705 on success. On Windows the console is
+    cp1252, so encoding it raises `UnicodeEncodeError` *after the artifact is
+    already correct* — the export fails for a reason that has nothing to do with
+    the model. `verbose=False` is what suppresses it, and this test is what stops
+    someone removing that as noise.
+
+    Reproduced everywhere rather than only on Windows: the stream is what matters,
+    not the platform.
+    """
+    pytest.importorskip("onnxruntime", reason="the export extra is not installed")
+    import contextlib
+    import io
+
+    bundle = _train(tmp_path, "mlp")
+    inf = Inferencer.from_artifacts(bundle)
+    destination = tmp_path / "model.onnx"
+
+    cp1252 = io.TextIOWrapper(io.BytesIO(), encoding="cp1252", errors="strict")
+    with contextlib.redirect_stdout(cp1252):
+        get_backend(inf.backend_name).export(
+            inf.estimator, destination, "onnx", manifest=inf.manifest
+        )
+
+    assert destination.exists() and destination.stat().st_size > 0
+
+
+@pytest.mark.integration
 def test_torchscript_round_trips_through_torch(tmp_path):
     import torch
 

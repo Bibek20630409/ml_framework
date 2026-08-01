@@ -15,6 +15,7 @@ Tracks progress against [ml_framework_architecture_plan.md](../ml_framework_arch
 | P7 — NLP | **done** | `e06c299` |
 | P8 — Zero-config | **done** | `62672eb` |
 | P9 — Deployment polish | **done** | `1dc3a0c` |
+| P10 — Exporter migration | **partial** — ONNX done, TorchScript open | see below |
 
 ## Version
 
@@ -30,9 +31,9 @@ v1 *bundles* still load (`test_v1_bundle_compat.py`); v1 *configs* do not, and
 
 ## Test baseline
 
-**641 passed, 1 skipped** with every declared extra installed except DVC
+**643 passed, 1 skipped** with every declared extra installed except DVC
 (46/4 before P0 → 130/4 after P0 → 249/4 after P1 → 258/1 → 284/1 after P2 → 355/1 after P3 → 395/1 after P4 → 429/1 after P5 → 458/1 after P6 → 471/1 after the image-augmentation fix → 511/1 after P7 → 549/1 after the two NLP tasks → 555/1 after `mlf models` → 563/1 after the HF cache pin → 621/1 after P8 →
-**641/1** after P9). Every phase gate is measured against this number — a phase that ends
+641/1 after P9 → **643/1** after the P10 ONNX half). Every phase gate is measured against this number — a phase that ends
 with fewer passing tests than it started with has regressed something, regardless
 of what its own new tests say.
 
@@ -1210,3 +1211,62 @@ round-trips exactly (verified, dynamic batch intact). That makes it a
 user-visible format decision on `mlf export --format torchscript` rather than a
 code edit, which is why it is not being done as a P9 amendment: the warnings are
 noise today, not breakage, and P9's gates pass as committed.
+
+## P10 — the ONNX half — **done**
+
+Split deliberately. The ONNX migration is an internal swap with no user-visible
+surface; the TorchScript one changes what `mlf export --format torchscript`
+writes. Doing them together would have hidden a format decision inside a cleanup.
+
+- **`export` declares `onnxscript>=0.7`**, and `ONNX_REQUIREMENTS` checks it — so
+  a missing copy names the pip extra instead of failing from inside torch.
+- **`dynamo=True`** in `backends/lightning.py`. The pin it replaces was correct
+  when written and had no future.
+- **`ONNX_OPSET = 17` is unchanged and now asserted on the produced file.**
+
+### Gates met
+
+`test_the_exported_file_declares_the_opset_we_promised` reads `opset_import` off
+the artifact. The exporter builds at 18 and down-converts, warning that it "may
+not be successful" — for an MLP's `Gemm`/`Relu` it succeeds, but that is
+op-dependent, so the assertion is what stops a future op silently shipping an
+opset-18 file to a runtime promised 17. It also asserts the batch axis is a
+symbol rather than the width it was traced at.
+
+The P9 parity gate is untouched and still passes: 7 rows, `argmax` agreeing,
+inside the stated 1e-5.
+
+### Two corrections to the scoping commit above
+
+**The batch-size trap did not materialize, and no code changed for it.**
+`ccfa12b` predicted `ConstraintViolationError` from tracing at batch 1, because
+`torch.export` specializes 0 and 1 to constants. Measured: exporting at batch
+**1** and at batch **2** both produce `dim_param='batch'` and both score
+correctly at 1, 7 and 64 rows. The specialization applies to raw `torch.export`
+with `dynamic_shapes`; `torch.onnx.export(dynamo=True, dynamic_axes=…)` goes
+through a compat shim that handles it. So `example_input_shape` keeps returning
+a leading `1` — changing it would have been churn against a prediction that did
+not hold. **If the TorchScript half later moves to raw `torch.export`, the trap
+returns and the prediction becomes correct again.**
+
+**The real blocker was one nobody predicted, and it is platform-specific.** The
+dynamo exporter writes U+2705 to stdout on success. On Windows, where the console
+is cp1252, encoding it raises `UnicodeEncodeError` *from inside an otherwise
+successful export* — a correct artifact reported as a failure. `verbose=False`
+suppresses it. `test_export_survives_a_console_that_cannot_encode_a_check_mark`
+pins this by redirecting stdout through a strict cp1252 stream, so it reproduces
+on every platform rather than only where it bites; verified to fail without the
+flag. This is the same class of bug as the UTF-8 stdout fix in `utils/logging.py`,
+arriving through a dependency instead of our own logging.
+
+### What P10 still owes
+
+1. **`--format torchscript` still calls `torch.jit.trace`**, which is deprecated
+   and unsupported on Python 3.14+. Still a warning, not breakage. The decision it
+   needs is a product one — rename the format, keep the flag and write `.pt2`, or
+   drop it — not a code edit.
+2. **CI does not test the Python versions where this bites.** `requires-python`
+   says `>=3.10`; `ci.yml` runs 3.10–3.12. The `torch.jit` deprecation fires on
+   3.14, so CI stays green for a failure a user would hit. Either test 3.13+ or
+   cap the floor — this is why the problem was invisible until it was looked for.
+3. `skl2onnx` remains declared and unused (from P9).
