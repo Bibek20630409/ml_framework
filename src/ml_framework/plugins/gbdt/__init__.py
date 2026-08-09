@@ -38,6 +38,9 @@ BUILTINS: tuple[str, ...] = ("xgboost", "lightgbm", "catboost")
 #   native_categorical=True    → pandas `category` dtype passes through
 #   native_missing=True        → imputation is skipped; NaN is routed natively
 #   supports_sample_weight=True→ imbalance resolver prefers weights over SMOTE
+#   native_feature_importance=True → core.explain reads `feature_importances_`
+#       instead of paying for a permutation pass, and select's a-priori gate
+#       keeps trees eligible under a high `min_explainability`
 _TREE_CAPS: dict[str, object] = {
     "needs_scaling": False,
     "native_categorical": True,
@@ -45,6 +48,7 @@ _TREE_CAPS: dict[str, object] = {
     "supports_sample_weight": True,
     "produces_proba": True,
     "supports_pruning": True,
+    "native_feature_importance": True,
     "supports_gpu": True,
     "supports_mixed_precision": False,
     "supports_lr_range_test": False,

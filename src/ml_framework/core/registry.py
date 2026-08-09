@@ -25,10 +25,12 @@ The v1 class registry survives for one reason: ``load_from_checkpoint`` is a
 itself, not a build callable. A plugin registers both, one line apart.
 
 Who populates the v2 registries:
-  * ``plugins/__init__.py``     → :data:`MODELS` (mlp, cnn) + entry-point discovery
-  * ``data/builders.py``        → :data:`SOURCES` (tabular, image)
-  * ``backends/__init__.py``    → :data:`BACKENDS` (lightning), via a lazy factory
+  * ``plugins/__init__.py``      → :data:`MODELS` (mlp, cnn) + entry-point discovery
+  * ``data/builders.py``         → :data:`SOURCES` (tabular, image)
+  * ``backends/__init__.py``     → :data:`BACKENDS` (lightning), via a lazy factory
     so registering never imports torch
+  * ``data/backends/__init__.py``→ :data:`DATA_BACKENDS` (local, spark), same lazy
+    factory so registering never imports pyspark
 """
 
 from __future__ import annotations
@@ -38,6 +40,7 @@ from typing import Any, TypeVar
 
 from .plugins import (
     BackendSpec,
+    DataBackendSpec,
     IncompatibleCombinationError,
     ModelSpec,
     PluginRegistry,
@@ -131,6 +134,10 @@ def available_datamodules() -> list[str]:
 MODELS: PluginRegistry[ModelSpec] = PluginRegistry("model")
 BACKENDS: PluginRegistry[BackendSpec] = PluginRegistry("backend")
 SOURCES: PluginRegistry[SourceSpec] = PluginRegistry("source")
+# "data backend" with a space: `kind` is interpolated into prose, and the payoff
+# of this registry is the sentence `check_requirements` builds from it —
+# "data backend 'spark' requires pyspark>=3.5. Install it with: ..."
+DATA_BACKENDS: PluginRegistry[DataBackendSpec] = PluginRegistry("data backend")
 
 
 def register_model_spec(spec: ModelSpec, *, override: bool = False) -> ModelSpec:
@@ -148,6 +155,31 @@ def register_backend(spec: BackendSpec, *, override: bool = False) -> BackendSpe
 
 def register_source(spec: SourceSpec, *, override: bool = False) -> SourceSpec:
     return SOURCES.register(spec, override=override)
+
+
+def register_data_backend(spec: DataBackendSpec, *, override: bool = False) -> DataBackendSpec:
+    return DATA_BACKENDS.register(spec, override=override)
+
+
+def get_data_backend(name: str, **params: Any) -> Any:
+    """The instantiated :class:`DataBackend` for ``name``.
+
+    Populates :data:`DATA_BACKENDS` first, for the same reason :func:`get_backend`
+    does: registration is an import side effect, and the callers here —
+    ``read_table``, reached from ``pipeline/contracts.py`` and ``core.lit_data`` —
+    do not otherwise import the data backends package.
+
+    Availability is checked after, so a missing extra produces a pip command
+    rather than an ImportError from inside the factory.
+
+    ``params`` is ``data.backend_params`` verbatim. It is passed through
+    unvalidated on purpose: validating it here would mean this function knowing
+    every engine's knobs, which is the coupling the registry exists to remove.
+    The backend rejects what it does not recognize.
+    """
+    import ml_framework.data.backends  # noqa: F401  (registration side effect)
+
+    return DATA_BACKENDS.get(name).factory(**params)
 
 
 def get_backend(name: str) -> Any:

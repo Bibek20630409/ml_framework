@@ -74,7 +74,19 @@ export = ["onnx", "onnxruntime", "onnxscript>=0.7", "skl2onnx"]
 # unconditionally: relying on that is a hidden coupling, and it breaks exactly
 # where it matters most — a slim serving image built without the mlops extra.
 parquet = ["pyarrow>=10.0.1"]
+# The Polars data backend — a *peer* of `local`, never a replacement for it.
+# pandas stays the base dependency and the default engine, because
+# `read_table -> pd.DataFrame` is public API. `pyarrow` rides along because
+# Polars needs it for `to_pandas`, which is how this backend hands off to the
+# rest of the framework.
+fast = ["polars>=1.0", "pyarrow>=10.0.1"]
 diagnostics = ["torch-lr-finder>=0.2.1", "matplotlib>=3.7.0"]
+# Feature attribution beyond what the estimator and sklearn already provide.
+# Deliberately thin: `core/explain.py` reaches the `native` tier with no extra at
+# all (the tree libraries carry `feature_importances_`) and the `permutation`
+# tier with sklearn, which is a base dependency. This extra buys the middle tier
+# and nothing else, which is why nothing in the framework requires it.
+explain = ["shap>=0.44"]
 logging = ["wandb>=0.15.0"]
 # Production MLOps stack. (Airflow is installed separately with its own
 # constraints file / container — see orchestration/airflow — not pinned here.)

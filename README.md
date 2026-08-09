@@ -1,14 +1,14 @@
 # ML Framework
 
-Production-grade training + serving framework for **tabular**, **image** and
-**time-series** data. Supports binary/multi-class classification, regression and
-forecasting across neural networks (PyTorch Lightning), gradient-boosted trees
-(XGBoost, LightGBM, CatBoost) and statistical forecasters (Prophet, ARIMA,
-seasonal-naive) — driven end-to-end by a single validated YAML config and a
-`mlf` CLI.
+Production-grade training + serving framework for **tabular**, **image**, **text** and
+**time-series** data. Supports binary/multi-class classification, regression,
+forecasting, token classification and seq2seq across neural networks (PyTorch
+Lightning), transformers (HuggingFace), gradient-boosted trees (XGBoost, LightGBM,
+CatBoost) and statistical forecasters (Prophet, ARIMA, seasonal-naive) — driven
+end-to-end by a single validated YAML config and a `mlf` CLI.
 
 ```
-lr finder → HPO (Optuna) → train → serve (FastAPI)
+lr finder → select (compare families) → tune (Optuna) → train → serve (FastAPI)
 ```
 
 ## Install
@@ -31,8 +31,27 @@ immediately with the command that fixes it —
 model 'xgboost' requires xgboost>=2.0. Install it with: pip install 'ml-framework[gbdt]'
 ```
 
-Extras: `lightning`, `gbdt`, `image`, `serve`, `hpo`, `parquet`, `diagnostics`,
-`logging`, `mlops`, `security`, `monitoring`, `dev`.
+All 17 extras:
+
+| Extra | Brings | For |
+|---|---|---|
+| `lightning` | torch, pytorch-lightning, torchmetrics | `mlp`, `cnn`, `ts.lstm`, every `nlp.*` |
+| `image` | torchvision, Pillow | `cnn` and the image source — install *with* `lightning` |
+| `gbdt` | xgboost, lightgbm, catboost | the three tree families |
+| `timeseries` | statsmodels, prophet | `ts.arima`, `ts.prophet` |
+| `nlp` | transformers, tokenizers, datasets | `nlp.hf_text`, `nlp.hf_token`, `nlp.hf_seq2seq` |
+| `serve` | fastapi, uvicorn, prometheus instrumentator | `mlf serve` |
+| `security` | slowapi, gunicorn | rate limiting, `--workers N` |
+| `monitoring` | scipy, pandera | `/drift`, data contracts |
+| `hpo` | optuna, optuna-integration | `mlf tune`, and `mlf train`'s default search |
+| `explain` | shap | the middle attribution tier only — native and permutation need no extra |
+| `export` | onnx, onnxruntime, onnxscript, skl2onnx | `mlf export --format onnx` |
+| `parquet` | pyarrow | Parquet ingestion |
+| `fast` | polars, pyarrow | the Polars data backend |
+| `mlops` | mlflow, dvc[s3], pyspark | tracking, versioning, the Spark engine |
+| `diagnostics` | torch-lr-finder, matplotlib | `mlf lr` |
+| `logging` | wandb | `logging.backend: wandb` |
+| `dev` | every runtime + the toolchain | running the suite |
 
 > **torch + torchvision are a pair.** Every torchvision release pins one exact
 > torch patch, so install `[lightning,image]` together and from one index.
@@ -58,6 +77,7 @@ The long version, when you want the config under version control:
    mlf models --show       # plus tasks, data kinds and each model's own search space
    mlf models --all        # plus third-party plugins that failed to *import*
    mlf backends            # the three fit-loop shapes and what each consumes
+   mlf data-backends       # the three processing engines: local, polars, spark
    ```
 
    They deliberately list models whose optional extra is **missing**, each with the
@@ -88,18 +108,25 @@ The long version, when you want the config under version control:
    mlf tune  -c configs/example_gbdt.yaml --emit-config configs/tuned.yaml   # search only
    ```
 
-5. **Serve**:
+5. **Compare model families** — score, latency, size and explainability, not
+   score alone:
+   ```bash
+   mlf select -c configs/example_selection.yaml --max-latency-ms 20   # compare only
+   mlf train  -c configs/example_selection.yaml --select              # compare, then train the winner
+   ```
+
+6. **Serve** — `sample.csv` has six features, so an instance is six numbers:
    ```bash
    mlf serve --artifacts outputs --port 8000
    curl -X POST localhost:8000/predict -H 'Content-Type: application/json' \
-        -d '{"instances": [[0.1, 0.2, 0.3, 0.4]]}'
+        -d '{"instances": [[0.1, 0.2, 0.3, 0.4, 0.5, 0.6]]}'
    ```
 
 ### Config schema v2
 
 The config is organized by *ownership*: fixed blocks for what the framework owns
-(`task`, `runtime`, `data`, `fit`, `tune`, `logging`) and free-form `params`
-sub-dicts for what a plugin owns.
+(`task`, `runtime`, `data`, `fit`, `tune`, `select`, `logging`) and free-form
+`params` sub-dicts for what a plugin owns.
 
 | block | holds | validated by |
 |---|---|---|
@@ -109,6 +136,8 @@ sub-dicts for what a plugin owns.
 | `model.params` | architecture knobs (hidden_dims, backbone…) | the model plugin |
 | `fit` | budget, patience, batch_size | the schema |
 | `fit.params` | loop knobs (lr, weight_decay, LR schedule, clipping) | the backend |
+| `tune` | search budget, objective, overrides | the schema |
+| `select` | candidate pool, constraints, decision rule | the schema |
 
 `params` blocks are free-form in core and **strict** in the plugin — each ships a
 frozen `extra="forbid"` schema, so a typo is still an error at config-load time,
@@ -133,19 +162,32 @@ src/ml_framework/
 │   ├── plugins.py       PluginRegistry, ModelSpec/BackendSpec/SourceSpec
 │   ├── task.py          TaskSpec table: metric, direction, monitor, postprocess
 │   ├── bundle.py        artifact bundle v2 + manifest.json
+│   ├── metrics.py       array-based per-task metrics (numpy/sklearn only)
 │   ├── lit_model.py     BaseModel: steps, metrics, loss, optimizer
 │   ├── evaluate.py      report.txt · predictions.csv · confusion_matrix.txt
-│   ├── inference.py     Inferencer.from_artifacts(dir)
-│   └── registry.py      MODELS / BACKENDS / SOURCES
+│   ├── baseline.py      the trivial predictor every chosen-model run is scored against
+│   ├── profile.py       latency (warmed p50/p95/p99) · artifact bytes · fit seconds
+│   ├── explain.py       attribution tiers: native 1.0 → shap 0.8 → permutation 0.5
+│   ├── export.py        ONNX · TorchScript · native · pickle
+│   ├── inference.py     Inferencer.from_artifacts(dir) — imports no torch
+│   └── registry.py      MODELS / BACKENDS / SOURCES / DATA_BACKENDS
 ├── backends/            one per fit-loop shape — lightning.py owns pl.Trainer
-├── plugins/             mlp · cnn · gbdt/ (xgboost…) · ts/ (naive…) · nlp/ (hf_text)
-├── data/                sources · preprocess · splitters · lightning_adapter
-├── pipeline/            train · tune · lr_finder
+├── plugins/             mlp · cnn · gbdt/ (xgboost…) · ts/ (naive…) · nlp/ (hf_text, hf_token, hf_seq2seq)
+├── data/
+│   ├── backends/        the processing engine: local (pandas) · polars · spark
+│   ├── sources/         tabular · image · text · timeseries
+│   ├── preprocess/      scaling, imbalance, tokenizers, windows
+│   ├── splitters.py     random · temporal · group · rolling-origin · purged · CPCV
+│   └── sniff.py         data-kind / target / task detection
+├── pipeline/            train · select · tune · lr_finder · spark_preprocess · contracts
+├── monitoring/          drift.py (PSI/KS) · model_quality.py (delayed labels)
 ├── serving/api.py       FastAPI: /health /predict /predict_proba
+│                        /predict_with_confidence /drift /metrics
 ├── utils/               logging, seed, platform-aware workers
 └── cli.py               `mlf` entry point
-configs/                 example_tabular · example_gbdt · example_image · example_timeseries · example_text · example_ner · example_seq2seq
-tests/                   unit · integration · serving · backends · data
+configs/                 example_tabular · example_gbdt · example_selection · example_image · example_timeseries · example_text · example_ner · example_seq2seq · dvc_tabular
+benchmarks/              data_backends.py — pandas vs polars, measured not asserted
+tests/                   unit · integration · serving · backends · data · pipeline · load
 ```
 
 ## Extending (scalability)
@@ -200,7 +242,9 @@ way with `SourceSpec`.
 - Metrics + CSV/WandB logging; final report, predictions, confusion matrix
 - Self-contained artifact bundle v2: `manifest.json` (the only file a loader must
   understand) · `config.json` · `model/` · `preprocessor/` · `metrics.json` ·
-  `report.txt` · `predictions.csv` · `hpo.json` (and `cv.json` when cross-validating)
+  `report.txt` · `predictions.csv` · `confusion_matrix.txt` · `reference_stats.json`
+  (the drift baseline) · `hpo.json` — plus `cv.json` when cross-validating and
+  `selection.json` after a bake-off
 
 ## Task reference
 
@@ -247,6 +291,54 @@ on `manifest.model.backend`, so nothing in the serving path imports a checkpoint
 loader; `docker build --target serve-gbdt` is roughly 500 MB lighter than the
 deep-learning image, with a cold start to match.
 
+## Data backends
+
+A **training backend** owns the fit loop; a **data backend** owns how the table is read
+and reduced. They are different axes, and the engine is a per-run choice:
+
+```bash
+mlf data-backends              # every engine, its extra, and whether it is ready
+mlf data-backends --show       # plus what each one can and cannot do
+mlf train -c configs/example_gbdt.yaml --data-backend polars
+```
+
+```yaml
+data:
+  backend: polars    # local (default) | polars | spark
+```
+
+| engine | extra | reach for it when |
+|---|---|---|
+| `local` | **none** | The default. pandas — `read_table -> pd.DataFrame` is public API |
+| `polars` | `[fast]` | The run is parse-bound: a wide or long CSV read repeatedly |
+| `spark` | `[mlops]` + a JVM | The table does not fit on one machine |
+
+`--data-backend` applies to `train`, `lr`, `tune` and `select`.
+
+`local` is the only engine with no `requires`, which is what makes "a bare install
+trains" unconditional rather than dependent on an extra. Registering the other two costs
+a bare install nothing — neither imports its runtime until selected, and CI asserts
+exactly that: after listing all three, `pyspark` and `polars` are absent from
+`sys.modules`.
+
+**A data backend changes how the table is read, not what the model learns.** The same
+config on `local` and `polars` produces the same splits, the same scaler and the same
+score — pinned by a cross-engine equality test rather than asserted here.
+
+Two limits worth knowing before you reach for one:
+
+- **Only `tabular` is backend-aware.** Image, text and timeseries read through pandas,
+  and a non-local engine is refused **by name** rather than silently ignored.
+- **This is not distributed training.** The Spark engine prepares the data; the fit loop
+  still runs in one process.
+
+See **[choose.md](choose.md)** for why Polars was gated on a measurement rather than
+adopted on reputation, and `benchmarks/data_backends.py` for the measurement:
+
+```bash
+make benchmark        # parse CSV, parse Parquet, and full build_bundle, pandas vs polars
+```
+
 ## Tuning
 
 `mlf train` searches before it fits. The budget is **per backend**, because a
@@ -271,10 +363,85 @@ tune:
   max_trials: 50
   metric: null            # null → the task's primary metric
   refit: best             # best = retrain at full budget | reuse = keep the trial model
+  objective: holdout      # holdout | cv — score a trial across inner folds
+  cv_folds: 3             # inner folds for objective: cv
+  n_jobs: 1               # concurrent trials (threads)
   overrides:
     model.params.max_depth: {type: int, low: 3, high: 8}
     fit.params.learning_rate: {type: float, low: 0.05, high: 0.2, log: true}
     fit.params.subsample: 0.9        # a bare value pins it
+```
+
+## Model selection
+
+`mlf train` tunes **one** model. `mlf select` compares model *families* — tuning
+each on its own space, cross-validating it, and measuring the four things a score
+does not tell you.
+
+```bash
+mlf select --config configs/mine.yaml --max-latency-ms 20 --max-workers 4
+```
+
+```
+model                  score     +/-   p95 ms      MB  expl  status
+-------------------------------------------------------------------
+catboost              0.9025  0.0326   1.2235  0.1019  1.00  WINNER
+lightgbm              0.8750  0.0179   2.5612  0.1980  1.00  ok
+xgboost               0.8724  0.0187   1.3515  0.1747  1.00  ok
+mlp                   0.8700  0.0144  24.0520  1.5621  0.50  rejected: p95 latency 24.05 ms exceeds the 20 ms budget
+```
+
+Five criteria, all measured in the same run under identical conditions:
+**predictive performance** (CV mean ± spread), **inference latency** (warmed
+p50/p95/p99 at batch size 1), **memory & compute cost** (serialized artifact
+bytes), **explainability** (native importances 1.0 → SHAP 0.8 → permutation 0.5
+→ none 0.0), and **maintainability** (fit wall-clock, fold stability, fold
+failures).
+
+The default rule is *take the simplest model that is not measurably worse than
+the best one*: hard constraints disqualify, then the top score wins unless
+something within one standard error of it is cheaper — latency first, then size,
+then explainability, then stability. It never trades a real accuracy difference
+for speed, and it names the axis that decided:
+
+```
+winner: xgboost — xgboost scores 0.8724 against lightgbm's 0.8750 — within the
+0.0103 tolerance (std error of the CV mean) — and wins the tie-break on
+p95 latency (1.59 ms vs 5.78 ms)
+```
+
+`mlf train --select` does the comparison and then trains the winner; the bundle's
+`manifest.selection` carries the whole table, so a served model can answer "why
+this family?" without the training directory.
+
+Off by default — a bake-off costs one tuning budget per candidate. See
+**[docs/MODEL_SELECTION.md](docs/MODEL_SELECTION.md)** for the configuration
+reference, the CV strategy table (stratified · k-fold · walk-forward · purged ·
+CPCV), the parallelism options, and the worked examples.
+
+## Cross-validation
+
+`data.split.folds >= 2` cross-validates; `data.split.cv_strategy` decides how the
+folds are cut. Using the wrong one does not raise — it reports a *better* score,
+which is why the choice has its own config key rather than being inferred from
+the model.
+
+| `cv_strategy` | For | Guards against |
+|---|---|---|
+| `auto` *(default)* | Anything | Resolves from data kind, task and purge settings |
+| `stratified` | Tabular classification | Imbalanced folds, high evaluation variance |
+| `kfold` | Regression | Stratifying a continuous target |
+| `rolling_origin` | Time series | Training on the future |
+| `purged` | Overlapping labels | Training on the test set's own observations |
+| `cpcv` | Backtests needing a distribution | Judging on one arrangement |
+
+```yaml
+data:
+  split:
+    folds: 5
+    cv_strategy: purged
+    label_horizon: 10     # a row's label is computed from the next 10 rows
+    embargo: 0.01         # drop a further 1% of rows after each test block
 ```
 
 ## Deep-learning knobs
@@ -353,14 +520,24 @@ See **[docs/MLOPS.md](docs/MLOPS.md)** for the architecture and per-component gu
 ## Development
 
 ```bash
-make install   # editable install with dev extras
-make lint      # ruff + black --check
-make type      # mypy
-make test      # pytest
-make cov       # pytest with coverage
+make install       # editable install with every extra the suite needs
+make install-mlops # + mlflow, dvc, pyspark (heavy; Spark tests also need a JVM)
+make format        # black + isort
+make lint          # ruff + black --check
+make type          # mypy
+make test          # pytest
+make cov           # pytest with coverage (fails under 80%)
+make clean         # drop outputs/, caches, build artifacts
 ```
 
-CI runs lint + type-check + tests on Python 3.10–3.12. Licensed MIT.
+Demo and ops targets: `make train`, `select`, `serve`, `benchmark`, `docker-serve`,
+`stack-up` / `stack-down`, `dvc-repro`, `k8s-validate`, `k8s-deploy`, `airflow-up`.
+
+CI runs lint + type-check + tests on Python **3.10–3.14** at a coverage floor of 80%,
+plus three jobs the matrix cannot cover: `gbdt-no-torch` (a tree bundle trains and
+serves with no deep-learning stack present), `spark-contract` (the Spark engine against
+a real JVM, refusing to pass by skipping) and `mlops-validate` (manifests render,
+every YAML parses). Licensed MIT.
 
 ## Forecasting
 

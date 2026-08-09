@@ -29,6 +29,14 @@ any of it.
 **Nothing here imports an Optuna integration package.** Pruning is per-backend,
 reached through ``backend.trial_hooks(trial)``; this module knows only that hooks
 exist.
+
+``tune.objective`` chooses what a trial is scored on. ``holdout`` (the default)
+fits once against the validation split. ``cv`` averages the objective over
+``tune.cv_folds`` inner folds, cut by the same ``data.split.cv_strategy`` the
+outer estimate uses — which is what makes "hyperparameters and model chosen
+jointly, on cross-validation" true rather than aspirational. It costs k times as
+much per trial, so it is opt-in; :mod:`ml_framework.pipeline.select` turns it on
+when a bake-off needs candidates compared on a number that is not one lucky split.
 """
 
 from __future__ import annotations
@@ -39,6 +47,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+import numpy as np
 
 from ..backends.base import resolve_budget
 from ..config import ExperimentConfig
@@ -269,15 +279,25 @@ def tune(
 
     budget = resolve_tune_budget(config, backend_name)
     log.info(
-        "tuning %s/%s on '%s' (%s): %d trials, %.0fs budget, %d parameters",
+        "tuning %s/%s on '%s' (%s, %s): %d trials, %.0fs budget, %d parameters, n_jobs=%d",
         spec.name,
         backend_name,
         metric,
         direction,
+        (f"{config.tune.cv_folds}-fold cv" if config.tune.objective == "cv" else "holdout"),
         budget.max_trials,
         budget.max_seconds,
         len(space),
+        config.tune.n_jobs,
     )
+    if config.tune.objective == "cv" and config.tune.refit == "reuse":
+        # `reuse` keeps a fitted estimator from the winning trial, but under a CV
+        # objective that estimator is the *last inner fold's* — trained on a
+        # fraction of the data and scored on a number it did not produce alone.
+        log.warning(
+            "tune.refit='reuse' with objective='cv' keeps the last inner fold's model, "
+            "which was trained on a subset. Use refit='best' to refit on all of it."
+        )
 
     out = Path(output_dir or config.runtime.output_dir)
     cache = _BundleCache(bundle_factory)
@@ -295,29 +315,45 @@ def tune(
     def objective(trial: Any) -> float:
         values = _suggest(trial, space, spec, config)
         trial_cfg = config.with_overrides(values)
-        bundle = cache.get(trial_cfg)
-        run = RunContext(
-            output_dir=out / "trials" / f"trial_{trial.number}",
-            seed=config.runtime.seed,
-            budget=trial_budget,
-            accelerator=config.runtime.accelerator,
-            devices=config.runtime.devices,
-            precision=config.runtime.precision,
-            deterministic=config.runtime.deterministic,
-            trial=trial,
-        )
-        result = backend.fit(spec, bundle, trial_cfg, run=run)
-        value = result.metric(metric)
+        run_dir = out / "trials" / f"trial_{trial.number}"
+
+        if config.tune.objective == "cv":
+            value, estimator, reported = _cv_objective(
+                trial_cfg,
+                spec=spec,
+                backend=backend,
+                metric=metric,
+                budget=trial_budget,
+                run_dir=run_dir,
+                trial=trial,
+            )
+        else:
+            bundle = cache.get(trial_cfg)
+            run = RunContext(
+                output_dir=run_dir,
+                seed=config.runtime.seed,
+                budget=trial_budget,
+                accelerator=config.runtime.accelerator,
+                devices=config.runtime.devices,
+                precision=config.runtime.precision,
+                deterministic=config.runtime.deterministic,
+                trial=trial,
+            )
+            result = backend.fit(spec, bundle, trial_cfg, run=run)
+            value = result.metric(metric)
+            estimator = result.estimator
+            reported = dict(result.val_metrics)
+
         if value is None:
             raise TuningError(
                 f"backend '{backend_name}' did not report '{metric}'. "
-                f"It reported: {sorted(result.val_metrics)}. "
+                f"It reported: {sorted(reported)}. "
                 f"Set tune.metric to one of those, or fix the backend."
             )
         trial.set_user_attr("values", values)
-        trial.set_user_attr("metrics", dict(result.val_metrics))
+        trial.set_user_attr("metrics", reported)
         if config.tune.refit == "reuse":
-            cache.keep_estimator(trial.number, result.estimator)
+            cache.keep_estimator(trial.number, estimator)
         records.append(
             {"number": trial.number, "value": value, "params": values, "state": "COMPLETE"}
         )
@@ -327,7 +363,12 @@ def tune(
     # No `catch=`: Optuna already marks a `TrialPruned` trial PRUNED and moves on,
     # and swallowing anything else would turn a genuine bug into a quietly worse
     # model. A trial that raises should stop the study and say why.
-    study.optimize(objective, n_trials=budget.max_trials, timeout=budget.max_seconds)
+    study.optimize(
+        objective,
+        n_trials=budget.max_trials,
+        timeout=budget.max_seconds,
+        n_jobs=config.tune.n_jobs,
+    )
     elapsed = time.perf_counter() - started
 
     completed = [t for t in study.trials if t.state.name == "COMPLETE"]
@@ -387,6 +428,90 @@ def _skipped(
     return TuneResult(
         config=config, metric=metric, direction=direction, skipped=reason, elapsed=elapsed
     )
+
+
+def _cv_objective(
+    config: ExperimentConfig,
+    *,
+    spec: Any,
+    backend: Any,
+    metric: str,
+    budget: Budget,
+    run_dir: Path,
+    trial: Any,
+) -> tuple[float | None, Any, dict[str, float]]:
+    """One trial's value as the **mean across inner folds**.
+
+    ``tune.objective: cv`` exists because a holdout objective selects
+    hyperparameters that suit one particular validation split. With 30 trials
+    against a small validation set, the winner is partly the configuration that
+    got lucky on those rows, and the tuned model then underperforms its own
+    reported number. Averaging over folds removes most of that.
+
+    Pruning is deliberately **not** wired into the inner loop. A pruner comparing
+    partial fold means across trials would prune on a quantity that means
+    different things at different fold counts; the outer study still prunes on
+    the returned value.
+
+    Returns ``(value, last_estimator, metrics)``. The estimator is the last
+    fold's, kept only so ``tune.refit: reuse`` has something to hand back — and
+    it is the *wrong* thing to reuse under a CV objective, which is why
+    ``refit: best`` is the default and the mismatch is logged.
+    """
+    from ..core.task import get_task_spec
+    from ..data.builders import build_cv_bundles
+
+    folds = config.data.split.folds
+    inner = config.tune.cv_folds
+    # The inner loop must not reuse the outer fold count: with `folds: 5` on the
+    # data block and `cv_folds: 3` on the tune block, a nested search is 3 fits
+    # per trial and 5 at the end, which is the honest arrangement.
+    cv_config = config.with_overrides({"data.split.folds": inner})
+    task_spec = get_task_spec(config.task)
+
+    values: list[float] = []
+    metrics: dict[str, float] = {}
+    estimator: Any = None
+    for i, fold in enumerate(build_cv_bundles(cv_config)):
+        run = RunContext(
+            output_dir=run_dir / f"fold_{i}",
+            seed=config.runtime.seed,
+            budget=budget,
+            accelerator=config.runtime.accelerator,
+            devices=config.runtime.devices,
+            precision=config.runtime.precision,
+            deterministic=config.runtime.deterministic,
+        )
+        result = backend.fit(spec, fold, cv_config, run=run)
+        estimator = result.estimator
+        value = result.metric(metric)
+        if value is None:
+            # Fall back to scoring the fold's own test split. A backend whose
+            # val_metrics do not carry the objective can still be cross-validated,
+            # and refusing here would make the CV objective backend-specific.
+            predictions = backend.predict_split(result.estimator, fold, "test")
+            scores = task_spec.compute(predictions.y_true, predictions.y_pred, predictions.y_prob)
+            metrics = {str(k): float(v) for k, v in scores.items()}
+            value = scores.get(metric)
+        else:
+            metrics = dict(result.val_metrics)
+        if value is None or not np.isfinite(value):
+            log.debug("inner fold %d produced no usable '%s' — skipping it", i, metric)
+            continue
+        values.append(float(value))
+
+    if not values:
+        return None, estimator, metrics
+
+    mean = float(sum(values) / len(values))
+    trial.set_user_attr("cv_values", values)
+    trial.set_user_attr("cv_folds", len(values))
+    # Restore the caller's view: `metrics` should describe the trial, and the
+    # mean is what the trial scored.
+    metrics = {**metrics, metric: mean, f"cv_{metric}_mean": mean}
+    if folds and folds != inner:
+        log.debug("nested CV: %d inner folds per trial, %d outer folds at the end", inner, folds)
+    return mean, estimator, metrics
 
 
 def _suggest(

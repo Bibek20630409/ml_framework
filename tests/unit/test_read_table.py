@@ -5,7 +5,11 @@ import pytest
 from ml_framework.core import read_table
 from ml_framework.core.plugins import MissingExtraError
 from ml_framework.core.types import Requirement
-from ml_framework.data.sources import tabular
+
+# The parquet guard is patched on the module that *reads* it. `read_table` is now
+# a shim over the selected data backend, and the requirement moved to the local
+# backend with the pandas read it guards; `tabular` only re-exports the name.
+from ml_framework.data.backends import local
 
 
 @pytest.mark.unit
@@ -50,7 +54,7 @@ def test_missing_parquet_engine_names_the_extra_not_a_pandas_import_error(monkey
     should get the pip command, not `ImportError: Unable to find a usable engine`.
     """
     monkeypatch.setattr(
-        tabular,
+        local,
         "PARQUET_REQUIREMENT",
         Requirement("definitely_not_pyarrow_xyz", extra="parquet", min_version="10.0.1"),
     )
@@ -64,7 +68,7 @@ def test_csv_reading_never_consults_the_parquet_engine(monkeypatch, tmp_path):
     """The guard must gate only the parquet branch — a CSV-only install stays free
     of pyarrow entirely."""
     monkeypatch.setattr(
-        tabular,
+        local,
         "PARQUET_REQUIREMENT",
         Requirement("definitely_not_pyarrow_xyz", extra="parquet"),
     )

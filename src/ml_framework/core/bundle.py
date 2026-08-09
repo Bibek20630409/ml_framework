@@ -166,6 +166,11 @@ class Manifest(PydanticModel):
     requires: list[RequirementRef] = Field(default_factory=list)
     metrics: dict[str, float] = Field(default_factory=dict)
     hpo: dict[str, Any] | None = None
+    # The bake-off this model won, when one ran: every candidate's score, latency,
+    # size and explainability, plus the rule that picked between them. `None` when
+    # the model was named rather than chosen — which is the common case, and is
+    # why this is nullable rather than an empty dict.
+    selection: dict[str, Any] | None = None
 
     def requirements(self) -> tuple[Requirement, ...]:
         return tuple(r.to_requirement() for r in self.requires)

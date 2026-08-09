@@ -31,6 +31,7 @@ config depend on the data package being importable first.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterator
 from typing import TYPE_CHECKING, Any
 
@@ -41,7 +42,7 @@ from .. import plugins as _plugins  # noqa: F401
 from ..core.plugins import SourceSpec
 from ..core.protocols import BuildContext
 from ..core.registry import MODELS, register_source
-from ..core.types import Requirement
+from ..core.types import FrameworkError, Requirement
 from .sources import (
     build_image_bundle,
     build_tabular_bundle,
@@ -52,6 +53,8 @@ from .types import DataBundle
 
 if TYPE_CHECKING:
     from ..config import ExperimentConfig
+
+log = logging.getLogger(__name__)
 
 _BUNDLE_BUILDERS = {
     "tabular": build_tabular_bundle,
@@ -71,6 +74,23 @@ _CV_BUILDERS = {
 }
 
 
+# The data kinds whose source honours `data.backend`. A kind absent from this
+# table reads through pandas regardless, so selecting a distributed engine for it
+# would be a promise the source does not keep — `_check_backend_supported` refuses
+# by name instead, the same way `build_cv_bundles` refuses an unfoldable kind.
+_BACKEND_AWARE_KINDS = frozenset({"tabular"})
+
+
+def _check_backend_supported(config: ExperimentConfig) -> None:
+    backend = config.data.backend
+    if backend != "local" and config.data.kind not in _BACKEND_AWARE_KINDS:
+        raise FrameworkError(
+            f"data.backend '{backend}' is implemented for "
+            f"{sorted(_BACKEND_AWARE_KINDS)} data; got kind '{config.data.kind}'. "
+            f"Use data.backend: local."
+        )
+
+
 def build_bundle(config: ExperimentConfig) -> DataBundle:
     """Materialize the configured data source as a :class:`DataBundle`.
 
@@ -79,6 +99,7 @@ def build_bundle(config: ExperimentConfig) -> DataBundle:
     """
     from ..core.registry import SOURCES
 
+    _check_backend_supported(config)
     if config.data.kind in SOURCES:
         spec = SOURCES.get(config.data.kind)
         return spec.build(config)
@@ -103,40 +124,168 @@ def build_cv_bundles(config: ExperimentConfig) -> Iterator[DataBundle]:
     held-out slice of the training folder, and the final bundle's ``test_acc``
     still comes from ``test_dir`` — two numbers answering different questions.
     """
-    from .splitters import CrossValidationSplitter, RollingOriginSplitter
-
     kind = config.data.kind
     if kind not in _CV_BUILDERS:
         raise NotImplementedError(
             f"cross-validation is implemented for {sorted(_CV_BUILDERS)}; got '{kind}'. "
             f"Set data.split.folds to 0 for a single holdout split."
         )
+    # Also checked here, not only in `build_bundle`: the CV path calls the source
+    # builders directly, so a fold would otherwise slip past the refusal that the
+    # single-holdout path enforces.
+    _check_backend_supported(config)
+
+    build = _CV_BUILDERS[kind]
+    for indices in cv_folds(config):
+        yield build(config, indices=indices)
+
+
+def cv_folds(config: ExperimentConfig, *, folds: int | None = None) -> list[Any]:
+    """The cross-validation partitions for ``config``, as a list of index sets.
+
+    Split out from :func:`build_cv_bundles` because the inner loop of a
+    CV-objective hyperparameter search needs the *partitions* without paying to
+    materialize a bundle per fold up front, and because a partition is the thing
+    worth testing directly.
+
+    ``folds`` overrides ``data.split.folds`` so the inner folds of a nested search
+    (``tune.cv_folds``) can differ from the outer estimate, which is the whole
+    point of nesting them.
+    """
+    from .splitters import (
+        CombinatorialPurgedSplitter,
+        CrossValidationSplitter,
+        PurgedKFoldSplitter,
+        RollingOriginSplitter,
+    )
 
     split_cfg = config.data.split
-    build = _CV_BUILDERS[kind]
+    kind = config.data.kind
+    k = split_cfg.folds if folds is None else folds
     n, labels = _cv_population(config)
+    strategy = split_cfg.resolved_cv_strategy(kind, config.task)
 
-    if kind == "timeseries" or split_cfg.resolved_strategy(kind) == "temporal":
+    if strategy == "rolling_origin":
         # **Not** k-fold. Shuffled folds put future rows in training and past rows
         # in test, which is the leakage the config validator refuses elsewhere;
         # doing it here under the name "cross-validation" would be the same bug
         # wearing a different hat.
-        folds = RollingOriginSplitter(
-            folds=split_cfg.folds,
+        return RollingOriginSplitter(
+            folds=k,
             horizon=split_cfg.horizon,
             gap=split_cfg.gap,
             expanding=split_cfg.expanding,
         ).split(n)
-    else:
-        folds = CrossValidationSplitter(
-            folds=split_cfg.folds,
-            seed=config.runtime.seed,
-            task=config.task,
-            val_size=split_cfg.val_size,
-        ).split(n, y=labels)
 
-    for indices in folds:
-        yield build(config, indices=indices)
+    if strategy == "purged":
+        ends, times = _label_columns(config, n)
+        return PurgedKFoldSplitter(
+            folds=k,
+            embargo=split_cfg.embargo,
+            label_horizon=split_cfg.label_horizon,
+            val_size=split_cfg.val_size,
+        ).split(n, y=labels, label_end=ends, time=times)
+
+    if strategy == "cpcv":
+        # `folds` is not a fold count here — CPCV's count is C(groups, test_groups).
+        # Saying so beats silently ignoring the number the user set.
+        if folds is not None and folds != split_cfg.cpcv_groups:
+            log.info(
+                "cv_strategy=cpcv: fold count comes from cpcv_groups/cpcv_test_groups, "
+                "not from folds=%d",
+                folds,
+            )
+        ends, times = _label_columns(config, n)
+        return CombinatorialPurgedSplitter(
+            groups=split_cfg.cpcv_groups,
+            test_groups=split_cfg.cpcv_test_groups,
+            embargo=split_cfg.embargo,
+            label_horizon=split_cfg.label_horizon,
+            val_size=split_cfg.val_size,
+            max_folds=split_cfg.cpcv_max_folds,
+        ).split(n, y=labels, label_end=ends, time=times)
+
+    # `stratified` and `kfold` are one splitter: it already picks between
+    # StratifiedKFold and KFold from the task, and stratifying a continuous
+    # target is what crashed the original framework. An explicit `stratified` on
+    # a regression task is therefore a request the splitter must refuse rather
+    # than quietly honour.
+    if strategy == "stratified" and config.task not in ("binary", "multiclass"):
+        raise ValueError(
+            f"cv_strategy 'stratified' needs one class label per row, and task "
+            f"'{config.task}' has none. Use cv_strategy: kfold."
+        )
+    return CrossValidationSplitter(
+        folds=k,
+        seed=config.runtime.seed,
+        # `kfold` forces the unstratified branch even for a classification task,
+        # which is how you ask for it.
+        task=config.task if strategy == "stratified" else "regression",
+        val_size=split_cfg.val_size,
+    ).split(n, y=labels)
+
+
+def _label_columns(config: ExperimentConfig, n: int) -> tuple[Any, Any]:
+    """``(label_end, observation_times)``, or ``(None, None)`` when not configured.
+
+    Read straight off the source table rather than off the bundle: both columns
+    are metadata about *when* a row was observed and when its label became known,
+    not features, and threading them through preprocessing would put them in the
+    model's input matrix.
+
+    Both are returned together because neither is usable alone —
+    :func:`~ml_framework.data.splitters.label_spans` needs the observation times
+    to place a label end time on a row, and returning them from one function is
+    what stops a caller from supplying half the pair.
+
+    Rows are sorted by ``time_col`` here, matching what the temporal sources do,
+    so the positions the splitter computes line up with the rows it is splitting.
+    """
+    split_cfg = config.data.split
+    col = split_cfg.label_end_col
+    if col is None:
+        return None, None
+    if config.data.kind not in ("tabular", "timeseries"):
+        raise ValueError(
+            f"split.label_end_col is only readable for tabular/timeseries data; "
+            f"got kind '{config.data.kind}'. Use split.label_horizon instead."
+        )
+    if not split_cfg.time_col:
+        raise ValueError(
+            "split.label_end_col needs split.time_col: a label end *time* can only be "
+            "mapped onto a row position if the rows' own observation times are known. "
+            "Set time_col, or state the span in rows with split.label_horizon."
+        )
+
+    from .backends import engine_for
+
+    engine = engine_for(config)
+    table = engine.read_table(str(config.data.path))
+
+    # Both checks run against the *schema and row count*, before anything is
+    # collected: under `spark` a mistyped column name should cost a metadata
+    # lookup, not a full materialization that then fails.
+    available = engine.columns(table)
+    for name in (col, split_cfg.time_col):
+        if name not in available:
+            raise ValueError(
+                f"split column '{name}' is not in {config.data.path}. "
+                f"Columns: {sorted(available)[:20]}"
+            )
+    rows = engine.n_rows(table)
+    if rows != n:
+        raise ValueError(f"'{col}' has {rows} rows for {n} data rows")
+
+    # Project first, then collect **once**. Two `engine.column` calls would be two
+    # collects, and these two arrays have to line up row-for-row — `label_spans`
+    # pairs each label-end time with the observation time on the same row. A
+    # distributed engine re-executing a sorted plan twice need not agree on row
+    # order (pyspark documents `monotonically_increasing_id`, which `sort_by`
+    # leans on, as non-deterministic), so a second collect could silently pair the
+    # wrong two values. One materialization, sliced locally, cannot.
+    ordered = engine.select(engine.sort_by(table, split_cfg.time_col), [col, split_cfg.time_col])
+    frame = engine.to_pandas(ordered)
+    return frame[col].to_numpy(), frame[split_cfg.time_col].to_numpy()
 
 
 def _cv_population(config: ExperimentConfig) -> tuple[int, Any]:
@@ -147,8 +296,8 @@ def _cv_population(config: ExperimentConfig) -> tuple[int, Any]:
     pixels. Keeping that difference here rather than in ``build_cv_bundles`` is
     what stops the folding logic from growing a per-kind branch.
     """
+    from .backends import engine_for
     from .sources.image import train_labels
-    from .sources.tabular import read_table
     from .sources.text import text_labels
 
     if config.data.kind == "image":
@@ -162,11 +311,18 @@ def _cv_population(config: ExperimentConfig) -> tuple[int, Any]:
         labels = text_labels(config)
         return len(labels), labels
 
-    frame = read_table(str(config.data.path))
-    labels = frame[config.data.target].to_numpy()
-    if config.task != "regression":
-        labels = labels.astype("int64")
-    return len(frame), labels
+    # The one place a distributed engine genuinely earns its keep: planning folds
+    # needs a row count and one label column, and neither requires the feature
+    # matrix. Under `spark` this is a `count()` plus a one-column collect, so a
+    # table far too large for the driver can still have its folds cut.
+    #
+    # `column` rather than a `to_pandas` slice because the labels stand alone here
+    # — the row count is checked against the bundle separately, so there is no
+    # second array that has to come out of the same materialization.
+    engine = engine_for(config)
+    table = engine.read_table(str(config.data.path))
+    dtype = None if config.task == "regression" else "int64"
+    return engine.n_rows(table), engine.column(table, config.data.target, dtype=dtype)
 
 
 def build_datamodule(config: ExperimentConfig) -> Any:

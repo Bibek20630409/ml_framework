@@ -1,0 +1,111 @@
+# ── Example model-selection config (schema v2) ───────────────────────
+# Compare model families, then train the winner:
+#
+#     mlf select --config configs/example_selection.yaml    # compare only
+#     mlf train  --config configs/example_selection.yaml    # compare, then train
+#
+# Needs the gbdt and hpo extras:  pip install -e '.[gbdt,hpo]'
+# The `lightning` extra adds the MLP to the pool; without it the bake-off is
+# trees only, and `mlf models` says so with the pip line that widens it.
+#
+# Compare this with example_gbdt.yaml: same task, same data, same blocks. The
+# difference is that `model.name` is now a *starting point* rather than the
+# decision — the `select` block turns it into a comparison, and the winner is
+# refit at full budget by the same `train()` that would have fitted the named
+# model. See docs/MODEL_SELECTION.md.
+
+task: multiclass
+
+runtime:
+  seed: 42
+  output_dir: outputs
+  num_workers: -1
+  deterministic: true
+
+data:
+  kind: tabular
+  path: data/raw/sample.csv
+  target: label
+  split:
+    strategy: auto
+    val_size: 0.15
+    test_size: 0.15
+    # >= 2 turns on cross-validation, which is what candidates are compared on.
+    # A single holdout would mean part of what decides the bake-off is which
+    # model happened to suit those particular rows.
+    folds: 5
+    # How those folds are cut. `auto` → stratified here (tabular classification).
+    # Set `purged` + `label_horizon` for overlapping labels, `rolling_origin`
+    # for time series, `cpcv` when you need the score's distribution.
+    cv_strategy: auto
+  params:
+    imbalance_strategy: auto
+
+model:
+  # Still required, and still meaningful: it is what runs if `select.enabled` is
+  # turned off, and it is the fallback the config validator checks against.
+  name: xgboost
+
+fit:
+  patience: 20
+  batch_size: 32
+  params:
+    learning_rate: 0.1
+    n_estimators: 500
+    early_stopping_rounds: 50
+
+tune:
+  enabled: true
+  max_trials: 30
+  max_seconds: 300
+  refit: best
+  # `cv` scores each trial across inner folds instead of one validation split,
+  # so a candidate cannot win the bake-off on a lucky split. Costs `cv_folds`
+  # times as much per trial — worth it when the families are close.
+  objective: holdout       # switch to `cv` when the top candidates are within noise
+  cv_folds: 3
+
+select:
+  enabled: true
+
+  # [] → every installed family compatible with (task, data.kind), ranked by
+  # auto_priority. Name them explicitly to narrow the bake-off to the ones you
+  # would actually deploy.
+  candidates: []           # e.g. [xgboost, lightgbm, catboost, mlp]
+  max_candidates: 8
+
+  # Hard limits. A candidate that misses one is disqualified and reported with
+  # the number it missed by, however good its score. `null` = unconstrained.
+  constraints:
+    max_latency_p95_ms: null    # e.g. 20 for a real-time API
+    max_model_mb: null          # e.g. 100 for a slim serving image
+    min_explainability: null    # 1.0 native · 0.8 shap · 0.5 permutation
+    min_performance: null       # a floor on the primary metric
+
+  # `tolerance` (default): best score wins, unless something statistically tied
+  # with it is cheaper — latency, then size, then explainability, then stability.
+  # Never trades a real accuracy difference for speed.
+  objective: tolerance
+  tolerance: null          # null → one standard error of the CV mean
+
+  # `weighted` instead, when a regulated context needs an auditable weight table.
+  # Ignored under `objective: tolerance`.
+  weights: {}
+  #   performance: 0.5
+  #   latency: 0.2
+  #   cost: 0.15
+  #   explainability: 0.1
+  #   maintainability: 0.05
+
+  # Candidates evaluated concurrently, as separate processes. Raise it on a
+  # multi-core CPU box; leave it at 1 on a single GPU, where concurrent fits
+  # contend and the wall-clock gets worse rather than better.
+  max_workers: 1
+
+  # Measure latency, artifact size and explainability. Off means comparing on
+  # score alone, which is the thing this block exists to stop doing.
+  profile: true
+  profile_samples: 128
+
+logging:
+  backend: csv

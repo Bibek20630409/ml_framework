@@ -50,11 +50,18 @@ def validate_dataframe(
     return schema.validate(df, lazy=False)
 
 
-def validate_file(path: str, target_col: str) -> int:
-    """Validate a CSV/Parquet dataset file; returns the row count on success."""
+def validate_file(path: str, target_col: str, *, backend: str = "local") -> int:
+    """Validate a CSV/Parquet dataset file; returns the row count on success.
+
+    ``backend`` is an explicit argument rather than a config lookup because this
+    is a standalone stage — an Airflow task and a ``python -m`` entry point, with
+    no ``ExperimentConfig`` in scope. Note that pandera validates *pandas*, so the
+    frame is collected here whatever the engine: what ``spark`` buys is reading a
+    table too large for the driver to open with pandas, not a distributed check.
+    """
     from ..core import read_table
 
-    df = read_table(path)
+    df = read_table(path, backend=backend)
     validated = validate_dataframe(df, target_col)
     log.info("data contract passed: %d rows, %d cols", len(validated), validated.shape[1])
     return len(validated)
@@ -64,9 +71,10 @@ def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="Data contract / quality gate")
     p.add_argument("--input", required=True, help="CSV/Parquet dataset")
     p.add_argument("--target-col", required=True)
+    p.add_argument("--data-backend", default="local", help="Engine: local (default) or spark")
     args = p.parse_args(argv)
     logging.basicConfig(level=logging.INFO)
-    validate_file(args.input, args.target_col)
+    validate_file(args.input, args.target_col, backend=args.data_backend)
     return 0
 
 

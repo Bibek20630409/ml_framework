@@ -18,6 +18,22 @@ the same index sets partition an array, a DataFrame or a lazily-loaded
 stratification, in the same order — so a run at a fixed seed produces the
 partition it produced before this refactor. The v1 ``split_dataset`` helper still
 exists (it slices with these indices) and its tests are unchanged.
+
+Two families live here, and the distinction is load-bearing:
+
+* **Single-partition** splitters (:class:`RandomSplitter`,
+  :class:`TemporalSplitter`, :class:`GroupSplitter`) return one
+  :class:`SplitIndices` and are selected by ``split.strategy``.
+* **Cross-validation** splitters (:class:`CrossValidationSplitter`,
+  :class:`RollingOriginSplitter`, :class:`PurgedKFoldSplitter`,
+  :class:`CombinatorialPurgedSplitter`) return a *list* of them and are selected
+  by ``split.cv_strategy`` once ``split.folds >= 2``.
+
+The cross-validation family exists because "estimate this model's performance
+honestly" has a different correct answer per data domain, and using the wrong one
+does not raise — it reports a better number. Shuffled k-fold on a time series
+trains on the future; unpurged k-fold on overlapping labels trains on the test
+set's own observations. Both look like success.
 """
 
 from __future__ import annotations
@@ -295,6 +311,321 @@ class CrossValidationSplitter:
         return out
 
 
+def label_spans(
+    n: int,
+    *,
+    horizon: int = 0,
+    label_end: np.ndarray | None = None,
+    times: np.ndarray | None = None,
+) -> np.ndarray:
+    """The last row each row's label depends on, as positional indices.
+
+    A row's *label span* is the window of observations its target is computed
+    from. A 10-step-ahead return at row ``i`` is not known until row ``i + 10``,
+    so rows ``i`` and ``i + 10`` share information even though they are distinct
+    rows. Purging needs to know that, and this is the one place the two ways of
+    saying it are turned into the same array of positions.
+
+    ``horizon`` is the approximation: every label spans the same fixed number of
+    rows. It covers the common case (a fixed-horizon target) without asking a
+    source to carry an extra column.
+
+    ``label_end`` is the exact statement — one end-of-label *time* per row
+    (López de Prado's ``t1``). Converting a time to a row position requires the
+    rows' own observation times, so ``times`` is required alongside it; there is
+    no way to infer "which row is this timestamp" from the timestamps of a
+    different quantity. Rows are assumed sorted by ``times``, which is what every
+    temporal source in this framework guarantees.
+
+    With neither, every span is the row itself and purging becomes a no-op —
+    which is exactly right for a target that is known at the row it sits on.
+    """
+    idx = np.arange(n)
+    if label_end is not None:
+        ends = np.asarray(label_end)
+        if len(ends) != n:
+            raise SplitError(f"label_end has {len(ends)} entries for {n} rows")
+        if times is None:
+            raise SplitError(
+                "label_end needs the rows' own observation times to be mapped onto "
+                "row positions — set split.time_col alongside split.label_end_col, "
+                "or use split.label_horizon to state the span in rows instead"
+            )
+        observed = np.asarray(times)
+        if len(observed) != n:
+            raise SplitError(f"times has {len(observed)} entries for {n} rows")
+        # `side="right" - 1` gives the last observation at or before the label's
+        # end, so a label ending between two rows does not purge the later one.
+        positions = np.searchsorted(observed, ends, side="right") - 1
+        # A span never points behind its own row: a label that ends before the
+        # observation it belongs to is a data error, and letting it produce a
+        # backwards span would make that row's purge window empty — silently
+        # turning the bad data into no protection at all.
+        return np.maximum(idx, np.clip(positions, 0, n - 1))
+    if horizon < 0:
+        raise SplitError(f"label_horizon must be >= 0, got {horizon}")
+    return np.minimum(idx + horizon, n - 1)
+
+
+def purge_and_embargo(
+    train: np.ndarray,
+    test: np.ndarray,
+    *,
+    spans: np.ndarray,
+    embargo: int = 0,
+) -> np.ndarray:
+    """``train`` with every row that shares information with ``test`` removed.
+
+    Two distinct mechanisms, both required, and neither sufficient alone:
+
+    **Purge** drops training rows whose label span reaches into the test window.
+    Those rows were labelled using observations the test set is scoring on, so
+    keeping them lets the model fit a target it is about to be graded against.
+    Note it is the *span* that is checked, not the row index — a training row
+    hundreds of positions before the test set still leaks if its label horizon
+    reaches inside.
+
+    **Embargo** drops training rows in a window immediately *after* the test set.
+    Purging handles leakage forward in time; the embargo handles it backward,
+    through serial correlation. A feature computed at ``test_end + 1`` is
+    correlated with observations inside the test window even though no label
+    spans it, and with strongly autocorrelated data that correlation is enough to
+    inflate the score.
+
+    Returns the surviving training indices in their original order.
+    """
+    if len(test) == 0:
+        return train
+    if embargo < 0:
+        raise SplitError(f"embargo must be >= 0, got {embargo}")
+
+    test_start = int(np.min(test))
+    test_end = int(np.max(test))
+    # Purge: the training row starts before the test window ends, and its label
+    # reaches at or past the test window's start. Straddling in either direction
+    # is contamination.
+    overlaps = (train <= test_end) & (spans[train] >= test_start)
+    # Embargo: `embargo` rows after the test window, dropped regardless of span.
+    embargoed = (train > test_end) & (train <= test_end + embargo)
+    return train[~(overlaps | embargoed)]
+
+
+def embargo_rows(n: int, embargo: float | int) -> int:
+    """``embargo`` as a row count, accepting either a fraction or a count.
+
+    A fraction below 1.0 is read as a share of the dataset (``0.01`` → 1% of
+    rows), which is how the finance literature states it and what keeps a config
+    portable across dataset sizes. A value of 1.0 or greater is read as a literal
+    row count, because "embargo 1 row" is a thing people mean and reading it as
+    100% of the data would be a spectacular silent failure.
+    """
+    if embargo <= 0:
+        return 0
+    if embargo < 1.0:
+        return int(np.ceil(embargo * n))
+    return int(embargo)
+
+
+@dataclass(frozen=True, slots=True)
+class PurgedKFoldSplitter:
+    """k **contiguous** folds with purging and an embargo. No shuffling.
+
+    The splitter for data where rows are not independent — overlapping labels,
+    serially correlated features, anything where knowing row *j* tells you
+    something about row *i*. Plain :class:`CrossValidationSplitter` assumes
+    independence and quietly reports a score that assumes it too.
+
+    Two departures from :class:`CrossValidationSplitter`, both deliberate:
+
+    * **Folds are contiguous slices, not shuffled.** A shuffled fold interleaves
+      test rows through the training set, which leaves every training row
+      adjacent to a test row and makes purging remove most of the data.
+    * **Validation is carved from the end of the training block**, and purged
+      against the test window as well. A validation set that leaks is a model
+      selected on a leaked number, which is the same defect one level up.
+
+    Unlike :class:`RollingOriginSplitter` this does *not* enforce that training
+    precedes testing — every fold is used as a test set in turn, including the
+    earliest. That is correct when the concern is overlapping labels rather than
+    forecasting a future you cannot see; use rolling-origin when the deployment
+    story is "stand at a point in time and predict forward".
+    """
+
+    name: ClassVar[str] = "purged"
+
+    folds: int = 5
+    embargo: float = 0.0
+    label_horizon: int = 0
+    val_size: float = 0.15
+
+    def split(
+        self,
+        n: int,
+        *,
+        y: np.ndarray | None = None,
+        label_end: np.ndarray | None = None,
+        time: np.ndarray | None = None,
+        **_: Any,
+    ) -> list[SplitIndices]:
+        if self.folds < 2:
+            raise SplitError(f"purged cross-validation needs at least 2 folds, got {self.folds}")
+        if n < self.folds:
+            raise SplitError(f"cannot make {self.folds} folds from {n} rows")
+
+        spans = label_spans(n, horizon=self.label_horizon, label_end=label_end, times=time)
+        gap = embargo_rows(n, self.embargo)
+        idx = np.arange(n)
+        bounds = np.linspace(0, n, self.folds + 1).astype(int)
+
+        out: list[SplitIndices] = []
+        for i in range(self.folds):
+            test = idx[bounds[i] : bounds[i + 1]]
+            if len(test) == 0:
+                continue
+            rest = idx[~np.isin(idx, test)]
+            kept = purge_and_embargo(rest, test, spans=spans, embargo=gap)
+            if len(kept) < 2:
+                raise SplitError(
+                    f"fold {i} has {len(kept)} rows left after purging — the label horizon "
+                    f"({self.label_horizon}) or embargo ({self.embargo}) is too large for "
+                    f"{n} rows in {self.folds} folds"
+                )
+            # Validation comes off the *end* of what survived, then is purged
+            # against the test window in turn. Taking it at random would scatter
+            # validation rows through the purged region we just cleared.
+            n_val = max(1, int(round(self.val_size * len(kept))))
+            train, val = kept[:-n_val], kept[-n_val:]
+            if len(train) == 0:
+                raise SplitError(
+                    f"fold {i} has no training rows after reserving {n_val} for validation"
+                )
+            out.append(SplitIndices(train, val, test))
+
+        if not out:  # pragma: no cover - guarded by the fold-count checks above
+            raise SplitError(f"purged cross-validation produced no folds from {n} rows")
+        log.info(
+            "purged k-fold: %d folds over %d rows, horizon %d, embargo %d rows",
+            len(out),
+            n,
+            self.label_horizon,
+            gap,
+        )
+        return out
+
+
+@dataclass(frozen=True, slots=True)
+class CombinatorialPurgedSplitter:
+    """CPCV: every way of choosing ``test_groups`` of ``groups`` as the test set.
+
+    Purged k-fold gives one backtest path — each row is tested exactly once, in
+    one particular arrangement. That single path is itself a sample, and judging a
+    model on it is judging it on one draw. CPCV splits the data into ``groups``
+    contiguous blocks and tests every combination of ``test_groups`` of them,
+    producing ``C(groups, test_groups)`` folds and enough paths to see the
+    *distribution* of the score rather than one number from it.
+
+    The cost is combinatorial and stated plainly rather than discovered: 6 groups
+    of 2 is 15 fits, 10 of 2 is 45. :attr:`max_folds` caps it, keeping the first
+    ``max_folds`` combinations in lexicographic order — a deterministic prefix
+    rather than a random sample, so a capped run is reproducible.
+
+    Test groups are generally **not contiguous**, which is the point: a fold that
+    tests blocks 0 and 4 trains on the blocks between them, and the purge is
+    applied around each test block separately.
+    """
+
+    name: ClassVar[str] = "cpcv"
+
+    groups: int = 6
+    test_groups: int = 2
+    embargo: float = 0.0
+    label_horizon: int = 0
+    val_size: float = 0.15
+    max_folds: int = 20
+
+    def split(
+        self,
+        n: int,
+        *,
+        y: np.ndarray | None = None,
+        label_end: np.ndarray | None = None,
+        time: np.ndarray | None = None,
+        **_: Any,
+    ) -> list[SplitIndices]:
+        from itertools import combinations
+
+        if self.groups < 2:
+            raise SplitError(f"CPCV needs at least 2 groups, got {self.groups}")
+        if not 1 <= self.test_groups < self.groups:
+            raise SplitError(
+                f"test_groups must be in [1, {self.groups - 1}], got {self.test_groups}"
+            )
+        if n < self.groups:
+            raise SplitError(f"cannot make {self.groups} groups from {n} rows")
+        if self.max_folds < 1:
+            raise SplitError(f"max_folds must be >= 1, got {self.max_folds}")
+
+        spans = label_spans(n, horizon=self.label_horizon, label_end=label_end, times=time)
+        gap = embargo_rows(n, self.embargo)
+        idx = np.arange(n)
+        bounds = np.linspace(0, n, self.groups + 1).astype(int)
+        blocks = [idx[bounds[i] : bounds[i + 1]] for i in range(self.groups)]
+
+        out: list[SplitIndices] = []
+        for combo in combinations(range(self.groups), self.test_groups):
+            if len(out) >= self.max_folds:
+                log.warning(
+                    "CPCV: stopping at max_folds=%d; C(%d,%d) would be %d folds",
+                    self.max_folds,
+                    self.groups,
+                    self.test_groups,
+                    _n_combinations(self.groups, self.test_groups),
+                )
+                break
+            test = np.concatenate([blocks[g] for g in combo])
+            rest = idx[~np.isin(idx, test)]
+            # Each test block is purged separately: one purge against the union
+            # would use the span between the first and last block and delete the
+            # training data sitting between two distant test blocks.
+            kept = rest
+            for g in combo:
+                kept = purge_and_embargo(kept, blocks[g], spans=spans, embargo=gap)
+            if len(kept) < 2:
+                raise SplitError(
+                    f"CPCV fold {combo} has {len(kept)} rows left after purging — reduce "
+                    f"label_horizon ({self.label_horizon}), embargo ({self.embargo}) "
+                    f"or test_groups ({self.test_groups})"
+                )
+            n_val = max(1, int(round(self.val_size * len(kept))))
+            train, val = kept[:-n_val], kept[-n_val:]
+            if len(train) == 0:
+                raise SplitError(
+                    f"CPCV fold {combo} has no training rows after reserving "
+                    f"{n_val} for validation"
+                )
+            out.append(SplitIndices(train, val, test))
+
+        if not out:  # pragma: no cover - guarded by the group checks above
+            raise SplitError(f"CPCV produced no folds from {n} rows")
+        log.info(
+            "CPCV: %d folds (C(%d,%d)=%d), %d rows, horizon %d, embargo %d rows",
+            len(out),
+            self.groups,
+            self.test_groups,
+            _n_combinations(self.groups, self.test_groups),
+            n,
+            self.label_horizon,
+            gap,
+        )
+        return out
+
+
+def _n_combinations(n: int, k: int) -> int:
+    from math import comb
+
+    return comb(n, k)
+
+
 @dataclass(frozen=True, slots=True)
 class RollingOriginSplitter:
     """Time-series cross-validation: k origins, each forecasting the next horizon.
@@ -383,13 +714,22 @@ class RollingOriginSplitter:
 # optional dependencies and need no capability metadata, so a spec-carrying
 # registry would be ceremony.
 #
-# Only the single-partition splitters are here. `CrossValidationSplitter` and
-# `RollingOriginSplitter` return a *list* of partitions, so they do not satisfy
-# the same protocol and are selected by `split.folds` rather than by name.
+# Two maps, because there are genuinely two protocols. `SPLITTERS` holds the
+# single-partition splitters selected by `split.strategy`. `CV_SPLITTERS` holds
+# the ones that return a *list* of partitions, selected by `split.cv_strategy`
+# once `split.folds >= 2`. Collapsing them into one map would mean a caller
+# cannot tell from the name whether it is getting one partition or k.
 SPLITTERS: dict[str, type] = {
     RandomSplitter.name: RandomSplitter,
     TemporalSplitter.name: TemporalSplitter,
     GroupSplitter.name: GroupSplitter,
+}
+
+CV_SPLITTERS: dict[str, type] = {
+    CrossValidationSplitter.name: CrossValidationSplitter,
+    RollingOriginSplitter.name: RollingOriginSplitter,
+    PurgedKFoldSplitter.name: PurgedKFoldSplitter,
+    CombinatorialPurgedSplitter.name: CombinatorialPurgedSplitter,
 }
 
 
@@ -399,6 +739,17 @@ def get_splitter_class(name: str) -> type:
     except KeyError:
         raise SplitError(
             f"Unknown split strategy '{name}'. Available: {sorted(SPLITTERS)}"
+        ) from None
+
+
+def get_cv_splitter_class(name: str) -> type:
+    """The list-returning splitter for ``name``. Companion to
+    :func:`get_splitter_class` for the cross-validation family."""
+    try:
+        return CV_SPLITTERS[name]
+    except KeyError:
+        raise SplitError(
+            f"Unknown cv_strategy '{name}'. Available: {sorted(CV_SPLITTERS)}"
         ) from None
 
 

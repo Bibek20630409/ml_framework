@@ -1,12 +1,14 @@
 from .migrate import MigrationError, migrate_file, migrate_mapping
 from .schema import (
     BudgetConfig,
+    ConstraintConfig,
     DataConfig,
     ExperimentConfig,
     FitConfig,
     LoggingConfig,
     ModelConfig,
     RuntimeConfig,
+    SelectConfig,
     SplitConfig,
     TuneConfig,
 )
@@ -20,6 +22,8 @@ __all__ = [
     "FitConfig",
     "BudgetConfig",
     "TuneConfig",
+    "SelectConfig",
+    "ConstraintConfig",
     "LoggingConfig",
     "MigrationError",
     "migrate_mapping",

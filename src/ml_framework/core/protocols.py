@@ -367,6 +367,151 @@ class Splitter(Protocol):
     def split(self, n: int, *, y: np.ndarray | None = None, **kwargs: Any) -> Any: ...
 
 
+# An opaque handle to a table owned by a `DataBackend`: a `pd.DataFrame` under
+# `local`, a `pyspark.sql.DataFrame` under `spark`. `Any` rather than a union, for
+# the same reason `Split.x` is `Any` — naming the alternatives would make this
+# module import pandas and pyspark.
+Table = Any
+
+
+@runtime_checkable
+class DataBackend(Protocol):
+    """The engine that reads and reduces a table, chosen per run by ``data.backend``.
+
+    A data backend decides *how the bytes become a matrix*, not how the model is
+    trained: ``local`` reads with pandas in-process, ``spark`` reads and reduces
+    across a cluster and then collects. Training is single-node either way —
+    :class:`~ml_framework.data.types.DataBundle` holds numpy arrays and the
+    splitters index into them.
+
+    Every method below replaces one pandas idiom that exists in the data layer
+    today; there are none here without a call site, per the rule on
+    :class:`~ml_framework.core.types.Capabilities`.
+
+    **Exactly two methods collect: :meth:`column` and :meth:`to_pandas`.** They are
+    named so they are greppable, and the split between them is a correctness rule,
+    not a convenience:
+
+    *Arrays that must line up row-for-row have to come out of a single collect.*
+
+    Under a distributed engine each collect re-executes the query plan, and two
+    executions need not agree on row order — pyspark documents
+    ``monotonically_increasing_id`` (which :meth:`sort_by` relies on) as
+    non-deterministic for exactly this reason. So a caller that needs features
+    *and* labels, or a label-end *and* its observation time, calls
+    :meth:`to_pandas` **once** and slices the result. :meth:`column` is for the
+    genuinely standalone array, where there is no second array to fall out of step
+    with.
+
+    :meth:`select` exists to make that affordable: it narrows the table *without*
+    collecting, so the one materialization carries only the columns needed.
+    """
+
+    name: ClassVar[str]
+    engine: ClassVar[str]
+    """The library doing the work. Printed by ``mlf data-backends``."""
+
+    # ── read ──
+    def read_table(self, path: str) -> Table:
+        """A CSV file, a Parquet file, or a directory of Parquet part-files."""
+        ...
+
+    # ── inspect: nothing leaves the cluster ──
+    def columns(self, table: Table) -> tuple[str, ...]: ...
+
+    def n_rows(self, table: Table) -> int: ...
+
+    def dtypes(self, table: Table, columns: Sequence[str]) -> Mapping[str, str]:
+        """Column dtypes as **numpy-style** names, identically on every backend.
+
+        Normalized rather than passed through, because these reach
+        ``FeatureSchema.dtypes`` and from there the bundle manifest and the
+        serving signature: Spark's native ``bigint``/``double`` would make the
+        artifact depend on which engine happened to build it.
+        """
+        ...
+
+    # ── reduce: still lazy ──
+    def sort_by(self, table: Table, column: str) -> Table:
+        """**Stable** ascending sort, with ties broken deterministically.
+
+        Not a detail. ``builders._label_columns`` sorts so the positions a
+        splitter computes line up with the rows it splits; an engine whose tie
+        order varies between runs would silently change the folds.
+        """
+        ...
+
+    def select(self, table: Table, columns: Sequence[str]) -> Table:
+        """Narrow the table to ``columns``. **Lazy — this does not collect.**
+
+        Under ``spark`` the projection pushes down into Parquet, so the single
+        :meth:`to_pandas` that follows carries only what the caller needs.
+        """
+        ...
+
+    # ── collect: the only two methods that move data to the driver ──
+    def column(self, table: Table, name: str, *, dtype: str | None = None) -> np.ndarray:
+        """One standalone column as a numpy array.
+
+        Only for arrays with no row-alignment partner — the CV label vector, whose
+        row count is checked separately. Two calls to this method are **two
+        collects** and may disagree on row order; when two arrays must line up, go
+        through :meth:`to_pandas` once instead.
+        """
+        ...
+
+    def to_pandas(self, table: Table) -> Any:
+        """The table on the driver, as pandas, in **one** materialization.
+
+        The atomic collect: everything sliced out of the returned frame is
+        guaranteed to be row-aligned. Also the escape hatch for code that is
+        genuinely pandas-shaped (pandera contracts, the timeseries exogenous
+        frame), and the one call that can turn a distributed run into a driver
+        OOM. Identity under ``local``.
+        """
+        ...
+
+    # ── clean + write ──
+    # These five exist for one consumer, `pipeline.spark_preprocess.preprocess`.
+    # They were deliberately withheld until that consumer was expressed in terms
+    # of this protocol, rather than added speculatively alongside the read path.
+    def filter_notnull(self, table: Table, column: str) -> Table:
+        """Drop rows whose ``column`` is null. Lazy."""
+        ...
+
+    def drop_all_null_rows(self, table: Table, columns: Sequence[str]) -> Table:
+        """Drop rows where **every** one of ``columns`` is null. Lazy.
+
+        Deliberately "all" and not "any": a single missing feature is ordinary,
+        while a row that is null across every feature carries no signal at all.
+        """
+        ...
+
+    def drop_duplicates(self, table: Table) -> Table:
+        """Drop exact duplicate rows. Lazy."""
+        ...
+
+    def cast(self, table: Table, column: str, dtype: str) -> Table:
+        """Cast ``column``, naming ``dtype`` in the **numpy** spelling.
+
+        Numpy-style for the same reason :meth:`dtypes` reports that way: the
+        caller should not have to know whether it is talking to ``float64`` or
+        ``double``.
+        """
+        ...
+
+    def write_parquet(self, table: Table, path: str) -> None:
+        """Write to ``path`` as a **directory** of Parquet part-files, overwriting.
+
+        A directory on every backend, including ``local``, because
+        :meth:`read_table` distinguishes a Parquet directory from a CSV by
+        inspecting the path — a bare file with no suffix would come back as a CSV
+        read. Writing the same shape everywhere is what lets a stage run under one
+        engine and be consumed by a run under the other.
+        """
+        ...
+
+
 # ── Payload compatibility ─────────────────────────────────
 # The canonical payload for each data kind, used to check a model/backend's
 # `Capabilities.accepts` at build time.

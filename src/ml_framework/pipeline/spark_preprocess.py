@@ -1,19 +1,30 @@
 """
 pipeline/spark_preprocess.py
 ────────────────────────────
-Apache Spark data-preprocessing stage. Reads raw data, cleans + feature-engineers
-it at scale, and writes a processed Parquet dataset that training consumes.
+The data-preprocessing stage. Reads raw data, cleans it, and writes a processed
+Parquet dataset that training consumes.
 
 This is the "data pipeline" stage — orchestrated by Airflow, versioned by DVC. It
-scales to data far larger than memory; on small demo data it still runs (Spark
-local mode). Scaling-specific transforms (scaling/encoding fit on train only) are
-deliberately left to the training DataModule to avoid train/serve skew.
+scales to data far larger than memory; on small demo data it still runs. Fitted
+transforms (scaling/encoding, fit on train only) are deliberately left to the
+training source to avoid train/serve skew.
+
+**It no longer speaks pyspark.** Every step goes through the selected
+:class:`~ml_framework.core.protocols.DataBackend`, which is what collapsed the
+two independent Spark codebases this repo used to carry — this stage and
+``data/backends/spark.py`` — into one, with a single session configuration. The
+side effect worth having: the same cleaning now runs under ``local`` on a laptop
+with no JVM, which was impossible while this module imported pyspark directly.
+
+The module keeps its name because DVC, the Airflow DAG and CI all reference the
+path; ``--data-backend`` is what changes the engine.
 
 Run standalone:
-    spark-submit -m ml_framework.pipeline.spark_preprocess \\
+    python -m ml_framework.pipeline.spark_preprocess \\
         --input data/raw/dataset.csv --output data/processed --target-col label
 
-Requires a JVM (Java 11/17) and ``pip install -e ".[mlops]"`` (pyspark).
+The default engine is ``spark``, which needs a JVM (Java 11/17) and
+``pip install -e ".[mlops]"``. Add ``--data-backend local`` for neither.
 """
 
 from __future__ import annotations
@@ -30,59 +41,62 @@ def preprocess(
     target_col: str,
     dropna: bool = True,
     deduplicate: bool = True,
+    backend: str = "spark",
 ) -> None:
-    """Clean + feature-engineer raw data with Spark → Parquet.
+    """Clean raw data → a Parquet dataset training can read.
 
-    Steps (all distributed):
+    Steps, in order:
       1. read raw CSV/Parquet
       2. drop rows with a null target; optionally drop fully-null feature rows
       3. de-duplicate
       4. cast the target to a stable type
-      5. write a single deterministic Parquet dataset
+      5. write a deterministic Parquet dataset
+
+    Every step runs through the selected :class:`DataBackend`, so ``backend`` is
+    the whole difference between this being a cluster job and a laptop one. The
+    default stays ``spark``: this is the distributed stage in the DVC/Airflow
+    pipeline and changing what it runs on by default would change what that
+    pipeline does. ``--data-backend local`` makes the *same* cleaning runnable
+    without a JVM, which was impossible while this module spoke pyspark directly.
     """
-    from pyspark.sql import SparkSession
-    from pyspark.sql import functions as F
+    from ..core.registry import get_data_backend
 
-    spark = (
-        SparkSession.builder.appName("ml_framework-preprocess")
-        .config("spark.sql.shuffle.partitions", "8")
-        .getOrCreate()
-    )
-    try:
-        reader = spark.read.option("header", True).option("inferSchema", True)
-        df = (
-            reader.parquet(input_path)
-            if input_path.endswith((".parquet", ".pq"))
-            else reader.csv(input_path)
-        )
-        log.info("spark: read %d rows from %s", df.count(), input_path)
+    engine = get_data_backend(backend)
 
-        df = df.where(F.col(target_col).isNotNull())
-        if dropna:
-            feature_cols = [c for c in df.columns if c != target_col]
-            df = df.dropna(how="all", subset=feature_cols)
-        if deduplicate:
-            df = df.dropDuplicates()
+    table = engine.read_table(input_path)
+    log.info("%s: read %d rows from %s", backend, engine.n_rows(table), input_path)
 
-        # Example feature engineering hook: keep the schema stable and typed.
-        # (Add domain transforms here — they run distributed across the cluster.)
-        df = df.withColumn(target_col, F.col(target_col).cast("double"))
+    table = engine.filter_notnull(table, target_col)
+    if dropna:
+        feature_cols = [c for c in engine.columns(table) if c != target_col]
+        table = engine.drop_all_null_rows(table, feature_cols)
+    if deduplicate:
+        table = engine.drop_duplicates(table)
 
-        # coalesce(1) → a single, deterministic output partition for downstream
-        # training (drop this for very large data and read the parquet dir directly).
-        df.coalesce(1).write.mode("overwrite").parquet(output_path)
-        log.info("spark: wrote %d rows → %s", df.count(), output_path)
-    finally:
-        spark.stop()
+    # Example feature engineering hook: keep the schema stable and typed.
+    # (Add domain transforms here — under `spark` they run across the cluster.)
+    table = engine.cast(table, target_col, "float64")
+
+    engine.write_parquet(table, output_path)
+    log.info("%s: wrote %d rows → %s", backend, engine.n_rows(table), output_path)
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Spark preprocessing stage")
+    parser = argparse.ArgumentParser(description="Data preprocessing stage")
     parser.add_argument("--input", required=True, help="Raw CSV/Parquet path")
     parser.add_argument("--output", required=True, help="Processed Parquet output dir")
     parser.add_argument("--target-col", required=True)
     parser.add_argument("--no-dropna", action="store_true")
     parser.add_argument("--no-dedup", action="store_true")
+    # Additive and defaulted, so the DVC stage and the Airflow BashOperator --
+    # which both invoke `python -m ml_framework.pipeline.spark_preprocess
+    # --input X --output Y --target-col Z` -- keep working unchanged.
+    parser.add_argument(
+        "--data-backend",
+        default="spark",
+        metavar="NAME",
+        help="Engine to clean with: spark (default) or local",
+    )
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO)
     preprocess(
@@ -91,6 +105,7 @@ def main(argv: list[str] | None = None) -> int:
         args.target_col,
         dropna=not args.no_dropna,
         deduplicate=not args.no_dedup,
+        backend=args.data_backend,
     )
     return 0
 

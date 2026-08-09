@@ -25,16 +25,17 @@ reproducibility win over v1, which recorded only what the user typed).
 
 Who validates which ``params`` block, and when:
 
-    model.params   here, at load time, via ``ModelSpec.params_model``
-    fit.params     by the backend, in ``fit()`` (``TrainingBackend.params_model``)
-    data.params    by the source, in its ``build_*_bundle``
+    model.params         here, at load time, via ``ModelSpec.params_model``
+    fit.params           by the backend, in ``fit()`` (``TrainingBackend.params_model``)
+    data.params          by the source, in its ``build_*_bundle``
+    data.backend_params  by the data backend, at first use
 
 The asymmetry is not an oversight. Resolving a model spec costs one import of
 ``ml_framework.plugins``, whose modules are required to be importable with zero
-optional dependencies. Resolving a *backend* and a *source* would mean importing
-the whole data layer and every backend just to validate a YAML file — so those
-two are validated by the code that consumes them, which is the same guarantee one
-step later.
+optional dependencies. Resolving a *backend*, a *source* or a *data backend*
+would mean importing the whole data layer, every backend, or pyspark just to
+validate a YAML file — so those three are validated by the code that consumes
+them, which is the same guarantee one step later.
 
 Load from YAML:
     cfg = ExperimentConfig.from_yaml("configs/example_tabular.yaml")
@@ -64,20 +65,40 @@ if TYPE_CHECKING:
     from ..core.plugins import ModelSpec
 
 SplitStrategy = Literal["auto", "random", "temporal", "group"]
+# How k-fold is *cut*, once `split.folds >= 2`. Orthogonal to `SplitStrategy`,
+# which cuts a single holdout partition: a run can hold out temporally and
+# cross-validate with rolling origins, and those are two separate statements.
+# `auto` resolves from the data kind and task, reproducing the pre-P11 behaviour
+# exactly, so an existing config keeps the folds it already had.
+CVStrategy = Literal["auto", "stratified", "kfold", "rolling_origin", "purged", "cpcv"]
 Refit = Literal["best", "reuse"]
+# What a hyperparameter trial is scored on. `holdout` fits once against the
+# single validation split — cheap, and the default. `cv` averages the objective
+# across inner folds, which is what makes "select the model and its
+# hyperparameters jointly, on cross-validation" literally true, at k times the
+# cost per trial.
+TuneObjective = Literal["holdout", "cv"]
+# How a bake-off picks its winner from the per-criterion measurements.
+SelectObjective = Literal["tolerance", "weighted"]
 # `16`/`bf16` are the shorthand people type; the backend normalizes them to
 # Lightning's `-mixed` spellings rather than rejecting them.
 Precision = Literal["16", "16-mixed", "bf16", "bf16-mixed", "32", "32-true", "64"]
 
 # Dotted prefixes under which `with_overrides` may *create* a key. Everything
 # else keeps v1's "the key must already exist" rule, because a typo in a fixed
-# block is a bug and silently creating `fit.epocs` would hide it. These four are
+# block is a bug and silently creating `fit.epocs` would hide it. These are
 # plugin-owned dicts whose keys core cannot know, so the rule cannot apply.
 _CREATABLE_PREFIXES: tuple[str, ...] = (
     "model.params.",
     "fit.params.",
     "data.params.",
+    "data.backend_params.",
     "tune.overrides.",
+    # Criterion names are a closed set, but they are validated by
+    # `SelectConfig._check_weights` rather than by key existence — a weights dict
+    # starts empty, so the "key must already exist" rule would make every weight
+    # unsettable from `--set`.
+    "select.weights.",
 )
 
 _FROZEN = ConfigDict(frozen=True, extra="forbid")
@@ -139,10 +160,35 @@ class SplitConfig(BaseModel):
     # data — and being driven by the Splitter is what gives GBDT and forecasting
     # cross-validation too, rather than it being a Lightning feature.
     folds: int = Field(default=0, ge=0)
+    # How those folds are cut. `auto` = the pre-P11 rule (temporal data gets
+    # rolling origins, classification gets stratified k-fold, everything else
+    # plain k-fold), so setting `folds` alone behaves exactly as it always did.
+    cv_strategy: CVStrategy = "auto"
     # Steps ahead each fold forecasts, for rolling-origin cross-validation.
     horizon: int = Field(default=1, ge=1)
     # Expanding window (a production retrain) vs sliding (old data is misleading).
     expanding: bool = True
+    # ── Purging (cv_strategy: purged | cpcv) ──────────────
+    # How many rows ahead a row's label is computed from. A 10-step-ahead target
+    # at row i is not known until row i+10, so i and i+10 share information and a
+    # fold that trains on one while testing the other leaks. 0 → labels are known
+    # at their own row and purging is a no-op.
+    label_horizon: int = Field(default=0, ge=0)
+    # The exact form of the same statement: a column of per-row label end times
+    # (López de Prado's t1). Wins over `label_horizon` when both are set, because
+    # a per-row span is strictly more information than one number for all rows.
+    label_end_col: str | None = None
+    # Rows dropped *after* each test window, to break serial correlation that
+    # purging (which looks forward) cannot see. < 1.0 → a fraction of the
+    # dataset; >= 1.0 → a literal row count.
+    embargo: float = Field(default=0.0, ge=0.0)
+    # ── CPCV (cv_strategy: cpcv) ──────────────────────────
+    # Contiguous blocks the data is cut into, and how many are tested per fold.
+    # Produces C(cpcv_groups, cpcv_test_groups) folds — 6 choose 2 is 15 fits.
+    cpcv_groups: int = Field(default=6, ge=2)
+    cpcv_test_groups: int = Field(default=2, ge=1)
+    # The cost ceiling on that combinatorial explosion.
+    cpcv_max_folds: int = Field(default=20, ge=1)
     # The deliberate friction point. Shuffling a time series is the most damaging
     # silent failure in this domain — it produces a suspiciously good score rather
     # than an error — so the escape hatch requires typing the word "leakage".
@@ -154,11 +200,22 @@ class SplitConfig(BaseModel):
             raise ValueError("val_size + test_size must be < 1.0")
         if self.folds == 1:
             raise ValueError("split.folds must be 0 (holdout) or >= 2; 1 fold is not a split")
+        if self.cpcv_test_groups >= self.cpcv_groups:
+            raise ValueError(
+                f"split.cpcv_test_groups ({self.cpcv_test_groups}) must be less than "
+                f"split.cpcv_groups ({self.cpcv_groups}) — testing every group leaves "
+                f"nothing to train on"
+            )
         return self
 
     @property
     def cross_validate(self) -> bool:
         return self.folds >= 2
+
+    @property
+    def purges(self) -> bool:
+        """Whether this configuration drops rows around the test window."""
+        return self.label_horizon > 0 or self.label_end_col is not None or self.embargo > 0
 
     def resolved_strategy(self, data_kind: str) -> str:
         """``auto`` made concrete: temporal whenever time ordering matters."""
@@ -170,10 +227,33 @@ class SplitConfig(BaseModel):
             return "group"
         return "random"
 
+    def resolved_cv_strategy(self, data_kind: str, task: str) -> str:
+        """``cv_strategy: auto`` made concrete.
+
+        The resolution order encodes which mistake is worse. Time ordering wins
+        first, because a shuffled fold on temporal data is the failure that
+        reports a *better* score. Purging settings win next: someone who declared
+        a label horizon has said their rows overlap, and honouring that with plain
+        k-fold would ignore the one thing they told us. Stratification is the
+        tie-break for row-labelled tasks, and plain k-fold is the floor.
+
+        Explicitly *not* consulted: ``strategy``. A temporal holdout with
+        stratified inner folds is a coherent thing to ask for, and inferring one
+        from the other would make it unaskable.
+        """
+        if self.cv_strategy != "auto":
+            return self.cv_strategy
+        if self.time_col or data_kind == "timeseries":
+            return "rolling_origin"
+        if self.purges:
+            return "purged"
+        return "stratified" if task in ("binary", "multiclass") else "kfold"
+
 
 class DataConfig(BaseModel):
     """Where the data is and what the target is. Source-specific knobs go in
-    ``params``, validated by the source that reads them."""
+    ``params``, validated by the source that reads them; engine knobs go in
+    ``backend_params``, validated by the data backend."""
 
     model_config = _FROZEN
 
@@ -186,6 +266,17 @@ class DataConfig(BaseModel):
     class_names: list[str] | None = None
     split: SplitConfig = Field(default_factory=SplitConfig)
     params: dict[str, Any] = Field(default_factory=dict)
+    # Which engine reads and reduces the table: `local` (pandas) or `spark`.
+    # A plain `str`, not a `Literal`: closing the set would put every third-party
+    # engine in this file, the same reason `model.name` is not one. An unknown
+    # name surfaces as UnknownPluginError from `get_data_backend`, which lists
+    # what is registered.
+    backend: str = "local"
+    # Engine knobs, validated by the backend at first use. A *separate* dict from
+    # `params` rather than a shared one: `params` is validated by the source with
+    # `extra="forbid"` (see `TabularSourceParams`), so an engine key placed there
+    # would make the source reject the config. One owner per dict.
+    backend_params: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def _check_required_by_kind(self) -> DataConfig:
@@ -301,8 +392,114 @@ class TuneConfig(BaseModel):
     # Lightning-only key the way v1's `val/loss` was.
     metric: str | None = None
     refit: Refit = "best"
+    # What a trial is scored on. `holdout` fits once against the validation split.
+    # `cv` averages the objective over `cv_folds` inner folds, cut by the same
+    # `data.split.cv_strategy` the outer estimate uses — so a trial cannot win on
+    # a lucky validation split, at k times the cost.
+    objective: TuneObjective = "holdout"
+    # Inner folds for `objective: cv`. Separate from `data.split.folds`, which is
+    # the *outer* estimate: sharing one number would make the honest nested setup
+    # (5 outer, 3 inner) unexpressible.
+    cv_folds: int = Field(default=3, ge=2)
+    # Optuna trials run concurrently. Threads, not processes — real speedup for
+    # GBDT and sklearn (which release the GIL in fit), close to none for a Python
+    # -bound loop. Leave at 1 on a single GPU: concurrent trials contend for it
+    # and the wall-clock gets worse, not better.
+    n_jobs: int = Field(default=1, ge=1)
     # Narrows a plugin's declared search space, keyed by the same dotted paths.
     overrides: dict[str, Any] = Field(default_factory=dict)
+
+
+class ConstraintConfig(BaseModel):
+    """Production limits a candidate must meet to be eligible to win.
+
+    These are **hard** constraints, not preferences: a candidate that violates one
+    is disqualified and reported with the reason, however good its score is. That
+    is the whole point — a model that cannot answer inside the latency budget is
+    not a better model that happens to be slow, it is a model that does not work.
+
+    ``None`` means the axis is unconstrained, which is the default for all of
+    them. A framework that shipped a default latency ceiling would fail runs on a
+    machine slower than the one the number was picked on.
+    """
+
+    model_config = _FROZEN
+
+    # Measured p95 of single-row inference, in milliseconds. The p95 rather than
+    # the mean because a tail that misses the budget is a timeout in production,
+    # and the mean hides it.
+    max_latency_p95_ms: float | None = Field(default=None, gt=0.0)
+    # Serialized artifact size on disk. The number that decides whether a model
+    # fits in a serving image and a memory budget.
+    max_model_mb: float | None = Field(default=None, gt=0.0)
+    # Refuse a model whose predictions cannot be attributed to features. Drops
+    # anything scoring below `min_explainability` on the tiered scale in
+    # `core/explain.py` — 1.0 native importances, 0.8 SHAP, 0.5 permutation.
+    min_explainability: float | None = Field(default=None, ge=0.0, le=1.0)
+    # A floor on the primary metric. A bake-off where nothing clears the bar
+    # should say so rather than crown the least bad candidate.
+    min_performance: float | None = None
+
+
+class SelectConfig(BaseModel):
+    """Cross-family model selection, consumed by ``pipeline/select.py``.
+
+    Off by default. Selection tunes and profiles *every* eligible candidate
+    family, so turning it on multiplies the cost of a run by the number of
+    candidates — that is a decision to make deliberately, not to inherit.
+    """
+
+    model_config = _FROZEN
+
+    enabled: bool = False
+    # The candidate pool. Empty → every installed model compatible with
+    # (task, data.kind), ranked by `auto_priority`. Naming candidates explicitly
+    # is how you narrow a bake-off to the families you would actually deploy.
+    candidates: list[str] = Field(default_factory=list)
+    # Cap on how many candidates are evaluated, applied after gating and in
+    # priority order. A guard against a plugin-rich install turning one command
+    # into forty fits.
+    max_candidates: int = Field(default=8, ge=1)
+    objective: SelectObjective = "tolerance"
+    constraints: ConstraintConfig = Field(default_factory=ConstraintConfig)
+    # `objective: tolerance` — how much primary-metric difference counts as noise.
+    # None → one standard error of the CV mean, computed per candidate, which
+    # adapts to how variable the data actually is. An explicit value (0.01) is a
+    # fixed band in metric units.
+    tolerance: float | None = Field(default=None, ge=0.0)
+    # `objective: weighted` — normalized 0-1 per-criterion weights. Need not sum
+    # to 1; they are normalized. Ignored under `objective: tolerance`.
+    weights: dict[str, float] = Field(default_factory=dict)
+    # Candidates evaluated concurrently, as separate processes. 1 → sequential,
+    # which is the default because a bake-off on one GPU is not made faster by
+    # running four fits on it at once.
+    max_workers: int = Field(default=1, ge=1)
+    # Measure inference latency and artifact size for each candidate. On by
+    # default: two of the five selection criteria are unavailable without it, and
+    # it costs a few hundred forward passes.
+    profile: bool = True
+    # Rows sampled for the latency benchmark. Enough to be stable, small enough
+    # not to dominate the run.
+    profile_samples: int = Field(default=128, ge=1)
+
+    @model_validator(mode="after")
+    def _check_weights(self) -> SelectConfig:
+        known = {"performance", "latency", "cost", "explainability", "maintainability"}
+        unknown = sorted(set(self.weights) - known)
+        if unknown:
+            raise ValueError(
+                f"select.weights has unknown criteria {unknown}. Known: {sorted(known)}"
+            )
+        if any(w < 0 for w in self.weights.values()):
+            raise ValueError("select.weights must be non-negative")
+        if self.objective == "weighted" and not self.weights:
+            raise ValueError(
+                "select.objective is 'weighted' but select.weights is empty — "
+                "give at least one criterion a weight, or use objective: tolerance"
+            )
+        if self.weights and sum(self.weights.values()) <= 0:
+            raise ValueError("select.weights must not sum to zero")
+        return self
 
 
 class LoggingConfig(BaseModel):
@@ -335,6 +532,7 @@ class ExperimentConfig(BaseModel):
     model: ModelConfig = Field(default_factory=ModelConfig)
     fit: FitConfig = Field(default_factory=FitConfig)
     tune: TuneConfig = Field(default_factory=TuneConfig)
+    select: SelectConfig = Field(default_factory=SelectConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
 
     # ── Plugin resolution ─────────────────────────────────

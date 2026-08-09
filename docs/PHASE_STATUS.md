@@ -16,6 +16,8 @@ Tracks progress against [ml_framework_architecture_plan.md](../ml_framework_arch
 | P8 — Zero-config | **done** | `62672eb` |
 | P9 — Deployment polish | **done** | `1dc3a0c` |
 | P10 — Exporter migration | **partial** — ONNX done, TorchScript open | see below |
+| P11 — Model selection | **done** | `08529e8` |
+| P12 — Pluggable data backends | **done** — all five phases | (this change) |
 
 ## Version
 
@@ -31,11 +33,19 @@ v1 *bundles* still load (`test_v1_bundle_compat.py`); v1 *configs* do not, and
 
 ## Test baseline
 
-**643 passed, 1 skipped** with every declared extra installed except DVC
+**922 passed, 18 skipped** with every declared extra installed except DVC
 (46/4 before P0 → 130/4 after P0 → 249/4 after P1 → 258/1 → 284/1 after P2 → 355/1 after P3 → 395/1 after P4 → 429/1 after P5 → 458/1 after P6 → 471/1 after the image-augmentation fix → 511/1 after P7 → 549/1 after the two NLP tasks → 555/1 after `mlf models` → 563/1 after the HF cache pin → 621/1 after P8 →
-641/1 after P9 → **643/1** after the P10 ONNX half). Every phase gate is measured against this number — a phase that ends
+641/1 after P9 → 643/1 after the P10 ONNX half → 811/1 after P11 → **922/18** after P12). Every phase gate is measured against this number — a phase that ends
 with fewer passing tests than it started with has regressed something, regardless
 of what its own new tests say.
+
+**The skip count jumped 1 → 18 at P12, and that is expected rather than a
+regression.** Every one of the new skips is a Spark test gated on a JVM this
+machine does not have (`shutil.which("java")`), not on an uninstalled package —
+pyspark itself imports fine here, which is exactly why `importorskip` is not the
+gate. They run in the `spark-contract` CI job, which refuses to pass by skipping.
+The Polars backend added in P12's last phase needs no JVM, so its share of the
+same suites runs here rather than skipping.
 
 **Read the 257 → 256 step carefully: it was not a regression** (2 parquet-guard tests then took it to 258). Installing
 `torchvision` makes `MODELS.is_available("cnn")` true, so
@@ -46,8 +56,9 @@ exists to test no longer holds. The companion
 branch instead of `[]`. Both tests are availability-aware by design; do **not**
 pin them to either world.
 
-**That test is the only expected skip.** Any *other* skip means a package went
-missing.
+**Outside the Spark suites, that test is the only expected skip.** The 17 others
+are the JVM-gated Spark tests described above. Any skip that is neither of those
+means a package went missing.
 
 ### The suite does not need the network (after the first run)
 
@@ -1277,3 +1288,227 @@ arriving through a dependency instead of our own logging.
    interpreter for it here. If it fails on the first CI run, that is the matrix
    doing its job and the fix is a real one, not a revert.
 3. `skl2onnx` remains declared and unused (from P9).
+
+---
+
+## P11 — Model selection
+
+Full documentation: [MODEL_SELECTION.md](MODEL_SELECTION.md).
+
+### What P11 landed
+
+Cross-family model selection: tune *every* eligible candidate, then choose on
+five measured criteria rather than on the score alone.
+
+1. **`pipeline/select.py`** — the driver. Gates the candidate pool, tunes each
+   survivor on its own space, cross-validates and profiles it, disqualifies on
+   measured constraints, and applies a decision rule. **Returns a config**, like
+   `tune` does, so `train()` keeps one bundle-writing path whether a bake-off
+   ran, only tuning ran, or neither did.
+2. **`core/profile.py`** — the four measurements that were not being taken:
+   p50/p95/p99 single-row latency and batched throughput, serialized artifact
+   bytes, the explainability tier, and fold stability / fit wall-clock / fold
+   failures.
+3. **`core/explain.py`** — tiered attribution: native `feature_importances_`
+   (1.0) → SHAP for trees (0.8) → `permutation_importance` (0.5) → none (0.0).
+   The score feeds `min_explainability`; the values go to
+   `feature_importance.json`.
+4. **Purged and combinatorial-purged CV** in `data/splitters.py`, joining the
+   list-returning family in the new `CV_SPLITTERS` registry. `label_spans`,
+   `purge_and_embargo` and `embargo_rows` are the shared primitives.
+5. **`data.split.cv_strategy`** — `auto | stratified | kfold | rolling_origin |
+   purged | cpcv`. `auto` reproduces the pre-P11 rule exactly, so an existing
+   config keeps the folds it already had.
+6. **`tune.objective: cv`** — a trial scored as the mean across `tune.cv_folds`
+   inner folds, which is what makes "model and hyperparameters selected jointly,
+   on cross-validation" literally true. `tune.n_jobs` for concurrent trials.
+7. **Parallel candidates**, two ways: `select.max_workers` (a
+   `ProcessPoolExecutor` on one machine) and Airflow dynamic task mapping (one
+   mapped task per family, then a reduce task).
+8. **`mlf select`**, plus `mlf train --select`. `--candidate`/`--collect` split
+   the fan-out from the decision so the same rule runs in both topologies.
+9. **`manifest.selection`** — the whole bake-off inside the served bundle, so a
+   deployed model can answer "why this family?" without the training directory.
+
+### Gates met
+
+- **811 passed, 1 skipped** (from 643/1). Coverage **89.7%**, floor 80.
+- `ruff`, `black --check`, `isort`, `mypy src` all clean.
+- New modules: `select.py` 87%, `profile.py` 93%, `explain.py` 90%,
+  `splitters.py` 95%.
+- Verified end to end on a real dataset: three tree families plus a torch MLP
+  compared on one table, cross-backend, with constraint disqualification, the
+  weighted objective, purged CV, CPCV (C(5,2)=10 folds), a 3-worker process pool,
+  and the Airflow fan-out/collect round trip through JSON.
+
+### Decisions worth knowing
+
+**`select` returns a config, exactly like `tune`.** It does not return a fitted
+model and does not write a bundle. The alternative — having `train()` branch on
+whether a bake-off happened — would have duplicated the bundle-writing path,
+which is the thing P1 existed to collapse. The winner is refit at full budget by
+the code that was already there.
+
+**Gating is two-phase because it has to be.** Compatibility, availability and
+row-count rules are answerable before training and *skip* work. Latency and size
+cannot be known until a model exists, so they disqualify after the fact — with
+the number missed by, because "too slow" is not actionable and "p95 24.10 ms
+exceeds the 20.00 ms budget" is.
+
+**The default decision rule never trades accuracy for speed silently.** Hard
+constraints disqualify; among survivors, the best score wins unless something
+*statistically tied* with it (within one standard error of the CV mean, by
+default) is cheaper. The tie-break order is fixed — latency, size,
+explainability, stability — and the reason string names the axis that actually
+decided, because listing the whole vector invites the reading that the winner is
+better on all of it, which it usually is not.
+
+**An unmeasured latency sorts last, never first.** A model whose speed could not
+be measured must not win a tie *because* it is unknown; that would make a
+measurement failure look like a measurement of zero. Same rule for size.
+
+**The weighted objective exists but is not the default.** It makes accuracy and
+milliseconds commensurable, which they are not, and its composite has no meaning
+outside the run that produced it (normalization is within the bake-off). It is
+there for regulated contexts that need an auditable weight table.
+
+**Purging needs the label span, and there are two honest ways to say it.**
+`label_horizon` states it in rows and needs nothing from the source.
+`label_end_col` is exact and requires `time_col` alongside it — mapping a label
+*end time* onto a row position is impossible without the rows' own observation
+times, and the first implementation of this got it wrong by searching the sorted
+label-end array against itself. The test that caught it is
+`test_label_spans_maps_an_end_time_column_to_positions`.
+
+**Processes, not threads, for candidate parallelism.** A fit is CPU-bound and
+holds the GIL, and two Lightning trainers in one interpreter share global state
+(seed, logger, accelerator registry) in ways that make results depend on
+interleaving. The pool falls back to sequential — loudly — where one cannot be
+created, because failing a run over a scheduling detail is worse than being slow.
+
+**Airflow gets N mapped tasks rather than one task with a loop.** Independent
+retries and independent failures: a family whose extra is missing on one worker
+should be one red square, not a dead pipeline. Reports cross as JSON, not
+pickles, because writer and reader are different processes on different machines.
+
+### A pre-existing bug this surfaced
+
+**`mlf train --model lightgbm` with tuning on a classification task failed
+outright, on `main`, before any P11 code.** Verified by stashing the P11 changes
+and reproducing it.
+
+`_PRUNING_METRICS` in `backends/gbdt.py` maps every task to the library's own
+training loss (`binary_logloss`, `validation_0-mlogloss`, `RMSE`) — all
+*minimized*. The Optuna study direction comes from the task's primary metric,
+which for every classification task is accuracy — *maximized*. LightGBM's
+`LightGBMPruningCallback` detects the mismatch and raises:
+
+```
+ValueError: The intermediate values are inconsistent with the objective values
+in terms of study directions.
+```
+
+xgboost's and catboost's callbacks do **not** detect it, so they pruned in the
+wrong direction in silence — concluding that a *rising* loss was progress and
+abandoning exactly the trials that were working. That is the worse of the two
+failures, and nothing would have reported it.
+
+Fixed by having `pruning_callback` read `trial.study.direction` and attach the
+callback only when the directions agree, logging why when they do not. Pruning is
+worth less on this backend anyway — the module's own docstring already said a
+boosting trial costs seconds, so there is little to abandon — and a search that
+runs every trial honestly beats one that discards the good ones quickly.
+
+The bake-off is what exposed it: nothing before P11 ran lightgbm and xgboost
+through the same tuning path in one command.
+
+## P12 — Pluggable data backends
+
+Design and full execution flow in [choose.md](../choose.md).
+
+`data.backend` (or `--data-backend`) selects the engine that reads and reduces the
+table, per run: `local` (pandas, the default), `polars`, or `spark`. A fourth
+registry, `DATA_BACKENDS`, mirrors `BACKENDS` exactly — spec plus lazy factory, so
+`mlf data-backends` lists every engine on an install without them and selecting one
+yields `pip install 'ml-framework[mlops]'` (or `[fast]`) rather than an ImportError.
+
+`local` and `polars` are **peers**: same contract, different parser. pandas stays
+the base dependency and the default because `read_table -> pd.DataFrame` is public
+API consumed by pandera in `pipeline/contracts.py`.
+
+**The three pipeline call sites did not change.** `train.py`, `tune.py` and
+`select.py` all call `build_bundle(config)`; the choice rides inside the config.
+That was the point.
+
+### The boundary, stated plainly
+
+A data backend chooses **how the table is read and reduced, not how the model is
+trained**. `DataBundle` holds numpy arrays and the splitters index into them, so
+the framework collects a materialized bundle and fits on one node under either
+engine. Spark's job ends at the feature matrix. What it buys:
+
+* **Fold planning without the feature matrix.** `_cv_population` uses exactly
+  `read_table`, `n_rows`, `column` — verified by tracing, not asserted.
+* **Failing on the schema.** A mistyped `data.target` now costs a metadata lookup
+  instead of a full materialization that then throws.
+* **One Spark codebase.** `pipeline/spark_preprocess.py` no longer imports
+  pyspark; it runs on the protocol, so the DVC stage and the training read share
+  one session configuration — and the same cleaning runs under `local` with no
+  JVM, which was impossible before.
+
+### The correctness rule the protocol enforces
+
+Only two methods collect: `column` (standalone arrays) and `to_pandas` (the atomic
+one). *Arrays that must line up row-for-row come out of a single collect.* Each
+collect re-executes the query plan, and pyspark documents
+`monotonically_increasing_id` — which the sort tie-break relies on — as
+non-deterministic; separate collects could therefore pair feature rows with the
+wrong labels, silently. An earlier draft had a `matrix()` method that invited
+exactly that, and it was removed rather than patched.
+
+### The measurement that settled the Polars question
+
+`benchmarks/data_backends.py`, median of 5 runs on this machine: CSV parse
+**19–21×**, Parquet parse ~1.3×, and the whole `build_bundle` **2.8–3.7×**. The
+design doc had argued Polars was not worth adding because the win was "confined to
+parse time"; the parse turns out to dominate `build_bundle`, so the argument was
+right about the location and wrong about the size. The benchmark is committed so
+the ratios can be re-measured rather than trusted.
+
+### What P12 still owes
+
+1. **Nothing Spark-specific has been proven on a machine with a JVM.** The sort
+   tie-break and the multi-collect alignment rule skip without one. The
+   `spark-contract` CI job exists to run them and refuses to pass by skipping, but
+   it has not yet run green. (The cross-engine bundle-equality tests *do* now run,
+   for Polars — that engine needs no JVM.)
+2. **Only `tabular` is backend-aware.** `image`, `text` and `timeseries` read
+   through pandas; a non-local backend is refused by name for them.
+3. **No distributed training.** A `spark` *training* backend consuming a `frame`
+   payload is separate work on a different registry: `GBDTBackend.fit` routes
+   through `_as_matrix`, which sends anything non-pandas to `np.asarray`.
+
+### Deliberate loose ends P12+ must close
+
+1. **Forecasting candidates are not latency-profiled.** A forecaster takes a
+   horizon, not rows, so "ms per row" is not a quantity it has; the profile says
+   "not measured" and the tie-break sorts it last. A latency constraint therefore
+   disqualifies *every* forecaster, which is correct-but-blunt. A horizon-based
+   latency measure is the obvious fix.
+2. **Latency and size are measured on the training machine.** The ranking
+   transfers under identical conditions; the absolute number does not. A
+   production-representative benchmark host would make `max_latency_p95_ms`
+   portable rather than relative.
+3. **No warm-starting between candidates.** Each family's study starts cold.
+   Sharing information across families (a meta-learner over past runs) is real
+   AutoML and deliberately out of scope.
+4. **`select.max_workers` is CPU-oriented.** On one GPU, concurrent candidates
+   contend and wall-clock gets worse. There is no device-aware default; the
+   documentation says to leave it at 1 and fan out with Airflow instead.
+5. **CPCV validation folds come off the end of the surviving training block** —
+   simple and slightly conservative rather than optimal.
+6. **`label_end_col` is tabular/timeseries only.** Image and text folds use
+   `label_horizon` or nothing.
+7. **SHAP is tree-only.** `shap.Explainer`'s sampling fallback takes minutes on a
+   non-tree model, inside a routine that is also timing inference. Those models
+   get permutation importance.

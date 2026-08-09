@@ -26,10 +26,23 @@ stages:
       - ${preprocess.output}
       - ${train.config}
       - src/ml_framework
+    # Bundle v2 — P3 deleted the v1 root artifacts (model.ckpt/scaler.pkl/
+    # metadata.json), which this stage went on declaring for two phases. Nothing
+    # caught it: DVC is deliberately not installed locally and CI only *parses*
+    # this file.
+    #
+    # `manifest.json` is the only file a loader must understand; `model/` and
+    # `preprocessor/` are what it points at. Listed granularly rather than as the
+    # whole `outputs` dir because `metrics.json` lives inside it and DVC will not
+    # accept an output nested in another output. The run's audit trail
+    # (report.txt, predictions.csv, hpo.json, training.log) is deliberately
+    # untracked — it is not what a loader needs, and caching a text report would
+    # version it on every run.
     outs:
-      - outputs/model.ckpt
-      - outputs/scaler.pkl
-      - outputs/metadata.json
+      - outputs/manifest.json
+      - outputs/config.json
+      - outputs/model
+      - outputs/preprocessor
     metrics:
       - outputs/metrics.json:
           cache: false

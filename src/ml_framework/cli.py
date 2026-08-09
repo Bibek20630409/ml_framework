@@ -10,9 +10,11 @@ accept dotted ``--set key=value`` overrides.
     mlf train          --data data/raw/sample.csv          # no YAML at all
     mlf lr             --config configs/example_tabular.yaml
     mlf tune           --config configs/example_tabular.yaml --emit-config configs/tuned.yaml
+    mlf select         --config configs/example_tabular.yaml --max-latency-ms 20
     mlf train          --config configs/example_tabular.yaml --set fit.budget.max_epochs=5
     mlf train          --config configs/example_gbdt.yaml --no-tune
     mlf train          --config configs/example_gbdt.yaml --tune-budget 10m --tune-trials 50
+    mlf train          --config configs/example_tabular.yaml --select
     mlf serve          --artifacts outputs --host 0.0.0.0 --port 8000
     mlf export         --artifacts outputs --format onnx -o model.onnx
     mlf dockerfile     --artifacts outputs -o Dockerfile.serve
@@ -21,6 +23,14 @@ accept dotted ``--set key=value`` overrides.
 ``mlf train`` **tunes by default**, under a per-backend budget (see
 ``config/defaults.py``) — 300 s for trees, 900 s for neural nets. ``--no-tune``
 skips it; ``--tune-budget``/``--tune-trials`` turn it up just as easily.
+
+``mlf select`` **does not run by default**, and that asymmetry is deliberate: a
+bake-off costs one tuning budget *per candidate family*, so it is a decision to
+make rather than one to inherit. It compares every compatible family on score,
+measured latency, artifact size, explainability and fold stability, and prints
+the table. ``mlf train --select`` does the same and then trains the winner.
+``--candidate``/``--collect`` split the same work across an orchestrator — see
+``orchestration/airflow/dags/ml_pipeline.py``.
 
 **Zero-config.** ``--data`` synthesizes a config by looking at the file, so
 ``mlf train --data x.csv`` needs no YAML. Every inferred field is logged with the
@@ -129,6 +139,12 @@ def _load_config(args: argparse.Namespace) -> ExperimentConfig:
     if args.set:
         cfg = cfg.with_overrides(dict(args.set))
 
+    # After `--set`, per the documented precedence: an explicit flag is the last
+    # word. `None` means the flag was not passed at all, which is distinct from a
+    # user asking for `local` -- the same "None means unset" rule the tune flags use.
+    if getattr(args, "data_backend", None):
+        cfg = cfg.with_overrides({"data.backend": args.data_backend})
+
     # Whether the *framework* chose the model, which is what decides if the trivial
     # baseline is worth scoring. Compared against the surviving value rather than
     # set when synthesis ran: a later layer -- a YAML, a --set, an explicit --model
@@ -153,6 +169,15 @@ def _add_config_args(sub: argparse.ArgumentParser) -> None:
         default=[],
         metavar="key=value",
         help="Override a config value (dotted key), repeatable",
+    )
+    # Here rather than in `_add_data_args` because that is the *synthesis* surface
+    # (also used by `mlf init`), and which engine to run on is a choice about this
+    # invocation, not a fact inferred from the data file.
+    sub.add_argument(
+        "--data-backend",
+        default=None,
+        metavar="NAME",
+        help="Data-processing engine for this run: local (default) or spark",
     )
 
 
@@ -199,6 +224,96 @@ def _apply_tune_args(cfg: ExperimentConfig, args: argparse.Namespace) -> Experim
     return cfg.with_overrides(overrides) if overrides else cfg
 
 
+def _add_select_args(sub: argparse.ArgumentParser) -> None:
+    """Bake-off controls. Every flag maps to exactly one ``select.*`` config key,
+    so the CLI and the YAML cannot describe different runs."""
+    sub.add_argument(
+        "--candidates",
+        default=None,
+        metavar="A,B,C",
+        help="Comma-separated model families to compare (default: every compatible one)",
+    )
+    sub.add_argument(
+        "--max-candidates",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Cap the pool after gating, in priority order",
+    )
+    sub.add_argument(
+        "--objective",
+        choices=("tolerance", "weighted"),
+        default=None,
+        help="How the winner is chosen (default: tolerance)",
+    )
+    sub.add_argument(
+        "--tolerance",
+        type=float,
+        default=None,
+        metavar="D",
+        help="Score difference counted as noise (default: one std error of the CV mean)",
+    )
+    sub.add_argument(
+        "--max-latency-ms",
+        type=float,
+        default=None,
+        metavar="MS",
+        help="Disqualify a candidate whose measured p95 single-row latency exceeds this",
+    )
+    sub.add_argument(
+        "--max-model-mb",
+        type=float,
+        default=None,
+        metavar="MB",
+        help="Disqualify a candidate whose serialized artifact exceeds this",
+    )
+    sub.add_argument(
+        "--min-explainability",
+        type=float,
+        default=None,
+        metavar="S",
+        help="Disqualify below this attribution tier (1.0 native, 0.8 shap, 0.5 permutation)",
+    )
+    sub.add_argument(
+        "--max-workers",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Evaluate this many candidates concurrently, as separate processes",
+    )
+    sub.add_argument(
+        "--no-profile",
+        dest="profile",
+        action="store_false",
+        default=None,
+        help="Skip latency/size/explainability measurement and compare on score alone",
+    )
+
+
+def _apply_select_args(cfg: ExperimentConfig, args: argparse.Namespace) -> ExperimentConfig:
+    """Fold the bake-off flags into the config. Same ``None``-means-unset rule as
+    :func:`_apply_tune_args`."""
+    overrides: dict[str, Any] = {}
+    if getattr(args, "candidates", None):
+        overrides["select.candidates"] = [
+            c.strip() for c in args.candidates.split(",") if c.strip()
+        ]
+    for flag, key in (
+        ("max_candidates", "select.max_candidates"),
+        ("objective", "select.objective"),
+        ("tolerance", "select.tolerance"),
+        ("max_workers", "select.max_workers"),
+        ("profile", "select.profile"),
+        ("max_latency_ms", "select.constraints.max_latency_p95_ms"),
+        ("max_model_mb", "select.constraints.max_model_mb"),
+        ("min_explainability", "select.constraints.min_explainability"),
+    ):
+        value = getattr(args, flag, None)
+        if value is not None:
+            overrides[key] = value
+    return cfg.with_overrides(overrides) if overrides else cfg
+
+
 def _format_search_space(spec: Any) -> list[str]:
     """The model's own declared search space, one line per knob.
 
@@ -237,13 +352,17 @@ def _print_plugins(registry: Any, *, include_failed: bool, show_detail: bool) ->
         rows = [row for row in rows if row["name"] not in failed]
 
     if not rows:
-        print("no models registered")
+        # Derived, not hardcoded: this printed "no models registered" for every
+        # registry, including `mlf backends`.
+        print(f"no {registry.kind}s registered")
         return 0
 
-    width = max(len(row["name"]) for row in rows)
-    pad = " " * (width + 9)
     label = registry.kind.upper()
-    second = "BACKEND" if registry.kind == "model" else "ACCEPTS"
+    # The header counts toward the column width: "DATA BACKEND" is longer than any
+    # engine name, and sizing on the names alone ragged-edged every row under it.
+    width = max(*(len(row["name"]) for row in rows), len(label))
+    pad = " " * (width + 9)
+    second = {"model": "BACKEND", "data backend": "ENGINE"}.get(registry.kind, "ACCEPTS")
     # 14 wide: a backend accepting two payloads prints "arrays,dataset", and a
     # narrower column would ragged-edge every description beside it.
     print(f"{label.ljust(width)}  READY  {second:<14}  DESCRIPTION")
@@ -264,15 +383,21 @@ def _print_plugins(registry: Any, *, include_failed: bool, show_detail: bool) ->
 
     hidden = len(failed) if not include_failed else 0
     if hidden:
-        verb = "models" if registry.kind == "model" else "backends"
+        # The command name, derived from the registry rather than assumed to be one
+        # of two: "data backend" -> `mlf data-backends --all`.
+        verb = registry.kind.replace(" ", "-") + "s"
         print(f"\n{hidden} plugin(s) failed to load and are hidden; `mlf {verb} --all` shows them")
     return 0
 
 
 def _second_column(kind: str, spec: Any) -> str:
-    """What a model rides on, or what a backend can consume."""
+    """What a model rides on, what a backend consumes, or what an engine runs on."""
     if kind == "model":
         return str(spec.backend)
+    if kind == "data backend":
+        # A DataBackendSpec carries no `capabilities`: every flag on that class is
+        # about a model or a fit loop. Reaching for one here raised AttributeError.
+        return str(spec.engine) or "-"
     return ",".join(sorted(spec.capabilities.accepts)) or "-"
 
 
@@ -283,6 +408,8 @@ def _format_detail(kind: str, spec: Any) -> list[str]:
             f"data:  {', '.join(sorted(spec.data_kinds)) or 'any'}",
             *_format_search_space(spec),
         ]
+    if kind == "data backend":
+        return [f"engine: {spec.engine}"]
     caps = spec.capabilities
     supported = [
         name
@@ -320,6 +447,16 @@ def build_parser() -> argparse.ArgumentParser:
     backends_p.add_argument("--all", action="store_true", help="Also list failed imports")
     backends_p.add_argument("--show", action="store_true", help="Add each backend's capabilities")
 
+    # Its own verb rather than a flag on `backends`: that command answers "what
+    # fit-loop shapes exist", and a flag that silently made it answer a different
+    # question would be worse than a second command. This one also shows up in
+    # `mlf --help`, which a flag does not.
+    data_backends_p = sub.add_parser(
+        "data-backends", help="List data-processing engines (local, spark)"
+    )
+    data_backends_p.add_argument("--all", action="store_true", help="Also list failed imports")
+    data_backends_p.add_argument("--show", action="store_true", help="Add each engine's detail")
+
     init_p = sub.add_parser("init", help="Write a config inferred from a dataset")
     _add_data_args(init_p)
     init_p.add_argument("--output", "-o", required=True, metavar="PATH", help="Where to write it")
@@ -346,9 +483,17 @@ def build_parser() -> argparse.ArgumentParser:
     lr = sub.add_parser("lr", help="Run the LR range test")
     _add_config_args(lr)
 
-    train_p = sub.add_parser("train", help="Tune (unless disabled) and train")
+    train_p = sub.add_parser("train", help="Select (if enabled), tune (unless disabled) and train")
     _add_config_args(train_p)
     _add_tune_args(train_p)
+    train_p.add_argument(
+        "--select",
+        dest="select",
+        action="store_true",
+        default=None,
+        help="Compare every compatible model family and train the winner",
+    )
+    _add_select_args(train_p)
     train_p.add_argument(
         "--emit-config",
         default=None,
@@ -383,6 +528,42 @@ def build_parser() -> argparse.ArgumentParser:
         _add_tune_args(p)
         p.add_argument("--emit-config", default=None, metavar="PATH", help="Write the winner")
 
+    # `select` runs the bake-off and reports, without fitting the winner at full
+    # budget or writing a bundle — the same relationship `tune` has to `train`.
+    select_p = sub.add_parser(
+        "select", help="Compare model families on score, latency, size and explainability"
+    )
+    _add_config_args(select_p)
+    _add_tune_args(select_p)
+    _add_select_args(select_p)
+    select_p.add_argument(
+        "--emit-config",
+        default=None,
+        metavar="PATH",
+        help="Write the winning config as YAML, for committing back",
+    )
+    select_p.add_argument(
+        "--candidate",
+        default=None,
+        metavar="MODEL",
+        help=(
+            "Evaluate exactly one family and write its report to --report-dir, "
+            "without deciding. The fan-out half of a parallel orchestration."
+        ),
+    )
+    select_p.add_argument(
+        "--collect",
+        default=None,
+        metavar="DIR",
+        help="Decide from the reports already written under DIR. The fan-in half.",
+    )
+    select_p.add_argument(
+        "--report-dir",
+        default=None,
+        metavar="DIR",
+        help="Where --candidate writes its report (default: <output_dir>/reports)",
+    )
+
     serve = sub.add_parser("serve", help="Serve a trained model via FastAPI")
     serve.add_argument("--artifacts", "-a", default="outputs", help="Artifact bundle dir")
     serve.add_argument("--registry-model", default=None, help="Load from MLflow registry by name")
@@ -416,19 +597,201 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _run_select(cfg: ExperimentConfig, args: argparse.Namespace) -> int:
+    """``mlf select`` — the whole bake-off, or one half of a distributed one.
+
+    Three modes, and the split exists so the same decision rule runs whether the
+    candidates were evaluated in one process or across an Airflow fan-out:
+
+    ``--candidate M``  evaluate M alone, write ``<report-dir>/M.json``, decide
+                       nothing. One mapped task's worth of work.
+    ``--collect DIR``  read every report in DIR, apply the constraints and the
+                       decision rule, print the winner. The reduce step.
+    *(neither)*        do both here, sequentially or across ``--max-workers``.
+    """
+    import json
+
+    from .pipeline.select import (
+        SelectionError,
+        SelectionResult,
+        apply_constraints,
+        candidate_models,
+        decide,
+        evaluate_candidate,
+        select,
+    )
+
+    cfg = _apply_select_args(cfg, args)
+    out = Path(cfg.runtime.output_dir)
+    report_dir = Path(args.report_dir) if args.report_dir else out / "reports"
+
+    try:
+        if args.candidate:
+            report = evaluate_candidate(cfg, args.candidate, output_dir=out)
+            report_dir.mkdir(parents=True, exist_ok=True)
+            destination = report_dir / f"{args.candidate.replace('.', '_')}.json"
+            destination.write_text(
+                json.dumps(report.to_dict(), indent=2, default=str), encoding="utf-8"
+            )
+            print(f"wrote {destination}")
+            if not report.eligible:
+                # A gated-out candidate is a normal result of a fan-out task, not
+                # a failed one: exiting non-zero would fail the whole DAG because
+                # one family of five was too slow.
+                print(f"note: {args.candidate} produced no usable profile")
+            return 0
+
+        if args.collect:
+            reports = _load_reports(Path(args.collect))
+            if not reports:
+                log.error("no candidate reports found under %s", args.collect)
+                return 1
+            reports = apply_constraints(reports, cfg)
+            winner, reason = decide(reports, cfg)
+            result = SelectionResult(
+                config=_winning_config(cfg, winner),
+                tuning=select(_winning_config(cfg, winner)).tuning,
+                winner=winner.model,
+                reason=reason,
+                objective=cfg.select.objective,
+                metric=winner.profile.primary_metric if winner.profile else "",
+                reports=reports,
+            )
+        else:
+            cfg = cfg.with_overrides({"select.enabled": True})
+            if not cfg.select.candidates:
+                # Resolve now so the log names the pool before spending on it.
+                log.info("candidate pool: %s", ", ".join(candidate_models(cfg)))
+            result = select(cfg)
+    except (SelectionError, FrameworkError) as exc:
+        log.error("%s", exc)
+        return 1
+
+    print()
+    print(result.table())
+    print()
+    print(f"winner: {result.winner} — {result.reason}")
+    if result.reports and result.winner:
+        for path, value in sorted(
+            next(r for r in result.reports if r.model == result.winner).best_params.items()
+        ):
+            print(f"  {path}: {value}")
+
+    if args.emit_config:
+        from .pipeline.train import _emit_config
+
+        _emit_config(result.config, args.emit_config)
+        print(f"\nwrote {args.emit_config}")
+    else:
+        print("\nRe-run `mlf train --select` to train the winner, or --emit-config to save it.")
+    return 0
+
+
+def _load_reports(directory: Path) -> list[Any]:
+    """Rehydrate ``CandidateReport``s written by ``--candidate`` runs.
+
+    Reads plain JSON rather than a pickle: the writer and the reader are separate
+    processes on separate machines in the orchestrated case, and a pickle would
+    couple them to one interpreter version and one framework version.
+    """
+    import json
+
+    from .core.profile import (
+        CostProfile,
+        LatencyProfile,
+        MaintainabilityProfile,
+        ModelProfile,
+    )
+    from .pipeline.select import CandidateReport
+
+    reports: list[Any] = []
+    for path in sorted(directory.glob("*.json")):
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            log.warning("skipping unreadable report %s (%s)", path, exc)
+            continue
+        if "model" not in raw:
+            continue  # not a candidate report (selection.json, metrics.json, …)
+
+        profile = None
+        if raw.get("profile"):
+            p = raw["profile"]
+            explain = p.get("explainability") or {}
+            profile = ModelProfile(
+                model=p.get("model", raw["model"]),
+                backend=p.get("backend", ""),
+                primary_metric=p.get("primary_metric", ""),
+                score=_nan(p.get("score")),
+                score_std=_nan(p.get("score_std")) if p.get("score_std") is not None else 0.0,
+                n_folds=int(p.get("n_folds", 0)),
+                metrics={k: _nan(v) for k, v in (p.get("metrics") or {}).items()},
+                latency=LatencyProfile(**_only(p.get("latency"), LatencyProfile)),
+                cost=CostProfile(**_only(p.get("cost"), CostProfile)),
+                explainability=float(explain.get("score", 0.0)),
+                explain_method=str(explain.get("method", "none")),
+                maintainability=MaintainabilityProfile(
+                    **_only(p.get("maintainability"), MaintainabilityProfile)
+                ),
+            )
+        reports.append(
+            CandidateReport(
+                model=raw["model"],
+                backend=raw.get("backend", ""),
+                profile=profile,
+                best_params=raw.get("best_params") or {},
+                n_trials=int(raw.get("n_trials", 0)),
+                tune_skipped=raw.get("tune_skipped"),
+                elapsed=float(raw.get("elapsed_seconds", 0.0)),
+                skipped=raw.get("skipped"),
+                disqualified=raw.get("disqualified"),
+            )
+        )
+    return reports
+
+
+def _only(raw: Any, cls: type) -> dict[str, Any]:
+    """``raw`` narrowed to ``cls``'s own fields.
+
+    The serialized form carries derived values (``artifact_mb``, ``score``) that
+    are properties, not fields. Filtering rather than popping known extras means
+    a future derived field does not break the reader.
+    """
+    from dataclasses import fields
+
+    names = {f.name for f in fields(cls)}
+    return {k: v for k, v in (raw or {}).items() if k in names}
+
+
+def _nan(value: Any) -> float:
+    """JSON ``null`` back to ``NaN`` — the inverse of ``profile._jsonable``."""
+    return float("nan") if value is None else float(value)
+
+
+def _winning_config(cfg: ExperimentConfig, winner: Any) -> ExperimentConfig:
+    return cfg.with_overrides(
+        {"model.name": winner.model, "select.enabled": False, **winner.best_params}
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     setup_logging()
 
-    if args.command in ("models", "backends"):
+    if args.command in ("models", "backends", "data-backends"):
         # Importing the plugin package is what populates the registry, and it is
         # required to be dependency-free — see plugins/__init__.py.
         import ml_framework.plugins  # noqa: F401
 
         from . import backends as _backends  # noqa: F401  (registers the backends)
-        from .core.registry import BACKENDS, MODELS
+        from .core.registry import BACKENDS, DATA_BACKENDS, MODELS
+        from .data import backends as _data_backends  # noqa: F401  (registers the engines)
 
-        registry = MODELS if args.command == "models" else BACKENDS
+        registry = {
+            "models": MODELS,
+            "backends": BACKENDS,
+            "data-backends": DATA_BACKENDS,
+        }[args.command]
         return _print_plugins(registry, include_failed=args.all, show_detail=args.show)
 
     if args.command == "export":
@@ -587,9 +950,15 @@ def main(argv: list[str] | None = None) -> int:
             print("\nRe-run `mlf train` to apply these, or pass --emit-config to save them.")
         return 0
 
+    if args.command == "select":
+        return _run_select(cfg, args)
+
     if args.command == "train":
         from .pipeline import train
 
+        cfg = _apply_select_args(cfg, args)
+        if getattr(args, "select", None):
+            cfg = cfg.with_overrides({"select.enabled": True})
         if args.folds is not None:
             cfg = cfg.with_overrides({"data.split.folds": args.folds})
         train(

@@ -26,7 +26,6 @@ to validate a YAML file (see ``config/schema.py``).
 from __future__ import annotations
 
 import logging
-from pathlib import Path
 from typing import Any, Literal
 
 import numpy as np
@@ -34,8 +33,8 @@ import pandas as pd
 from pydantic import BaseModel as PydanticModel
 from pydantic import Field
 
-from ...core.plugins import check_requirements
-from ...core.types import Capabilities, FrameworkError, Requirement
+from ...core.types import Capabilities, FrameworkError
+from ..backends import engine_for
 from ..preprocess.tabular import (
     TabularPreprocessor,
     balanced_sample_weights,
@@ -46,13 +45,10 @@ from ..types import DataBundle, FeatureSchema, Split
 
 log = logging.getLogger(__name__)
 
-
-# pandas needs an engine to read parquet, and it is not a pandas dependency.
-# Declaring it here rather than leaning on `mlflow` (which happens to require
-# pyarrow) keeps the coupling visible: the parquet path must fail with a pip
-# command, not with a pandas ImportError, in exactly the environment where the
-# dependency is most likely absent — a serving image built without the mlops extra.
-PARQUET_REQUIREMENT = Requirement("pyarrow", extra="parquet", min_version="10.0.1")
+# `PARQUET_REQUIREMENT` used to live here. It moved to `data/backends/local.py`
+# with the pandas read it guards, and is not re-exported: nothing imported it from
+# this module, and a compatibility alias for a name with no importers is a shim
+# that only ever costs.
 
 
 class TabularSourceParams(PydanticModel):
@@ -70,18 +66,24 @@ class TabularSourceParams(PydanticModel):
     holdout_threshold: int = Field(default=5000, gt=0)
 
 
-def read_table(path: str) -> pd.DataFrame:
+def read_table(path: str, *, backend: str = "local") -> pd.DataFrame:
     """Read a tabular dataset as CSV or Parquet.
 
     Supports a ``.parquet``/``.pq`` file, or a directory of parquet part-files
     (what Spark writes), or a ``.csv`` file. This is what lets the Spark
     preprocessing stage hand off to training transparently.
+
+    ``backend`` chooses *who does the reading* — under ``spark`` the read is
+    distributed and this function is the collect point. The return type is
+    **pandas under every backend**: this is public API, re-exported from ``core``
+    and consumed by ``pipeline/contracts.py``, which hands the frame to pandera.
+    Code that wants to stay lazy should go through
+    :func:`~ml_framework.core.registry.get_data_backend` directly.
     """
-    p = Path(path)
-    if p.is_dir() or p.suffix.lower() in (".parquet", ".pq"):
-        check_requirements((PARQUET_REQUIREMENT,), what=f"reading parquet from '{path}'")
-        return pd.read_parquet(path)
-    return pd.read_csv(path)
+    from ...core.registry import get_data_backend
+
+    engine = get_data_backend(backend)
+    return engine.to_pandas(engine.read_table(path))
 
 
 def build_splitter(config, params: TabularSourceParams) -> Any:
@@ -193,9 +195,16 @@ def build_tabular_bundle(config, *, indices: Any = None) -> DataBundle:
         raise ValueError("tabular data requires data.path")
     params = TabularSourceParams.model_validate(dict(config.data.params))
 
-    df = read_table(config.data.path)
+    engine = engine_for(config)
+    table = engine.read_table(config.data.path)
+
+    # Every check below runs against the **schema**, before a byte is collected.
+    # Under `spark` that is the difference between "data.target 'labl' not in the
+    # table's columns" arriving in a second and arriving after a full
+    # materialization of a table that was never going to work.
+    available = engine.columns(table)
     target = config.data.target
-    if target not in df.columns:
+    if target not in available:
         raise KeyError(f"data.target '{target}' not in the table's columns")
 
     split_cfg = config.data.split
@@ -204,12 +213,29 @@ def build_tabular_bundle(config, *, indices: Any = None) -> DataBundle:
     # generalizing across.
     reserved = {target, split_cfg.time_col, split_cfg.group_col} - {None}
     for name in (split_cfg.time_col, split_cfg.group_col):
-        if name is not None and name not in df.columns:
+        if name is not None and name not in available:
             raise KeyError(f"split column '{name}' not in the table's columns")
 
-    feature_cols = [c for c in df.columns if c not in reserved]
+    feature_cols = [c for c in available if c not in reserved]
     if not feature_cols:
         raise FrameworkError(f"'{config.data.path}' has no feature columns besides '{target}'")
+
+    # Dtypes off the schema, normalized by the engine, so `FeatureSchema.dtypes` —
+    # which reaches the bundle manifest and the serving signature — cannot record
+    # which engine happened to build the bundle.
+    dtypes = engine.dtypes(table, feature_cols)
+
+    # **The collect point**, and deliberately a single one. x, y, the time column
+    # and the group column must all index the same rows; separate collects would
+    # be separate executions of the plan, and a distributed engine does not
+    # promise two executions agree on row order. Pairing feature rows with the
+    # wrong labels is the worst failure this module could have, and it would be
+    # silent — so everything downstream slices one materialized frame.
+    #
+    # No projection: features + target + time + group *is* every column here, so
+    # there is nothing for `select` to push down.
+    df = engine.to_pandas(table)
+
     x = df[feature_cols].values.astype("float32")
     y = df[target].values
     y = y.astype("int64") if config.task != "regression" else y.astype("float32")
@@ -251,7 +277,7 @@ def build_tabular_bundle(config, *, indices: Any = None) -> DataBundle:
 
     schema = FeatureSchema(
         feature_names=tuple(feature_cols),
-        dtypes={c: str(df[c].dtype) for c in feature_cols},
+        dtypes=dict(dtypes),
         target_name=target,
         class_names=tuple(config.data.class_names) if config.data.class_names else None,
         time_col=split_cfg.time_col,

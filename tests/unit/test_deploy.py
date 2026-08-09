@@ -27,7 +27,7 @@ from ml_framework.core.bundle import (
     write_bundle,
 )
 from ml_framework.core.types import Requirement
-from ml_framework.deploy import DeployError, render_dockerfile, required_extras
+from ml_framework.deploy import DeployError, excluded_by, render_dockerfile, required_extras
 
 
 def make_bundle(dest: Path, *, name: str, backend: str, requires: list[Requirement]) -> Path:
@@ -145,6 +145,92 @@ def test_the_bundle_is_copied_not_mounted(tmp_path):
 def test_a_missing_bundle_says_so(tmp_path):
     with pytest.raises(DeployError, match="no bundle directory"):
         render_dockerfile(tmp_path / "absent")
+
+
+# ── The build context ─────────────────────────────────────
+# A generated Dockerfile is only correct relative to the context it will be built
+# from, and that context was previously implicit: the bundle was copied by its
+# basename (assuming the context is the bundle's parent) while `src/` and
+# `pyproject.toml` were copied by name (assuming the context is the repository
+# root). The two coincide only for a bundle sitting directly in the root — which
+# is the default, `outputs/`, and which this repository's own .dockerignore
+# strips. The default configuration was the broken one.
+@pytest.mark.unit
+def test_a_dockerignored_bundle_is_refused_rather_than_copied_as_nothing(tmp_path):
+    """The failure this replaces was invisible in the worst way: the build
+    succeeds, the image is produced, and `COPY` quietly contributes an empty
+    directory. Nothing goes wrong until the container starts and cannot find a
+    manifest — by which point the evidence is a serving log, not a build log."""
+    bundle = make_bundle(
+        tmp_path / "outputs",
+        name="xgboost",
+        backend="gbdt",
+        requires=[Requirement("xgboost", extra="gbdt")],
+    )
+    (tmp_path / ".dockerignore").write_text("__pycache__\noutputs\n*.pkl\n", encoding="utf-8")
+
+    with pytest.raises(DeployError, match=r"strips 'outputs'"):
+        render_dockerfile(bundle)
+
+
+@pytest.mark.unit
+def test_the_documented_fix_actually_works(tmp_path):
+    """The refusal above tells the reader to add `!outputs`. Docker's rule is
+    last-match-wins, so that has to re-include the bundle — an error message
+    that sends people somewhere unhelpful is worse than no message."""
+    bundle = make_bundle(
+        tmp_path / "outputs",
+        name="xgboost",
+        backend="gbdt",
+        requires=[Requirement("xgboost", extra="gbdt")],
+    )
+    (tmp_path / ".dockerignore").write_text("outputs\n!outputs\n", encoding="utf-8")
+
+    assert "COPY outputs/ ./bundle/" in render_dockerfile(bundle)
+
+
+@pytest.mark.unit
+def test_excluding_a_parent_directory_excludes_the_bundle_under_it(tmp_path):
+    """Docker excludes a matched directory's whole subtree, so a pattern has to
+    be tested against every parent prefix and not only the full path. Checking
+    the path alone would miss `artifacts` stripping `artifacts/run7`."""
+    assert excluded_by("artifacts/run7", tmp_path) is None  # no .dockerignore at all
+
+    (tmp_path / ".dockerignore").write_text("artifacts\n", encoding="utf-8")
+    assert excluded_by("artifacts/run7", tmp_path) == "artifacts"
+
+
+@pytest.mark.unit
+def test_the_copy_path_is_relative_to_the_context_not_the_basename(tmp_path):
+    """A bundle nested deeper than one level under the context must be copied by
+    the path the context can resolve. The basename form named a directory that
+    does not exist at the context root, so COPY had nothing to match."""
+    nested = tmp_path / "artifacts" / "run7"
+    make_bundle(
+        nested, name="xgboost", backend="gbdt", requires=[Requirement("xgboost", extra="gbdt")]
+    )
+
+    text = render_dockerfile(nested, context=tmp_path)
+
+    assert "COPY artifacts/run7/ ./bundle/" in text
+    assert "COPY run7/" not in text
+
+
+@pytest.mark.unit
+def test_a_bundle_outside_the_context_is_refused(tmp_path):
+    """COPY cannot reach outside a build context. Emitting a path that climbs out
+    of it produces a Dockerfile that cannot build anywhere."""
+    bundle = make_bundle(
+        tmp_path / "elsewhere" / "b",
+        name="xgboost",
+        backend="gbdt",
+        requires=[Requirement("xgboost", extra="gbdt")],
+    )
+    context = tmp_path / "context"
+    context.mkdir()
+
+    with pytest.raises(DeployError, match="not inside the build context"):
+        render_dockerfile(bundle, context=context)
 
 
 # ── The CLI ───────────────────────────────────────────────

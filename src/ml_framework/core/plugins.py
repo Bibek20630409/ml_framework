@@ -217,7 +217,41 @@ class SourceSpec:
     description: str = ""
 
 
-SpecT = TypeVar("SpecT", bound="ModelSpec | BackendSpec | SourceSpec")
+@dataclass(frozen=True, slots=True)
+class DataBackendSpec:
+    """A registered data-processing engine, selected by ``data.backend``.
+
+    ``factory`` is a zero-arg callable returning the
+    :class:`~ml_framework.core.protocols.DataBackend`; it imports its engine
+    inside itself, so registering the spark backend costs a bare install nothing.
+
+    **No ``capabilities`` field.** Every flag on :class:`Capabilities` is about a
+    model or a fit loop (``needs_scaling``, ``produces_proba``); a
+    default-constructed one here would be exactly the decoration that class's
+    docstring forbids. ``engine`` is the one honest column, and
+    ``mlf data-backends`` is its single named consumer.
+    """
+
+    name: str
+    factory: Callable[..., Any]
+    """``factory(**backend_params) -> DataBackend``.
+
+    Takes keyword arguments — unlike :class:`BackendSpec`'s zero-arg factory —
+    because ``data.backend_params`` is validated *by the backend*, so the backend
+    has to receive it. An unknown key is the backend's error to raise.
+    """
+    engine: str = ""
+    """The library doing the work: ``"pandas"``, ``"pyspark"``.
+
+    Distinct from ``name`` because the name is the *choice* a user types and the
+    engine is what it runs on; two backends could share an engine and differ in
+    how they use it.
+    """
+    requires: tuple[Requirement, ...] = ()
+    description: str = ""
+
+
+SpecT = TypeVar("SpecT", bound="ModelSpec | BackendSpec | SourceSpec | DataBackendSpec")
 
 
 # ── Registry ──────────────────────────────────────────────

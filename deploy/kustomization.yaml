@@ -1,0 +1,36 @@
+# Deploy the whole platform:  kubectl apply -k deploy
+# Validate without a cluster:  kubectl kustomize deploy   (or: kustomize build deploy)
+#
+# The root is `deploy/`, not `deploy/k8s/`, and that is load-bearing. Kustomize
+# refuses to read a file outside the kustomization root (LoadRestrictionsRootOnly),
+# so a kustomization rooted at `k8s/` could not reach the Grafana dashboard JSON at
+# `monitoring/grafana/dashboards/` — `kubectl kustomize` failed with a `security;
+# file is not in or below` error, and so did `kubectl apply -k`.
+#
+# The obvious escape hatch does not work: `--load-restrictor LoadRestrictionsNone`
+# exists on `kubectl kustomize` but **not** on `kubectl apply -k`, so it would have
+# fixed validation while leaving the actual deploy broken. Moving the JSON under
+# `k8s/` was the other option and breaks `docker-compose.yml`, which mounts
+# `deploy/monitoring/grafana/dashboards` into the local Grafana. Raising the root
+# is the one fix that leaves every consumer working and moves no files.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: ml-framework
+
+resources:
+  - k8s/namespace.yaml
+  - k8s/minio.yaml
+  - k8s/mlflow.yaml
+  - k8s/api.yaml
+  - k8s/monitoring.yaml
+  - k8s/policies.yaml
+
+# Grafana's dashboard JSON is turned into a ConfigMap the grafana Deployment mounts.
+configMapGenerator:
+  - name: grafana-dashboard
+    files:
+      - monitoring/grafana/dashboards/ml-framework.json
+
+generatorOptions:
+  disableNameSuffixHash: true

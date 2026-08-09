@@ -233,6 +233,14 @@ class Capabilities:
     # on a hardcoded task check.
     produces_proba: bool = True
 
+    # `core.explain.feature_importance`: try the estimator's own
+    # `feature_importances_`/`coef_` before falling back to permutation
+    # importance, which costs a full predict pass per feature. Declaring it is
+    # cheaper than probing, and the probe still runs — the flag decides the
+    # *order* of the attempts, so a wrong declaration costs time, never
+    # correctness.
+    native_feature_importance: bool = False
+
     # HPO driver: install a pruning hook, or fall back to a non-pruning pruner.
     supports_pruning: bool = False
 

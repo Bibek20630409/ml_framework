@@ -322,6 +322,10 @@ _FORMATS: dict[str, str] = {
 # The library's own name for the validation metric it reports, per task. The
 # pruning callback watches this string, and each library spells it differently —
 # pruning on a name the library never emits would silently do nothing.
+#
+# **Every entry here is a loss**: these are the metrics the libraries report from
+# their own training objective, and all of them improve downward. That fact is
+# load-bearing — see `pruning_callback`.
 _PRUNING_METRICS: dict[str, dict[str, str]] = {
     "xgboost": {
         "binary": "validation_0-logloss",
@@ -340,18 +344,62 @@ _PRUNING_METRICS: dict[str, dict[str, str]] = {
     },
 }
 
+# The direction the values in `_PRUNING_METRICS` improve in. A constant rather
+# than a per-entry field because it is a property of the whole table, and naming
+# it is what makes the mismatch check below readable.
+_PRUNING_DIRECTION = "min"
+
+
+def study_direction(trial: Any) -> str | None:
+    """``"min"``/``"max"`` for the study this trial belongs to, or ``None``.
+
+    Read off the trial rather than passed down from the driver: the driver
+    already told Optuna the direction when it created the study, and threading
+    the same fact through three layers is how the two get to disagree.
+    """
+    try:
+        return "max" if trial.study.direction.name == "MAXIMIZE" else "min"
+    except AttributeError:  # a stub trial in a test, or an Optuna version change
+        return None
+
 
 def pruning_callback(library: str, trial: Any, task: str) -> Any | None:
-    """The library's Optuna pruning callback, or ``None`` if unavailable.
+    """The library's Optuna pruning callback, or ``None`` if it cannot be used.
 
     Returning ``None`` rather than raising is deliberate: tuning is on by default,
     so an install without ``optuna-integration`` should tune *without* pruning
     rather than refuse to train.
+
+    **The direction check is a correctness fix, not an optimization.** The values
+    these libraries report are losses (see ``_PRUNING_METRICS``), while the study
+    maximizes the task's primary metric — accuracy, for every classification
+    task. Handing a minimizing series to a maximizing pruner means the pruner
+    concludes that a *rising* loss is progress and abandons exactly the trials
+    that were working. LightGBM's callback detects the mismatch and raises,
+    which took `mlf train --model lightgbm` down entirely on a classification
+    task; xgboost's and catboost's do not, so they pruned backwards in silence,
+    which is worse.
+
+    So: attach the callback only when the directions agree, and say why when they
+    do not. Pruning is worth less on this backend anyway — a boosting trial costs
+    seconds, so there is little to abandon — and a search that runs every trial
+    honestly beats one that discards the good ones quickly.
     """
     metric = _PRUNING_METRICS.get(library, {}).get(task)
     if metric is None:
         log.debug("no pruning metric for %s/%s; tuning without pruning", library, task)
         return None
+
+    direction = study_direction(trial)
+    if direction is not None and direction != _PRUNING_DIRECTION:
+        log.debug(
+            "tuning %s without pruning: the study maximizes, but '%s' is a loss "
+            "(pruning on it would abandon improving trials)",
+            library,
+            metric,
+        )
+        return None
+
     attr = {
         "xgboost": "XGBoostPruningCallback",
         "lightgbm": "LightGBMPruningCallback",

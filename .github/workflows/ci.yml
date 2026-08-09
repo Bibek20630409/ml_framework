@@ -96,6 +96,33 @@ jobs:
           else:
               raise SystemExit("selecting an uninstalled model must raise MissingExtraError")
           PY
+      - name: Data backends are listed without importing an engine
+        run: |
+          python - <<'PY'
+          import sys
+
+          from ml_framework.core.plugins import MissingExtraError
+          from ml_framework.core.registry import DATA_BACKENDS, get_data_backend
+          import ml_framework.data.backends  # noqa: F401
+
+          # The same guarantee as the model registry, one axis wider: registering an
+          # engine must cost a bare install nothing, however many are registered.
+          assert DATA_BACKENDS.names() == ["local", "polars", "spark"], DATA_BACKENDS.names()
+          for mod in ("pyspark", "polars"):
+              assert mod not in sys.modules, f"registering a backend imported {mod}"
+          assert DATA_BACKENDS.is_available("local"), "the default engine must always be available"
+          # `local` is the only one with no `requires` — that is what makes "a bare
+          # install trains" unconditional rather than dependent on an extra.
+          for name, extra in (("spark", "mlops"), ("polars", "fast")):
+              assert not DATA_BACKENDS.is_available(name), f"{name} should be absent here"
+              try:
+                  get_data_backend(name)
+              except MissingExtraError as exc:
+                  assert f"ml-framework[{extra}]" in str(exc), exc
+                  print(exc)
+              else:
+                  raise SystemExit(f"selecting uninstalled '{name}' must raise MissingExtraError")
+          PY
       - name: Train a GBDT bundle and serve it
         run: |
           mlf train --config configs/example_gbdt.yaml --set fit.params.n_estimators=20
@@ -111,6 +138,87 @@ jobs:
               print("served:", res.json())
           import sys
           assert "torch" not in sys.modules
+          assert "pyspark" not in sys.modules
+          assert "polars" not in sys.modules
+          PY
+
+  # The only place the Spark data backend actually executes. Everywhere else in
+  # this file pyspark is either absent (gbdt-no-torch) or present without a JVM
+  # (the test matrix), so the conformance suite skips and `spark.py`'s collects and
+  # its sort tie-break go unproven.
+  #
+  # That tie-break is the feature's worst failure mode: Spark's `orderBy` fixes the
+  # order of keys but not of *equal* keys, and `builders._label_columns` sorts so
+  # splitter positions line up with the rows they split — so a table with duplicate
+  # timestamps would silently produce different folds, and different scores, from
+  # one run to the next. A test that only ever skips does not catch that.
+  spark-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install with the mlops extra
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,mlops]"
+      - name: Refuse to pass by skipping
+        # Without this the job is theatre. The Spark tests gate on exactly these
+        # two conditions, so if setup-java silently failed every one of them would
+        # skip and the job would go green having proven nothing -- which is the
+        # precise gap it was added to close. Assert the gate is open *first*.
+        run: |
+          python - <<'PY'
+          import importlib.util, shutil, sys
+          if importlib.util.find_spec("pyspark") is None:
+              sys.exit("pyspark did not install; the conformance suite would skip")
+          java = shutil.which("java")
+          if not java:
+              sys.exit("no JVM on PATH; the conformance suite would skip")
+          print("java on PATH:", java)
+          from pyspark.sql import SparkSession
+          spark = SparkSession.builder.appName("ci-probe").getOrCreate()
+          print("spark session:", spark.version)
+          spark.stop()
+          PY
+      - name: Conformance suite against a real Spark session
+        run: |
+          pytest -p no:cacheprovider -v -rs \
+            tests/unit/test_data_backends.py \
+            tests/unit/test_spark_backend_translation.py \
+            tests/unit/test_data_backend_selection.py \
+            tests/unit/test_preprocess_stage.py \
+            tests/integration/test_data_backend_equivalence.py
+      - name: The preprocessing stage runs on a real Spark session
+        # Its unit tests pin the cleaning logic under `local`; this is the only
+        # place the same code path executes against pyspark, which is the engine
+        # the DVC stage and the Airflow DAG actually use.
+        run: |
+          python - <<'PY'
+          import pandas as pd, numpy as np, tempfile, pathlib
+          from ml_framework.pipeline.spark_preprocess import main
+          from ml_framework.core import read_table
+
+          tmp = pathlib.Path(tempfile.mkdtemp())
+          pd.DataFrame({
+              "f0": [1.0, 2.0, np.nan, 4.0, 4.0, 6.0],
+              "f1": [10.0, 20.0, np.nan, 40.0, 40.0, 60.0],
+              "label": [0, 1, 0, 1, 1, None],
+          }).to_csv(tmp / "raw.csv", index=False)
+
+          out = str(tmp / "processed")
+          assert main(["--input", str(tmp / "raw.csv"), "--output", out,
+                       "--target-col", "label"]) == 0
+          frame = read_table(out)
+          assert len(frame) == 3, frame
+          assert str(frame["label"].dtype) == "float64", frame.dtypes
+          print("spark preprocess ->", len(frame), "rows")
           PY
 
   mlops-validate:
@@ -125,10 +233,17 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install pyyaml
-          curl -sfLo /usr/local/bin/kustomize https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh || true
+          # No kustomize install here on purpose. This step used to curl
+          # `install_kustomize.sh` *to* /usr/local/bin/kustomize — saving the
+          # installer script under the name of the binary it installs, never
+          # chmod'ing it, and swallowing every failure with `|| true`. Nothing ever
+          # noticed because the render step below uses `kubectl kustomize`, which
+          # ubuntu-latest already provides.
       - name: Compile Python pipeline + DAG + load script
         run: |
           python -m py_compile src/ml_framework/pipeline/spark_preprocess.py
+          python -m py_compile src/ml_framework/data/backends/spark.py
+          python -m py_compile src/ml_framework/data/backends/local.py
           python -m py_compile src/ml_framework/pipeline/contracts.py
           python -m py_compile src/ml_framework/monitoring/drift.py
           python -m py_compile src/ml_framework/monitoring/model_quality.py
@@ -154,7 +269,42 @@ jobs:
           sys.exit(1 if bad else 0)
           PY
       - name: Kustomize build (k8s manifests render)
+        # Two ways this step used to pass without checking anything, both fixed:
+        #   1. It was wrapped in `if command -v kubectl`, so a runner without
+        #      kubectl reported success for a render it never ran.
+        #   2. A kustomization that resolves but yields nothing exits 0, so
+        #      `> /dev/null` alone cannot tell "rendered fine" from "rendered
+        #      nothing".
+        # ubuntu-latest ships kubectl; its absence means the image changed, which is
+        # something to fail on and fix rather than skip past.
         run: |
-          if command -v kubectl >/dev/null; then kubectl kustomize deploy/k8s > /dev/null && echo "kustomize OK"; fi
+          command -v kubectl >/dev/null || {
+            echo "kubectl not found — ubuntu-latest no longer ships it; install it explicitly" >&2
+            exit 1
+          }
+          # Root is `deploy`, not `deploy/k8s`: the configMapGenerator reads the
+          # Grafana JSON under `deploy/monitoring/`, and kustomize refuses a file
+          # outside the kustomization root. See deploy/kustomization.yaml.
+          kubectl kustomize deploy > rendered.yaml
+          kinds=$(grep -c '^kind:' rendered.yaml || true)
+          if [ "${kinds:-0}" -lt 1 ]; then
+            echo "kustomize built successfully but produced no resources" >&2
+            exit 1
+          fi
+          echo "kustomize OK — $kinds resources"
       - name: Validate Grafana dashboard JSON
-        run: python -c "import json; json.load(open('deploy/monitoring/grafana/dashboards/ml-framework.json'))"
+        # Globbed rather than named: this step hardcoded one filename, so renaming
+        # the dashboard broke the job for a reason that had nothing to do with the
+        # JSON being valid. The empty check is the other half — a glob that matches
+        # nothing would otherwise pass vacuously, which is the same failure wearing
+        # the opposite hat.
+        run: |
+          python - <<'PY'
+          import glob, json, sys
+          files = glob.glob("deploy/monitoring/grafana/dashboards/*.json")
+          if not files:
+              sys.exit("no dashboard JSON found — the glob must not pass vacuously")
+          for f in files:
+              json.load(open(f, encoding="utf-8"))
+              print("ok", f)
+          PY

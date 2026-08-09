@@ -12,7 +12,8 @@ orchestrated → tracked → deployed → scaled → monitored.
     └─ trigger deploy     → roll the serving Deployment
                                 │
  Serving: FastAPI (loads models:/ml-framework@production) ─▶ Docker ─▶ Kubernetes
-    │  /predict  /predict_proba  /health  /metrics            (Deployment/Svc/Ingress/HPA)
+    │  /predict /predict_proba /predict_with_confidence           (Deployment/Svc/Ingress/HPA)
+    │  /health /metrics /drift
     ▼
  Monitoring: Prometheus scrapes /metrics ─▶ Grafana ("ML Framework — Serving")
 ```
@@ -21,13 +22,15 @@ orchestrated → tracked → deployed → scaled → monitored.
 |---|---|---|
 | Experiment tracking + model registry | **MLflow** | `tracking/mlflow_utils.py`, `logging.backend: mlflow` |
 | Data version control | **DVC** | `dvc.yaml`, `params.yaml` |
-| Data processing (at scale) | **Apache Spark** | `pipeline/spark_preprocess.py` |
+| Data processing engine (per run) | **pandas · Polars · Spark** | `data/backends/`, `data.backend` / `--data-backend` |
+| Data processing (batch stage) | **Apache Spark** | `pipeline/spark_preprocess.py` |
 | Orchestration | **Apache Airflow** | `orchestration/airflow/dags/ml_pipeline.py` |
 | Serving | **FastAPI** (+ KServe option) | `serving/api.py`, `deploy/k8s/api.yaml` |
-| Infra / scaling | **Kubernetes** | `deploy/k8s/` (kustomize) |
+| Infra / scaling | **Kubernetes** | `deploy/k8s/` manifests, `deploy/kustomization.yaml` |
 | Monitoring | **Prometheus + Grafana** | `deploy/monitoring/`, `deploy/k8s/monitoring.yaml` |
 
-Install everything: `pip install -e ".[dev,serve,mlops]"`.
+Install everything: `pip install -e ".[dev,serve,mlops]"`. Add `fast` for the Polars
+engine — it is a peer of pandas, not part of the `mlops` stack.
 
 ## Fastest path: the whole stack locally
 
@@ -46,9 +49,9 @@ mlf train --config configs/example_tabular.yaml \
   --set logging.registered_model_name=ml-framework
 ```
 
-Every run's params, metrics, and the portable bundle (`model.ckpt` + `scaler.pkl` +
-`metadata.json`) are logged; a new **registered model version** is created. Serving
-loads it back:
+Every run's params, metrics, and the whole bundle v2 directory (`manifest.json` +
+`model/` + `preprocessor/` + `config.json`, under `bundle/`) are logged; a new
+**registered model version** is created. Serving loads it back:
 
 ```bash
 mlf serve --registry-model ml-framework --registry-stage production \
@@ -81,6 +84,40 @@ Reads raw CSV/Parquet, cleans + feature-engineers at scale, writes processed Par
 that the datamodule reads directly (`read_table` handles CSV, Parquet files, and
 Spark's Parquet directories). Requires Java 11/17.
 
+The engine is a flag, and `spark` is only the default:
+
+```bash
+python -m ml_framework.pipeline.spark_preprocess \
+  --input data/raw/sample.csv --output data/processed --target-col label \
+  --data-backend local        # identical cleaning logic in pandas — no JVM needed
+```
+
+Same code path, same output, different executor — which is what makes the stage
+testable on a laptop and on a cluster without two implementations to keep in step.
+
+### The data backend, per run
+
+`data.backend` (or `--data-backend` on `train`, `lr`, `tune` and `select`) chooses the
+engine that reads and reduces the table:
+
+| Engine | Extra | Use when |
+|---|---|---|
+| `local` | none — always available | The default. pandas; `read_table -> pd.DataFrame` is public API |
+| `polars` | `[fast]` | Parse-bound runs on wide or long CSVs |
+| `spark` | `[mlops]` + a JVM | The table does not fit on one machine |
+
+```bash
+mlf data-backends --show            # every engine, its extra, and whether it is ready
+mlf train -c configs/example_gbdt.yaml --data-backend polars
+```
+
+Registering an engine costs a bare install nothing — none of the three imports its
+runtime until selected, which the `gbdt-no-torch` CI job asserts explicitly. **Only
+`tabular` is backend-aware**; image, text and timeseries read through pandas and refuse
+a non-local engine by name rather than silently ignoring it. See
+[`choose.md`](../choose.md) for why Polars was gated on a measurement, and
+`benchmarks/data_backends.py` for the measurement itself.
+
 ## 4. Airflow — orchestration
 
 ```bash
@@ -89,17 +126,55 @@ docker compose -f docker-compose.airflow.yml up airflow-init
 docker compose -f docker-compose.airflow.yml up      # UI :8080 (airflow/airflow)
 ```
 
-The `ml_framework_pipeline` DAG runs: `dvc_pull → spark_preprocess → train →
-evaluate_gate → promote_model → trigger_deploy`. The gate fails the run if accuracy
-is below `ACCURACY_GATE`; promotion sets the `@production` alias in MLflow.
+The `ml_framework_pipeline` DAG runs: `dvc_pull → spark_preprocess →
+validate_data → train → evaluate_gate → promote_model → trigger_deploy`. The gate
+fails the run if accuracy is below `ACCURACY_GATE`; promotion sets the
+`@production` alias in MLflow.
+
+### Optional: a model-selection fan-out
+
+Setting `SELECT_CANDIDATES` inserts a **dynamically mapped** stage — one task per
+model family, run concurrently, then a reduce task that applies the constraints
+and picks a winner:
+
+```
+dvc_pull → spark_preprocess → validate_data
+    → tune_candidate.expand([xgboost, lightgbm, catboost, mlp])   ← concurrent
+    → collect_winner → announce_winner
+    → train → evaluate_gate → promote_model → trigger_deploy
+```
+
+```bash
+SELECT_CANDIDATES=xgboost,lightgbm,catboost,mlp
+SELECT_REPORT_DIR=outputs/reports
+SELECT_MAX_LATENCY_MS=20        # optional hard constraints
+SELECT_MAX_MODEL_MB=100
+SELECT_MIN_EXPLAINABILITY=0.5
+```
+
+Each mapped task runs `mlf select --candidate <model> --report-dir …` and writes
+one JSON report; `collect_winner` runs `mlf select --collect …` and writes
+`selection.json`; `train` pins `model.name` to the winner via XCom rather than
+re-running the comparison. N tasks rather than one loop so a family whose extra
+is missing on a worker is one red square, not a dead pipeline.
+
+Empty (the default) skips the stage entirely and trains the configured model.
+Needs Airflow ≥ 2.3 for `.expand()`. See
+[MODEL_SELECTION.md](MODEL_SELECTION.md#6-running-candidates-in-parallel).
 
 ## 5. Kubernetes — deploy + scale
 
 ```bash
-kubectl kustomize deploy/k8s          # render/validate without applying
-kubectl apply -k deploy/k8s           # namespace, api (Deploy/Svc/Ingress/HPA),
+kubectl kustomize deploy              # render/validate without applying
+kubectl apply -k deploy               # namespace, api (Deploy/Svc/Ingress/HPA),
                                       # mlflow, minio, prometheus, grafana
 ```
+
+The kustomization root is `deploy/`, not `deploy/k8s/`: it generates the Grafana
+dashboard ConfigMap from `deploy/monitoring/`, and kustomize will not read a file
+outside its root. `--load-restrictor` is not an option — `kubectl kustomize` accepts
+it but `kubectl apply -k` does not, so it would fix validation and leave the deploy
+broken. The manifests themselves stay in `deploy/k8s/`.
 
 The API `Deployment` loads `models:/ml-framework@production` from MLflow and
 autoscales via the `HorizontalPodAutoscaler` (2–10 pods at 70% CPU). For serverless
@@ -147,9 +222,22 @@ The hardening layer that makes the platform safe for live traffic:
 
 ## Verification boundary
 
-The Python integrations (MLflow tracking/registry round-trip, DVC pipeline parse,
-`read_table`, `/metrics` + `/drift`, auth / rate-limit / size caps, PSI/KS drift,
-Pandera contracts) are covered by the test suite and run in CI. The cluster
-components (Spark needs a JVM, Airflow/K8s need clusters, Trivy/cosign need a
-registry, k6/Locust need a live endpoint) are validated by static checks —
-`py_compile`, YAML parsing, `kustomize build` — and run on your infrastructure.
+What CI actually proves, by job — worth stating precisely, because "validated" covers
+three very different strengths of evidence here.
+
+| Job | Proves | How |
+|---|---|---|
+| `test` | MLflow tracking/registry round-trip, DVC pipeline parse, `read_table`, `/metrics` + `/drift`, auth / rate-limit / size caps, PSI/KS drift, Pandera contracts | The suite, on Python 3.10–3.14, at a coverage floor of 80% |
+| `gbdt-no-torch` | A GBDT bundle trains **and serves** with no deep-learning stack present; unavailable plugins and data backends are listed rather than hidden, and refuse with a `pip install` line | torch, pyspark and polars are genuinely absent — no meta-path trickery |
+| `spark-contract` | The Spark backend **executes**: the collects, the `orderBy` tie-break, cross-engine bundle equality, and `spark_preprocess` against a live session | `setup-java` temurin 17 + a real `SparkSession`. The job asserts the gate is open *before* running, so it cannot go green by skipping |
+| `mlops-validate` | The DAG, the pipeline modules and the load script import; every YAML parses; the kustomization renders **non-empty**; the Grafana dashboards are valid JSON | `py_compile`, YAML parsing, `kubectl kustomize` with a resource count check |
+
+Spark moved out of the static-check column when `spark-contract` was added: its sort
+tie-break is the feature's worst failure mode — Spark fixes the order of keys but not of
+*equal* keys, so duplicate timestamps would silently produce different folds and
+different scores run to run — and a test that only ever skips does not catch that.
+
+What remains genuinely unproven by CI, and runs on your infrastructure: **Airflow and
+Kubernetes** (both need clusters), **Trivy and cosign** against a real registry, and
+**k6/Locust**, which need a live endpoint. The manifests are rendered but never applied;
+the DAG is compiled but never scheduled.

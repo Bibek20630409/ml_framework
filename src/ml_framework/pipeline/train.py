@@ -55,7 +55,8 @@ from ..core.task import get_task_spec
 from ..data import build_bundle
 from ..tracking import build_run_logger
 from ..utils import seed_everything, setup_logging
-from .tune import HPO_FILE, tune
+from .select import select
+from .tune import HPO_FILE
 
 log = logging.getLogger(__name__)
 
@@ -94,14 +95,25 @@ def train(
     # Fails here — with a pip command or an explanation of why the combination
     # cannot work — rather than 40 seconds into data loading.
     spec = validate_combination(config.task, config.data.kind, config.model.name)
+
+    # Choose the family, then its hyperparameters, then fit the winner. Both
+    # `select` and `tune` return a *config* rather than a fitted model precisely
+    # so this stays one code path: whether a bake-off ran, only tuning ran, or
+    # neither did, everything below fits a config and writes a bundle.
+    #
+    # `select` is a pass-through to `tune` when `select.enabled` is false, which
+    # is the default — so this call is exactly the old `tune(config)` until
+    # somebody asks for a comparison.
+    selection = select(config)
+    tuning = selection.tuning
+    config = selection.config
+    if selection.ran:
+        # A bake-off can change the model, which changes the spec and the backend.
+        spec = validate_combination(config.task, config.data.kind, config.model.name)
+        log.info("model selection chose '%s': %s", selection.winner, selection.reason)
     backend = get_backend(spec.backend)
 
-    # Search first, then fit the winner. `tune` returns the *config* rather than a
-    # fitted model precisely so this stays one code path: whether tuning ran or was
-    # skipped, everything below fits a config and writes a bundle.
-    tuning = tune(config)
-    config = tuning.config
-    if tuning.ran:
+    if tuning.ran or selection.ran:
         seed_everything(config.runtime.seed, workers=True)  # trials advanced the RNG
     if emit_config is not None:
         _emit_config(config, emit_config)
@@ -170,7 +182,7 @@ def train(
         artifact = backend.save(result.estimator, out / MODEL_DIR)
         preprocessor_ref = _save_preprocessor(bundle, out)
         manifest = _build_manifest(
-            config, bundle, spec, artifact, preprocessor_ref, metrics, size, tuning
+            config, bundle, spec, artifact, preprocessor_ref, metrics, size, tuning, selection
         )
         # `config` here is the *tuned* config, so config.json is the record of what
         # actually trained — which is what closes v1's copy-paste gap.
@@ -386,6 +398,7 @@ def _build_manifest(
     metrics: dict[str, float],
     size: dict[str, Any],
     tuning: Any,
+    selection: Any = None,
 ) -> Manifest:
     """The serving contract.
 
@@ -428,4 +441,9 @@ def _build_manifest(
         # The winner and the space it came from, so a served model can answer "how
         # were these numbers chosen?" without the training directory.
         hpo=tuning.to_dict() if tuning.ran else None,
+        # And the same question one level up: "why this model family?" A served
+        # bundle carrying the bake-off it won is the difference between an
+        # architecture decision that can be audited and one that has to be
+        # remembered.
+        selection=(selection.to_dict() if selection is not None and selection.ran else None),
     )
