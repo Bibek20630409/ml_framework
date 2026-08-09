@@ -450,6 +450,14 @@ export     = ["onnx", "onnxruntime", "skl2onnx"]
 
 ## 5. Implementation Roadmap
 
+> **This is the original ten-phase roadmap, kept as written.** P0–P9 below were scoped
+> before any of them were built. Three further phases — P10 (exporter migration), P11
+> (model selection) and P12 (pluggable data backends) — were scoped afterwards, in
+> response to what the earlier ones surfaced, and are deliberately **not** backfilled
+> here: a plan edited to predict what actually happened is no longer evidence of what was
+> intended. For the live state of all twelve, see
+> [docs/PHASE_STATUS.md](docs/PHASE_STATUS.md).
+
 Strictly dependency-ordered. **Phases 0–3 are the load-bearing work**; everything after is additive.
 
 | Phase | Content | Exit gate |
@@ -564,7 +572,14 @@ Every capability in the current framework, mapped to its destination. **Nothing 
 
 ### 8.4 Infrastructure (unchanged unless noted)
 
-Dockerfile multi-stage (gains per-extra serve targets) · docker-compose (api/train/mlflow/minio/prometheus/grafana) · 10 K8s manifests incl. KServe, NetworkPolicy default-deny, PDB, HPA 2–10 @70%, ResourceQuota, cert-manager TLS · `ci.yml` (ruff/black/mypy/pytest 3.10–3.12 + `mlops-validate`) · `cd.yml` (buildx → Trivy → Syft SBOM → GHCR → cosign → gated deploy) · DVC 2 stages + `params.yaml` + metrics (outs repointed at the bundle dir) · Prometheus 5 alert rules + Grafana dashboard · locust + k6 load tests · pre-commit · Makefile · `.env.example`.
+Dockerfile multi-stage (gains per-extra serve targets) · docker-compose (api/train/mlflow/minio/prometheus/grafana) · 10 K8s manifests incl. KServe, NetworkPolicy default-deny, PDB, HPA 2–10 @70%, ResourceQuota, cert-manager TLS · `ci.yml` (ruff/black/mypy/pytest 3.10–3.12 + `mlops-validate`) [†] · `cd.yml` (buildx → Trivy → Syft SBOM → GHCR → cosign → gated deploy) · DVC 2 stages + `params.yaml` + metrics (outs repointed at the bundle dir) · Prometheus 5 alert rules + Grafana dashboard · locust + k6 load tests · pre-commit · Makefile · `.env.example`.
+
+[†] **As of this plan.** CI has since grown to a **3.10–3.14** matrix and four jobs:
+`test`, `gbdt-no-torch` (a tree bundle trains and serves with no deep-learning stack
+present), `spark-contract` (the Spark engine against a real JVM, refusing to pass by
+skipping) and `mlops-validate`. The line above is left as written for the same reason as
+§5 — it records the surface being preserved at the time, not the surface today. Current
+state: [docs/PHASE_STATUS.md](docs/PHASE_STATUS.md) and [README.md](README.md).
 
 ⚠️ **Airflow DAG** ([orchestration/airflow/dags/ml_pipeline.py](orchestration/airflow/dags/ml_pipeline.py)): the 7-task chain, `_evaluate_gate` (`ACCURACY_GATE` against `metrics.json`) and `_promote_model` (MLflow 3 `set_registered_model_alias`) are **preserved**. Only two edits: paths point at the bundle dir, and the gate reads `TaskSpec.primary_metric` instead of hardcoding accuracy — so it works for regression and forecasting too. Replace its `print()` calls with the logger while there.
 

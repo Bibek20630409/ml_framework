@@ -3,6 +3,12 @@
 Tracks progress against [ml_framework_architecture_plan.md](../ml_framework_architecture_plan.md)
 §5 (Implementation Roadmap). Update this when a phase lands.
 
+**P0–P9 come from that roadmap; P10, P11 and P12 do not** — they were scoped after it,
+once the earlier phases had landed and shown what was missing. The plan is therefore a
+record of what was *intended* at the outset, not a live index of the work. This file is
+the live index. Neither was backfilled to match the other, because a plan edited to
+predict what actually happened stops being evidence of anything.
+
 | Phase | State | Commit |
 |---|---|---|
 | P0 — Foundations | **done** | `a8692a1` |
