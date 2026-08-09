@@ -16,8 +16,19 @@ Tracks progress against [ml_framework_architecture_plan.md](../ml_framework_arch
 | P8 — Zero-config | **done** | `62672eb` |
 | P9 — Deployment polish | **done** | `1dc3a0c` |
 | P10 — Exporter migration | **partial** — ONNX done, TorchScript open | see below |
-| P11 — Model selection | **done** | `08529e8` |
-| P12 — Pluggable data backends | **done** — all five phases | (this change) |
+| P11 — Model selection | **done** | `c42dc04` |
+| P12 — Pluggable data backends | **done** — all five phases | `c42dc04` |
+
+P11 and P12 share a commit. They were developed in sequence but could not be split
+into two: `cli.py`, `config/schema.py` and `core/registry.py` each carry changes for
+both, so a P11-only commit would not have been independently green.
+
+**The P11 row previously read `08529e8`, which was wrong.** That commit touched only
+`ci.yml` and this file — the row was written when the phase was finished rather than
+when it was committed, and the code sat uncommitted for two further commits. Worth
+recording because the phase table is the thing someone reads to find out when a
+behaviour changed, and a row pointing at a commit that does not contain the feature
+is worse than no row at all.
 
 ## Version
 
