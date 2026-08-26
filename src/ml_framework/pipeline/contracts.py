@@ -71,7 +71,9 @@ def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="Data contract / quality gate")
     p.add_argument("--input", required=True, help="CSV/Parquet dataset")
     p.add_argument("--target-col", required=True)
-    p.add_argument("--data-backend", default="local", help="Engine: local (default) or spark")
+    p.add_argument(
+        "--data-backend", default="local", help="Engine: local (default), polars or spark"
+    )
     args = p.parse_args(argv)
     logging.basicConfig(level=logging.INFO)
     validate_file(args.input, args.target_col, backend=args.data_backend)

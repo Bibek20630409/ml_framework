@@ -177,7 +177,7 @@ def _add_config_args(sub: argparse.ArgumentParser) -> None:
         "--data-backend",
         default=None,
         metavar="NAME",
-        help="Data-processing engine for this run: local (default) or spark",
+        help="Data-processing engine for this run: local (default), polars or spark",
     )
 
 
@@ -452,7 +452,7 @@ def build_parser() -> argparse.ArgumentParser:
     # question would be worse than a second command. This one also shows up in
     # `mlf --help`, which a flag does not.
     data_backends_p = sub.add_parser(
-        "data-backends", help="List data-processing engines (local, spark)"
+        "data-backends", help="List data-processing engines (local, polars, spark)"
     )
     data_backends_p.add_argument("--all", action="store_true", help="Also list failed imports")
     data_backends_p.add_argument("--show", action="store_true", help="Add each engine's detail")

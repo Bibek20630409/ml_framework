@@ -95,7 +95,7 @@ def main(argv: list[str] | None = None) -> int:
         "--data-backend",
         default="spark",
         metavar="NAME",
-        help="Engine to clean with: spark (default) or local",
+        help="Engine to clean with: spark (default), local or polars",
     )
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO)
