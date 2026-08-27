@@ -24,7 +24,7 @@ predict what actually happened stops being evidence of anything.
 | P10 — Exporter migration | **partial** — ONNX done, TorchScript open | see below |
 | P11 — Model selection | **done** | `c42dc04` |
 | P12 — Pluggable data backends | **done** — all five phases | `c42dc04` |
-| P13 — Staged decode pipeline | **in progress** — P13a done; b–e open | see below |
+| P13 — Staged decode pipeline | **in progress** — P13a, P13b done; c–e open | see below |
 
 P11 and P12 share a commit. They were developed in sequence but could not be split
 into two: `cli.py`, `config/schema.py` and `core/registry.py` each carry changes for
@@ -1535,9 +1535,9 @@ the ratios can be re-measured rather than trusted.
 
 ## P13 — Staged decode pipeline
 
-**P13a landed. P13b–P13e are open.** Test baseline after P13a: **984 passed, 18 skipped**
-(up from 922; the 18 remain the JVM-gated Spark tests — P13a added 62 and skipped none,
-because its two zero-dependency decoders are exactly the ones a bare install can run).
+**P13a and P13b landed. P13c–P13e are open.** Test baseline: **1096 passed, 18 skipped**
+(up from 922; the 18 remain the JVM-gated Spark tests — P13a added 62 and P13b 112, and
+neither skipped any, because both are built on the two zero-dependency decoders).
 
 Storage → tensor is eleven stages, and this framework previously expressed about
 three of them. The two claims driving the phase:
@@ -1604,15 +1604,64 @@ Four decisions in that table worth keeping:
   no device memory is what lets CI execute all three. A real DALI/NVDEC decoder
   registers identically.
 
-### P13b–P13e — open
+### P13b — shards, sampler, dataset, state, materialize (done)
 
-* **P13b — shards, sampler, dataset, state, materialize.** `ShardIndex`
-  (`shards.json` + streamed `entries.jsonl`), `BlobSource` implementations,
-  `ShardShuffleSampler`, `StagedDataset`, `LoaderState`, `mlf materialize`.
-  Testable with `audio.pcm` + `text.tokens` alone, so it needs no optional
-  dependency. The load-bearing invariant: `len(dataset)` is read from the index and
-  `__getitem__` is *total*, so batch count is invariant to how many samples are
-  corrupt — which is how DDP parity holds with no rank-aware code anywhere in `src/`.
+The layer that makes the parity guarantee real. Needs no optional dependency: it is
+tested end to end with `audio.pcm` and `text.tokens` alone.
+
+* `shards.py` — `ShardIndex` / `ShardEntry` / `ShardIndexWriter`. Two files:
+  `shards.json` (small, fully parsed, **declares `n_samples`**) and `entries.jsonl`
+  (streamed, appended, greppable). The manifest is written **last**, so it can never
+  claim a count the entries cannot satisfy.
+* `sources_io.py` — `DirSource` / `TarSource` / `MemmapSource`. One positioned-read
+  seam; what differs between the three is addressing, not decoding.
+* `sampler.py` — `ShardShuffleSampler`, no torch import at all.
+* `substitute.py` — `SubstitutionPolicy`: index in, index out, deterministic in
+  `(seed, epoch, index)`.
+* `dataset.py` — `StagedDataset`, where `__getitem__` is made total.
+* `state.py` — `LoaderState`, the mid-epoch resume position.
+* `materialize.py` + `mlf materialize` — the offline decode-probe pass.
+* `DataConfig.integrity` / `.shards` / `.decoder_params`; `_CREATABLE_PREFIXES` gains
+  exactly one entry (`data.decoder_params.`).
+
+**The parity chain, and where each link is pinned.** Under DDP every rank must
+produce an identical number of batches or the next collective hangs *with no error
+message*. That reduces to one property — `len(dataset)` is a constant read from the
+manifest, and `__getitem__` is total — and it holds with **no rank-aware code
+anywhere in `src/`**:
+
+| # | Link | Pinned by |
+|---|---|---|
+| 1 | `__len__` returns `index.n_samples` from `shards.json`, never a count of what decoded | `test_len_is_the_declared_sample_count_not_the_decodable_one` |
+| 2 | `DistributedSampler` derives `ceil(N/W)` per rank from that one integer | `test_per_rank_length_is_a_pure_function_of_the_declared_count` |
+| 3 | `drop_last` is a function of the same constant and `batch_size` | `test_drop_last_is_a_function_of_the_declared_length_and_batch_size_only` |
+| 4 | a fault resolves to a different **index**, never to `None` or a variable count | `test_every_index_yields_exactly_one_sample_even_when_a_third_are_corrupt` |
+
+`tests/data/test_staged_dataset.py` instantiates `DistributedSampler` for two ranks
+**directly**, with no `torch.distributed` and no process group, and asserts equal
+batch counts. It runs on one CPU in milliseconds. If it ever needs a process group
+to pass, the design has regressed.
+
+**Three decisions that fell out of building it:**
+
+* **`skip` is unrepresentable, not rejected.** `on_corrupt` is
+  `Literal["substitute", "raise"]`. `continue` is the single response that cannot
+  preserve batch count, so the schema does not offer it.
+* **The fault ceiling raises in `mlf materialize` and nowhere else.**
+  `max_fault_rate` is a *content-dependent* abort: rank 0 could trip it while rank 1
+  does not, and a rank-divergent abort is the exact hang this phase prevents.
+  Materialization is one process running before any collective exists, so it can
+  fail safely. At runtime the rate is counted, logged and reported — never raised.
+  For the same reason `ExperimentConfig` **refuses** `on_corrupt: raise` when
+  `runtime.strategy` explicitly names `ddp`/`fsdp`/`deepspeed`, and warns when
+  `strategy: auto` with `devices != 1`.
+* **A faulted sample still gets an index entry.** The index declares what *should*
+  exist, not what happens to decode today. Dropping the entry would shrink
+  `n_samples`, which is the one number that must not depend on the state of the
+  bytes. Verified against a corpus with 15% corruption: the index declares 20, not 17.
+
+### P13c–P13e — open
+
 * **P13c — the transport tail.** `pin_memory` / `persistent_workers` /
   `prefetch_factor` (none of which exist in the repo today), zero-copy `from_numpy`
   when the buffer is already float32/C-contiguous/writeable, and the
@@ -1635,12 +1684,14 @@ Four decisions in that table worth keeping:
    is a clear error but not the eventual one. `_check_required_by_kind` grows its
    cases in P13d.
 3. **The compressed-audio and video decoders are untested against real files.** They
-   are gated on `av`, which is not installed here. `audio.mp3`'s silent-resync
-   detection needs the duration cross-check in `mlf materialize` (P13b) plus a
-   committed ~2 KB truncated MP3 fixture to be proven at all.
-4. **`mlf materialize` does not exist**, so the refusal to train on a `silent`/`none`
-   corpus without an offline pass is designed but not enforced. That enforcement is
-   P13b's, and until it lands nothing checks `REQUIRES_MATERIALIZATION`.
+   are gated on `av`, which is not installed here. `audio.mp3` now emits the
+   `expected_samples` / `n_samples` pair that `mlf materialize` compares, and the
+   comparison is implemented — but proving it catches a real resync needs a
+   committed ~2 KB truncated MP3 fixture, which P13d owes.
+4. **Nothing calls `StagedDataset` from a training run yet.** The dataset, sampler,
+   index and resume state are complete and tested, but `build_bundle` does not
+   construct them — that is P13d, where the audio/video sources land. `mlf
+   materialize` is fully usable today; `mlf train` does not yet consume its output.
 5. **Parquet is deliberately not a decoder row.** Its read/demux/decode is already
    owned by `DataBackend` (P12), and the reference table itself notes the
    Thrift-footer→chunk-offset step is "same API, no seam". A second owner for one

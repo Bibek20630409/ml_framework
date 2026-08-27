@@ -44,6 +44,17 @@ _DEFAULT_DTYPE = "float32"
 # stage runs, and nothing else.
 _CONTAINERIZED: dict[str, bool] = {"mp3": False, "opus": True}
 
+# Samples per frame, per codec. This is the number that makes MP3's silent resync
+# *detectable*: the packet count comes from the demuxer, which walks frame headers
+# and does not care whether the payloads decode, so `packets * frame_size` is an
+# independent statement of how long the sample should have been. Comparing it to
+# what actually came out is the only signal a resync ever produces.
+#
+# MPEG-1 Layer III is 1152; Opus at 48 kHz reports its own frame size, so it is
+# absent here and the check simply does not run for it -- correct, because Opus
+# raises on damage instead of hiding it.
+_FRAME_SAMPLES: dict[str, int] = {"mp3": 1152}
+
 
 class CompressedAudioDecoder(BaseDecoder):
     """Raw-frame or containerized compressed audio → float32 PCM.
@@ -144,10 +155,15 @@ class CompressedAudioDecoder(BaseDecoder):
             meta={
                 "channels": 1 if pcm.ndim == 1 else int(pcm.shape[0]),
                 "n_packets": n_packets,
-                # Materialization compares this against the duration the frame
-                # count implies. For MP3 that comparison is the ONLY way a silent
-                # resync is ever detected.
+                # The pair `mlf materialize` compares. `n_samples` is what came
+                # out; `expected_samples` is what the demuxed frame count says
+                # should have. For MP3 that comparison is the ONLY way a silent
+                # resync is ever detected -- it drops whole frames and reports
+                # nothing, so the shapes stay valid and only the length betrays it.
                 "n_samples": int(pcm.shape[-1]),
+                "expected_samples": (
+                    n_packets * _FRAME_SAMPLES[self.codec] if self.codec in _FRAME_SAMPLES else None
+                ),
             },
         )
 

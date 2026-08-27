@@ -49,6 +49,7 @@ v1 files are mechanically convertible: see :mod:`ml_framework.config.migrate` an
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -63,6 +64,8 @@ from ..core.types import DataKind, Task
 
 if TYPE_CHECKING:
     from ..core.plugins import ModelSpec
+
+log = logging.getLogger(__name__)
 
 SplitStrategy = Literal["auto", "random", "temporal", "group"]
 # How k-fold is *cut*, once `split.folds >= 2`. Orthogonal to `SplitStrategy`,
@@ -93,6 +96,11 @@ _CREATABLE_PREFIXES: tuple[str, ...] = (
     "fit.params.",
     "data.params.",
     "data.backend_params.",
+    # Decoder-owned, like the two above. `data.integrity.*` and `data.shards.*` are
+    # NOT here on purpose: they are typed fields, so the "key must already exist"
+    # rule applies correctly and `--set data.integrity.on_corupt=raise` rightly
+    # raises instead of silently creating a setting nothing reads.
+    "data.decoder_params.",
     "tune.overrides.",
     # Criterion names are a closed set, but they are validated by
     # `SelectConfig._check_weights` rather than by key existence — a weights dict
@@ -250,6 +258,57 @@ class SplitConfig(BaseModel):
         return "stratified" if task in ("binary", "multiclass") else "kfold"
 
 
+class IntegrityConfig(BaseModel):
+    """What happens to a sample that cannot be trusted.
+
+    **There is no ``skip``.** Not a rejected option — an *absent* one. Under DDP
+    every rank must produce an identical number of batches or the next collective
+    hangs with no error message, and ``continue`` is the one action that cannot
+    preserve that. Making it unrepresentable in the schema is cheaper, and more
+    reliable, than documenting why not to use it.
+    """
+
+    model_config = _FROZEN
+
+    # `substitute` serves a different sample; `raise` stops the run. The latter is
+    # refused for an explicitly distributed strategy below, because an abort that
+    # depends on which rank drew the bad sample is a hang, not an error.
+    on_corrupt: Literal["substitute", "raise"] = "substitute"
+    # `redraw` takes another sample from the SAME shard (fair-ish, and it keeps the
+    # read inside an already-open shard); `repeat` re-serves the previous good one.
+    substitute: Literal["redraw", "repeat"] = "redraw"
+    # Enforced by `mlf materialize` ONLY. At runtime this is counted and logged but
+    # never raised: a content-dependent abort is rank-divergent, which is the exact
+    # failure this block exists to prevent. Materialization is one process, runs
+    # before any collective exists, and can therefore fail safely.
+    max_fault_rate: float = Field(default=0.01, ge=0.0, le=1.0)
+    # "auto" verifies digests for decoders whose integrity is `none` or `silent`,
+    # and skips the ones already paying for their own CRC. Hashing is ~1 GB/s of
+    # the read budget; paying it twice on a FLAC is waste.
+    verify_checksums: Literal["auto", "always", "never"] = "auto"
+    # Escape hatch for training on a corpus whose decoder cannot report its own
+    # damage without probing it first. It exists, and it costs typing — the same
+    # friction idiom as `allow_temporal_leakage`.
+    allow_unverified: bool = False
+
+
+class ShardConfig(BaseModel):
+    """Where the shard index lives and how the corpus is ordered."""
+
+    model_config = _FROZEN
+
+    # None -> `<data.path>/_mlf_shards`. Overridable for a read-only corpus mount,
+    # which is the common case for a shared dataset.
+    index_dir: str | None = None
+    # `block` shuffles shard order then within each shard, so every read stays
+    # inside one open shard — the entire reason to shard over object storage.
+    # `global` is a true permutation (right on local SSD); `none` is index order.
+    shuffle: Literal["block", "global", "none"] = "block"
+    # Carry the loader position in the checkpoint, so `--resume` continues
+    # mid-epoch rather than silently replaying what this epoch already served.
+    resume_state: bool = True
+
+
 class DataConfig(BaseModel):
     """Where the data is and what the target is. Source-specific knobs go in
     ``params``, validated by the source that reads them; engine knobs go in
@@ -277,6 +336,13 @@ class DataConfig(BaseModel):
     # `extra="forbid"` (see `TabularSourceParams`), so an engine key placed there
     # would make the source reject the config. One owner per dict.
     backend_params: dict[str, Any] = Field(default_factory=dict)
+    integrity: IntegrityConfig = Field(default_factory=IntegrityConfig)
+    shards: ShardConfig = Field(default_factory=ShardConfig)
+    # Decoder knobs, validated by the decoder at first use. A *third* separate dict
+    # for the identical reason `backend_params` is separate from `params`: `params`
+    # is validated by the source with `extra="forbid"`, so a decoder key placed
+    # there would make the source reject the config. One owner per dict.
+    decoder_params: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def _check_required_by_kind(self) -> DataConfig:
@@ -592,6 +658,42 @@ class ExperimentConfig(BaseModel):
             ) from exc
         updates["model"] = self.model.model_copy(update={"params": resolved.model_dump()})
         return self.model_copy(update=updates)
+
+    @model_validator(mode="after")
+    def _check_corrupt_policy_is_safe_for_the_strategy(self) -> ExperimentConfig:
+        """Refuse ``on_corrupt: raise`` on an explicitly distributed run.
+
+        Raising on a bad sample is a *content-dependent* abort: whether it fires
+        depends on which samples a given rank happened to draw. Under DDP that is
+        a rank-divergent abort — one rank stops, the others reach the next
+        collective and wait forever. The failure presents as a hang with no error
+        message, which is the worst diagnostic outcome available.
+
+        Only an *explicit* strategy is refused. ``"auto"`` with more than one
+        device is warned about instead: Lightning decides what to do there, and a
+        config validator that guessed would refuse valid single-process runs.
+        That asymmetry is the honest limit of what this layer can know.
+        """
+        if self.data.integrity.on_corrupt != "raise":
+            return self
+        strategy = str(self.runtime.strategy).lower()
+        if strategy.startswith(("ddp", "fsdp", "deepspeed")):
+            raise ValueError(
+                f"data.integrity.on_corrupt: 'raise' is unsafe with runtime.strategy: "
+                f"'{self.runtime.strategy}'. Whether it fires depends on which samples a "
+                "rank drew, so one rank aborts while the others block on the next "
+                "collective -- a hang, not an error. Use 'substitute' (the default), which "
+                "keeps the batch count identical on every rank, and run `mlf materialize` "
+                "if you want a corpus to fail loudly before training starts."
+            )
+        if strategy == "auto" and self.runtime.devices != 1:
+            log.warning(
+                "data.integrity.on_corrupt: 'raise' with runtime.devices=%r. If Lightning "
+                "selects a distributed strategy, a corrupt sample will abort one rank and "
+                "hang the rest. Prefer 'substitute' unless this is a single-device run.",
+                self.runtime.devices,
+            )
+        return self
 
     # ── Loaders ───────────────────────────────────────────
     @classmethod

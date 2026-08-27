@@ -498,6 +498,42 @@ def build_parser() -> argparse.ArgumentParser:
         help="Add each decoder's stages, output dtype/layout and integrity note",
     )
 
+    # The offline pass. It exists because two of the four integrity classes are
+    # invisible at training time: an MP3 resyncs past damage and a hardware
+    # decoder emits green frames, both producing correctly-shaped tensors that no
+    # handler will ever see. Probing once, here, is the only way to catch them.
+    materialize_p = sub.add_parser(
+        "materialize",
+        help="Decode-probe a corpus, write its shard index, and report what is unreadable",
+    )
+    materialize_p.add_argument("--data", "-d", metavar="PATH", help="Corpus directory")
+    materialize_p.add_argument("--config", "-c", metavar="PATH", help="Config naming the corpus")
+    materialize_p.add_argument(
+        "--decoder",
+        default=None,
+        metavar="NAME",
+        # No `choices=`: the set is open and validated by the registry, exactly as
+        # `--data-backend` is. An unknown name lists what is registered.
+        help="Decoder to probe with. Inferred from the corpus's suffixes when omitted",
+    )
+    materialize_p.add_argument(
+        "--sample-rate",
+        type=float,
+        default=1.0,
+        metavar="F",
+        help="Probe this fraction of the corpus for a quick check (default 1.0 = all)",
+    )
+    materialize_p.add_argument(
+        "--max-fault-rate",
+        type=float,
+        default=None,
+        metavar="F",
+        help="Exit non-zero above this fraction (default: data.integrity.max_fault_rate)",
+    )
+    materialize_p.add_argument(
+        "--force", action="store_true", help="Rewrite an index that already exists"
+    )
+
     init_p = sub.add_parser("init", help="Write a config inferred from a dataset")
     _add_data_args(init_p)
     init_p.add_argument("--output", "-o", required=True, metavar="PATH", help="Where to write it")
@@ -836,6 +872,57 @@ def main(argv: list[str] | None = None) -> int:
             "decoders": DECODERS,
         }[args.command]
         return _print_plugins(registry, include_failed=args.all, show_detail=args.show)
+
+    if args.command == "materialize":
+        from .data.streaming.materialize import MaterializeError, materialize
+        from .data.streaming.shards import ShardIndex
+
+        # `--data` alone is enough (this is a corpus-level operation, not a run),
+        # but a config supplies the decoder params and the fault ceiling.
+        cfg = None
+        if args.config:
+            cfg = ExperimentConfig.from_yaml(args.config)
+        path = args.data or (cfg.data.path if cfg else None)
+        if not path:
+            log.error("materialize needs --data PATH or a --config naming data.path")
+            return 1
+
+        index_dir = ShardIndex.location(path, cfg.data.shards.index_dir if cfg else None)
+        if ShardIndex.exists(index_dir) and not args.force:
+            log.error(
+                "a shard index already exists at %s. It is a property of the corpus, not of "
+                "a run, so two runs are meant to share it -- pass --force to rebuild.",
+                index_dir,
+            )
+            return 1
+
+        ceiling = args.max_fault_rate
+        if ceiling is None:
+            ceiling = cfg.data.integrity.max_fault_rate if cfg else 0.01
+
+        try:
+            _, report = materialize(
+                path,
+                index_dir=index_dir,
+                decoder=args.decoder,
+                decoder_params=dict(cfg.data.decoder_params) if cfg else None,
+                data_kind=cfg.data.kind if cfg else "tabular",
+                max_fault_rate=ceiling,
+                sample_rate=args.sample_rate,
+                seed=cfg.runtime.seed if cfg else 42,
+            )
+        except MaterializeError as exc:
+            # The one place the fault ceiling raises. Safe here and nowhere else:
+            # this is a single process, running before any collective exists.
+            log.error("%s", exc)
+            return 1
+        except FrameworkError as exc:
+            log.error("%s", exc)
+            return 1
+
+        print(report.render())
+        print(f"\nwrote {index_dir}")
+        return 0
 
     if args.command == "export":
         from .core.export import UnsupportedExportError
