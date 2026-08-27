@@ -520,6 +520,13 @@ DEFAULT_PAYLOAD: Mapping[DataKind, Payload] = {
     "image": "dataset",
     "text": "dataset",
     "timeseries": "series",
+    # Audio and video are `dataset` for the same reason image is: one item is
+    # decoded on demand from storage, and materializing an (n, d) matrix of clips
+    # would mean holding the whole corpus in RAM. They need no new payload — a
+    # `dataset` already means "a lazily-decoding corpus", and the two kinds differ
+    # in what one *item* is, not in the shape of the container.
+    "audio": "dataset",
+    "video": "dataset",
 }
 
 # Every payload a kind can be materialized as. Usually one — but a data *kind* is
@@ -535,4 +542,6 @@ KIND_PAYLOADS: Mapping[DataKind, frozenset[Payload]] = {
     "image": frozenset({"dataset"}),
     "text": frozenset({"dataset"}),
     "timeseries": frozenset({"series", "arrays"}),
+    "audio": frozenset({"dataset"}),
+    "video": frozenset({"dataset"}),
 }

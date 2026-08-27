@@ -24,6 +24,7 @@ predict what actually happened stops being evidence of anything.
 | P10 — Exporter migration | **partial** — ONNX done, TorchScript open | see below |
 | P11 — Model selection | **done** | `c42dc04` |
 | P12 — Pluggable data backends | **done** — all five phases | `c42dc04` |
+| P13 — Staged decode pipeline | **in progress** — P13a done; b–e open | see below |
 
 P11 and P12 share a commit. They were developed in sequence but could not be split
 into two: `cli.py`, `config/schema.py` and `core/registry.py` each carry changes for
@@ -1529,3 +1530,118 @@ the ratios can be re-measured rather than trusted.
 7. **SHAP is tree-only.** `shap.Explainer`'s sampling fallback takes minutes on a
    non-tree model, inside a routine that is also timing inference. Those models
    get permutation importance.
+
+---
+
+## P13 — Staged decode pipeline
+
+**P13a landed. P13b–P13e are open.** Test baseline after P13a: **984 passed, 18 skipped**
+(up from 922; the 18 remain the JVM-gated Spark tests — P13a added 62 and skipped none,
+because its two zero-dependency decoders are exactly the ones a bare install can run).
+
+Storage → tensor is eleven stages, and this framework previously expressed about
+three of them. The two claims driving the phase:
+
+1. **Read, demux and decode are three distinct stages, and decode is independent of
+   tensor construction.** A pre-tokenized `.bin` shard has neither demux nor decode
+   but does have tensor construction; a GPU decoder has decode and *no* tensor
+   construction at all. A design with one "load" stage cannot say either thing.
+2. **A corrupt sample must be substituted, never skipped.** Under DDP every rank
+   must produce an identical number of batches or the next collective hangs with no
+   error message, so `continue` is the one response that cannot be allowed. Worse
+   are the formats that fail *silently* — MP3 resync, mid-stream H.264 artifacts,
+   NVDEC garbage frames — which yield valid-shaped tensors that degrade the model
+   without tripping any handler.
+
+### P13a — decoder registry and stage vocabulary (done)
+
+Zero behaviour change: nothing outside `data/streaming/` imports it yet.
+
+* `core/types.py` gains `Stage`, `Layout`, `LandsIn`, `Integrity` beside `DataKind`
+  and `Payload` — vocabulary, in the dependency-free module, because
+  `core/plugins.DecoderSpec` is typed against them and core may not import the data
+  layer. `DataKind` gains `audio` and `video`; `DEFAULT_PAYLOAD`/`KIND_PAYLOADS` map
+  both to `dataset`. Their sources and models arrive in P13d.
+* `core/plugins.DecoderSpec` + `core/registry.DECODERS` / `register_decoder` /
+  `get_decoder`, modelled on `DataBackendSpec` exactly: a spec plus a lazy factory,
+  never an import of the codec.
+* `data/streaming/` — `stages.py` (`SampleRef`/`Blob`/`Packet`/`Decoded`/
+  `DecodeContext`/`BlobSource`), `integrity.py` (the four classifications,
+  `SampleFault`, `FaultLog`), `decoders/` (nine specs, seven modules).
+* `mlf decoders [--all] [--show]`, off the existing generic `_print_plugins`.
+* Extras `audio = [soundfile, torchaudio]` and `video = [av]`.
+
+**The decoder table, as `mlf decoders --show` renders it:**
+
+| decoder | stages | output | lands | integrity |
+|---|---|---|---|---|
+| `audio.pcm` | read, decode | int16 pcm | host | loud — **the oracle**, no requirements |
+| `audio.flac` | read, decode | int16 pcm | host | **checked** — per-frame CRC-16 |
+| `audio.mp3` | read, demux, decode | float32 pcm | host | **silent** — resyncs past damage |
+| `audio.opus` | read, demux, decode | float32 pcm | host | checked — Ogg page CRC |
+| `image.jpeg` | read, decode | uint8 hwc | host | loud *because we make it so* |
+| `image.png` | read, decode | uint8 hwc | host | checked — Adler-32 + CRC-32 |
+| `video.h264` | read, demux, decode | uint8 thwc | host | loud — but artifacts are silent |
+| `text.tokens` | **read** | **uint16** tokens | host | **none** — a bit flip is a valid id |
+| `fake.device` | read, decode | uint8 hwc | **device** | silent — the seam under test |
+
+Four decisions in that table worth keeping:
+
+* **`read` is on every row.** Bytes always come off a device. What varies is the
+  other two, which is why `text.tokens` declaring `{"read"}` *alone* is the
+  informative case. A test pins that only that row claims decode costs nothing.
+* **`audio.pcm` has no requirements on purpose.** It is the oracle the
+  cross-decoder equivalence tests compare against — the role `local` plays for data
+  backends — and that claim is only worth making if the reference path is present on
+  a bare install.
+* **JPEG's `loud` is a deviation, not a default.** libjpeg treats a truncated file
+  as a *warning* and returns a partial image with the missing scanlines filled grey;
+  a test pins that Pillow really does this (31/64 flat rows on a half-truncated
+  64×64), that the decoder raises instead, and that it still raises when something
+  else has set `LOAD_TRUNCATED_IMAGES = True` globally.
+* **`fake.device` ships with no CUDA.** The `lands_in` seam changes loader
+  construction in two places and is invisible in a third; a decoder that allocates
+  no device memory is what lets CI execute all three. A real DALI/NVDEC decoder
+  registers identically.
+
+### P13b–P13e — open
+
+* **P13b — shards, sampler, dataset, state, materialize.** `ShardIndex`
+  (`shards.json` + streamed `entries.jsonl`), `BlobSource` implementations,
+  `ShardShuffleSampler`, `StagedDataset`, `LoaderState`, `mlf materialize`.
+  Testable with `audio.pcm` + `text.tokens` alone, so it needs no optional
+  dependency. The load-bearing invariant: `len(dataset)` is read from the index and
+  `__getitem__` is *total*, so batch count is invariant to how many samples are
+  corrupt — which is how DDP parity holds with no rank-aware code anywhere in `src/`.
+* **P13c — the transport tail.** `pin_memory` / `persistent_workers` /
+  `prefetch_factor` (none of which exist in the repo today), zero-copy `from_numpy`
+  when the buffer is already float32/C-contiguous/writeable, and the
+  `lands_in == "device"` branch. Ships alone, and its gate is byte-identical
+  artifacts against the previous commit at seed 42.
+* **P13d — `audio` and `video` sources, preprocessors and models.** The vocabulary
+  landed in P13a; this adds `SourceSpec`s, `AudioSourceParams`/`VideoSourceParams`,
+  the mel/clip preprocessors, `audio.cnn` and `video.r3d`, `serving/schemas.py`, and
+  `sniff.py` detection.
+* **P13e — stall profiler and the fault→tracker path.** `core/stall.py`,
+  `StagedDataCallback`, `bundle/faults.json` and `bundle/stall.json` always written.
+
+### Known gaps P13a leaves open, deliberately
+
+1. **Nothing consumes the registry yet.** `decoder_for` resolves and instantiates,
+   but no source calls it — that is P13b/P13d. The phase is a foundation, and its
+   gate was "`mlf decoders` prints the table truthfully on a bare install".
+2. **`audio`/`video` are in `DataKind` with no source behind them.** Setting
+   `data.kind: audio` today reaches `SOURCES` and fails with "unknown source", which
+   is a clear error but not the eventual one. `_check_required_by_kind` grows its
+   cases in P13d.
+3. **The compressed-audio and video decoders are untested against real files.** They
+   are gated on `av`, which is not installed here. `audio.mp3`'s silent-resync
+   detection needs the duration cross-check in `mlf materialize` (P13b) plus a
+   committed ~2 KB truncated MP3 fixture to be proven at all.
+4. **`mlf materialize` does not exist**, so the refusal to train on a `silent`/`none`
+   corpus without an offline pass is designed but not enforced. That enforcement is
+   P13b's, and until it lands nothing checks `REQUIRES_MATERIALIZATION`.
+5. **Parquet is deliberately not a decoder row.** Its read/demux/decode is already
+   owned by `DataBackend` (P12), and the reference table itself notes the
+   Thrift-footer→chunk-offset step is "same API, no seam". A second owner for one
+   read path is what `DataBackendSpec`'s docstring forbids.

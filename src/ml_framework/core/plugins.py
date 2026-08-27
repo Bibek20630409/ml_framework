@@ -43,8 +43,12 @@ from .types import (
     Capabilities,
     DataKind,
     FrameworkError,
+    Integrity,
+    LandsIn,
+    Layout,
     Payload,
     Requirement,
+    Stage,
     Task,
     unmet_requirements,
 )
@@ -251,7 +255,77 @@ class DataBackendSpec:
     description: str = ""
 
 
-SpecT = TypeVar("SpecT", bound="ModelSpec | BackendSpec | SourceSpec | DataBackendSpec")
+@dataclass(frozen=True, slots=True)
+class DecoderSpec:
+    """One media format's read/demux/decode path, and what it costs to trust it.
+
+    Sibling of :class:`DataBackendSpec`, and registered the same way: a spec plus a
+    lazy factory, never an import of the codec. That is what lets ``mlf decoders``
+    list the H.264 path on an install with no FFmpeg binding.
+
+    **No ``capabilities`` field**, for the reason :class:`DataBackendSpec` has
+    none: every flag on :class:`Capabilities` is about a model or a fit loop, so a
+    default-constructed one here would be exactly the decoration that class's
+    docstring forbids. ``integrity`` and ``lands_in`` are the honest columns.
+
+    The three declared columns each have exactly one named consumer:
+
+    * ``stages`` — ``mlf decoders --show``, and ``materialize`` (which only times a
+      stage that is declared).
+    * ``lands_in`` — ``BundleDataModule``, which skips pinning and forces
+      ``num_workers=0`` when a decoder returns device memory.
+    * ``integrity`` — the corrupt-sample policy, which refuses to run a corpus
+      whose damage it could not possibly see without an offline pass first.
+    """
+
+    name: str
+    """Dotted ``kind.format``: ``"audio.flac"``, ``"video.h264"``, ``"text.tokens"``.
+
+    Dotted rather than flat because the set is open and will grow per *format*,
+    not per kind — ``audio.mp3`` and ``audio.opus`` are genuinely different paths
+    that happen to land in the same tensor shape.
+    """
+    data_kind: DataKind
+    factory: Callable[..., Any]
+    """``factory(**decoder_params) -> Decoder``.
+
+    Takes keyword arguments for the same reason :class:`DataBackendSpec`'s factory
+    does: ``data.decoder_params`` is validated *by the decoder*, so the decoder has
+    to receive it. An unknown key is the decoder's error to raise.
+    """
+    media_types: tuple[str, ...] = ()
+    suffixes: tuple[str, ...] = ()
+    # Which of read/demux/decode this decoder actually performs. The methods always
+    # exist (BaseDecoder supplies defaults), so this is a declaration, not a
+    # capability check — no caller branches on it.
+    stages: frozenset[Stage] = frozenset({"decode"})
+    # What `decode()` leaves in memory, BEFORE any tensor is built. Decode and
+    # tensor construction are independent axes, so recording the decoder's own
+    # output dtype is what makes the cost of the conversion visible.
+    output_dtype: str = ""
+    output_layout: Layout = "hwc"
+    lands_in: LandsIn = "host"
+    integrity: Integrity = "none"
+    integrity_note: str = ""
+    """Printed verbatim by ``mlf decoders --show``.
+
+    Prose rather than a flag because the useful thing to know is *how* a format
+    fails, and "resyncs silently past damage: shorter audio, no error" is not
+    reducible to a boolean.
+    """
+    oracle: str | None = None
+    """A host decoder producing the same array, for ``mlf materialize`` to compare against.
+
+    The practical answer to a decoder that cannot report its own damage: decode it
+    twice, once through a path that can. Single consumer: ``materialize.py``.
+    """
+    requires: tuple[Requirement, ...] = ()
+    description: str = ""
+
+
+SpecT = TypeVar(
+    "SpecT", bound="ModelSpec | BackendSpec | SourceSpec | DataBackendSpec | DecoderSpec"
+)
 
 
 # ── Registry ──────────────────────────────────────────────

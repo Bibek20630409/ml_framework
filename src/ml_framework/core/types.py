@@ -39,7 +39,7 @@ Task = Literal[
     "token_classification",
     "seq2seq",
 ]
-DataKind = Literal["tabular", "image", "text", "timeseries"]
+DataKind = Literal["tabular", "image", "text", "timeseries", "audio", "video"]
 
 # What a split's `payload` physically is — the honest alternative to pretending
 # every estimator consumes an (n, d) matrix. A backend declares which of these it
@@ -47,6 +47,40 @@ DataKind = Literal["tabular", "image", "text", "timeseries"]
 # consume an image folder" into a build-time error instead of a shape error 200
 # lines deep.
 Payload = Literal["arrays", "frame", "dataset", "series"]
+
+# ── Staged-read vocabulary (P13) ──────────────────────────
+# Storage → tensor is `read → demux → decode`: three stages, not two. The
+# distinction is what lets the formats be described honestly — a pre-tokenized
+# `.bin` shard has neither demux nor decode (a memmap slice is a page fault, not a
+# call), while an MP3 has both. Declared per decoder on `DecoderSpec.stages`.
+Stage = Literal["read", "demux", "decode"]
+
+# The physical arrangement of a decoded buffer, before any transform. `nv12` is
+# listed because it is what a hardware video decoder actually emits; calling that
+# `chw` would be a lie that costs a wrong reshape later.
+Layout = Literal["hwc", "chw", "nv12", "pcm", "mel", "tokens", "thwc"]
+
+# Where a decoder left its output. `device` means the bytes never touched host
+# memory: no array to wrap, no pinned staging buffer, no H2D copy. Consumer:
+# `BundleDataModule`, which skips pinning and forces `num_workers=0` for one.
+LandsIn = Literal["host", "device"]
+
+# How much a decoder's output can be trusted — what a failure *surfaces*, not
+# whether one can occur:
+#   checked  a verified integrity primitive; damage raises (FLAC CRC-16, PNG CRC-32)
+#   loud     no checksum, but structural damage raises (missing `moov`, bad header)
+#   silent   damage yields a valid-shaped wrong result and NO exception (MP3 resync,
+#            mid-stream H.264 artifacts) — invisible at training time
+#   none     no integrity information exists (a bit flip in a uint16 token shard is
+#            a valid token id); only a recorded digest defends it
+# Consumer: the corrupt-sample policy in `data/streaming/integrity.py`.
+Integrity = Literal["checked", "loud", "silent", "none"]
+
+STAGES: Final[tuple[Stage, ...]] = ("read", "demux", "decode")
+LAYOUTS: Final[tuple[Layout, ...]] = ("hwc", "chw", "nv12", "pcm", "mel", "tokens", "thwc")
+LANDS_IN: Final[tuple[LandsIn, ...]] = ("host", "device")
+INTEGRITIES: Final[tuple[Integrity, ...]] = ("checked", "loud", "silent", "none")
+
 
 # The shape of what a model emits, recorded in the bundle manifest's signature.
 #
@@ -84,7 +118,14 @@ TASKS: Final[tuple[Task, ...]] = (
     "token_classification",
     "seq2seq",
 )
-DATA_KINDS: Final[tuple[DataKind, ...]] = ("tabular", "image", "text", "timeseries")
+DATA_KINDS: Final[tuple[DataKind, ...]] = (
+    "tabular",
+    "image",
+    "text",
+    "timeseries",
+    "audio",
+    "video",
+)
 PAYLOADS: Final[tuple[Payload, ...]] = ("arrays", "frame", "dataset", "series")
 
 # The distribution name used in every `pip install …` hint we emit.

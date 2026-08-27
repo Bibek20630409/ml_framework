@@ -58,12 +58,13 @@ import argparse
 import json
 import logging
 import os
+import textwrap
 from pathlib import Path
 from typing import Any
 
 from .config import ExperimentConfig
 from .core.export import EXPORT_FORMATS
-from .core.types import FrameworkError
+from .core.types import STAGES, FrameworkError
 from .utils import setup_logging
 
 log = logging.getLogger(__name__)
@@ -362,7 +363,9 @@ def _print_plugins(registry: Any, *, include_failed: bool, show_detail: bool) ->
     # engine name, and sizing on the names alone ragged-edged every row under it.
     width = max(*(len(row["name"]) for row in rows), len(label))
     pad = " " * (width + 9)
-    second = {"model": "BACKEND", "data backend": "ENGINE"}.get(registry.kind, "ACCEPTS")
+    second = {"model": "BACKEND", "data backend": "ENGINE", "decoder": "INTEGRITY"}.get(
+        registry.kind, "ACCEPTS"
+    )
     # 14 wide: a backend accepting two payloads prints "arrays,dataset", and a
     # narrower column would ragged-edge every description beside it.
     print(f"{label.ljust(width)}  READY  {second:<14}  DESCRIPTION")
@@ -398,6 +401,11 @@ def _second_column(kind: str, spec: Any) -> str:
         # A DataBackendSpec carries no `capabilities`: every flag on that class is
         # about a model or a fit loop. Reaching for one here raised AttributeError.
         return str(spec.engine) or "-"
+    if kind == "decoder":
+        # Integrity, not `lands_in`: this is the column the staged pipeline exists
+        # for, and "how does this format fail" is what an operator scanning the
+        # table needs to see without asking for --show. Every value fits in 14.
+        return str(spec.integrity) or "-"
     return ",".join(sorted(spec.capabilities.accepts)) or "-"
 
 
@@ -410,6 +418,25 @@ def _format_detail(kind: str, spec: Any) -> list[str]:
         ]
     if kind == "data backend":
         return [f"engine: {spec.engine}"]
+    if kind == "decoder":
+        lines = [
+            f"kind:   {spec.data_kind}",
+            f"lands:  {spec.lands_in} memory",
+            f"output: {spec.output_dtype} {spec.output_layout}",
+            # Sorted read/demux/decode rather than alphabetically: the pipeline
+            # order is the information, and "decode,demux,read" reads backwards.
+            f"stages: {','.join(s for s in STAGES if s in spec.stages)}",
+        ]
+        if spec.suffixes:
+            lines.append(f"files:  {' '.join(spec.suffixes)}")
+        if spec.oracle:
+            lines.append(f"oracle: {spec.oracle} (cross-checked at materialization)")
+        if spec.integrity_note:
+            # Verbatim, wrapped. This is the sentence the whole command exists to
+            # deliver -- an operator should be able to learn from it that MP3
+            # resyncs silently and that a token shard has no integrity at all.
+            lines.extend(textwrap.wrap(spec.integrity_note, width=76))
+        return lines
     caps = spec.capabilities
     supported = [
         name
@@ -456,6 +483,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     data_backends_p.add_argument("--all", action="store_true", help="Also list failed imports")
     data_backends_p.add_argument("--show", action="store_true", help="Add each engine's detail")
+
+    # Sibling of `data-backends`, and the same shape: a registry rendered from
+    # specs alone, so it lists the H.264 path and its pip line on an install with
+    # no FFmpeg binding. The second column is INTEGRITY — how each format fails —
+    # because that is the column the staged pipeline exists for.
+    decoders_p = sub.add_parser(
+        "decoders", help="List media decoders, what they output, and how each fails"
+    )
+    decoders_p.add_argument("--all", action="store_true", help="Also list failed imports")
+    decoders_p.add_argument(
+        "--show",
+        action="store_true",
+        help="Add each decoder's stages, output dtype/layout and integrity note",
+    )
 
     init_p = sub.add_parser("init", help="Write a config inferred from a dataset")
     _add_data_args(init_p)
@@ -778,19 +819,21 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     setup_logging()
 
-    if args.command in ("models", "backends", "data-backends"):
+    if args.command in ("models", "backends", "data-backends", "decoders"):
         # Importing the plugin package is what populates the registry, and it is
         # required to be dependency-free — see plugins/__init__.py.
         import ml_framework.plugins  # noqa: F401
 
         from . import backends as _backends  # noqa: F401  (registers the backends)
-        from .core.registry import BACKENDS, DATA_BACKENDS, MODELS
+        from .core.registry import BACKENDS, DATA_BACKENDS, DECODERS, MODELS
         from .data import backends as _data_backends  # noqa: F401  (registers the engines)
+        from .data import streaming as _streaming  # noqa: F401  (registers the decoders)
 
         registry = {
             "models": MODELS,
             "backends": BACKENDS,
             "data-backends": DATA_BACKENDS,
+            "decoders": DECODERS,
         }[args.command]
         return _print_plugins(registry, include_failed=args.all, show_detail=args.show)
 

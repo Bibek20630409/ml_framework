@@ -41,6 +41,7 @@ from typing import Any, TypeVar
 from .plugins import (
     BackendSpec,
     DataBackendSpec,
+    DecoderSpec,
     IncompatibleCombinationError,
     ModelSpec,
     PluginRegistry,
@@ -138,6 +139,10 @@ SOURCES: PluginRegistry[SourceSpec] = PluginRegistry("source")
 # of this registry is the sentence `check_requirements` builds from it —
 # "data backend 'spark' requires pyspark>=3.5. Install it with: ..."
 DATA_BACKENDS: PluginRegistry[DataBackendSpec] = PluginRegistry("data backend")
+# One word, no space — unlike "data backend" this already reads correctly in the
+# sentence `check_requirements` builds: "decoder 'audio.flac' requires
+# soundfile>=0.12.1. Install it with: pip install 'ml-framework[audio]'".
+DECODERS: PluginRegistry[DecoderSpec] = PluginRegistry("decoder")
 
 
 def register_model_spec(spec: ModelSpec, *, override: bool = False) -> ModelSpec:
@@ -180,6 +185,28 @@ def get_data_backend(name: str, **params: Any) -> Any:
     import ml_framework.data.backends  # noqa: F401  (registration side effect)
 
     return DATA_BACKENDS.get(name).factory(**params)
+
+
+def register_decoder(spec: DecoderSpec, *, override: bool = False) -> DecoderSpec:
+    return DECODERS.register(spec, override=override)
+
+
+def get_decoder(name: str, **params: Any) -> Any:
+    """The instantiated :class:`Decoder` for ``name``.
+
+    Same shape as :func:`get_data_backend`, and for the same two reasons:
+    registration is an import side effect of ``ml_framework.data.streaming``, which
+    no caller reaches otherwise; and availability is checked *after* populating, so
+    a missing extra produces a pip command rather than an ImportError raised from
+    inside the factory when it tries to ``import av``.
+
+    ``params`` is ``data.decoder_params`` verbatim, passed through unvalidated —
+    validating it here would mean this function knowing every codec's knobs, which
+    is the coupling the registry exists to remove.
+    """
+    import ml_framework.data.streaming  # noqa: F401  (registration side effect)
+
+    return DECODERS.get(name).factory(**params)
 
 
 def get_backend(name: str) -> Any:

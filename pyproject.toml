@@ -50,6 +50,27 @@ lightning = [
 # when you care which build you get — that is what CI does, and it is an
 # environment concern, not something package metadata can express.
 image = ["torchvision>=0.15.0", "Pillow>=9.0.0"]
+# Audio ingestion. `soundfile` wraps libsndfile, which is the only format path in
+# the staged decode pipeline with real built-in integrity (FLAC's per-frame
+# CRC-16) -- and also the one whose `read()` defaults to float64, a silent 4x
+# blowup over a whole corpus. That default is why `DecodeContext.dtype` exists.
+#
+# `torchaudio` carries the SAME sharp edge as torchvision above, for the same
+# reason: every torchaudio release pins one torch patch exactly. The floor is
+# unbounded to avoid pinning the user's torch, and the consequence is identical --
+# `pip install -e '.[audio]'` resolves the newest torchaudio and will replace an
+# older torch to match it. Install torch and torchaudio together from one index.
+audio = ["soundfile>=0.12.1", "torchaudio>=2.0.0"]
+# Compressed audio and video. One FFmpeg binding covers all four container/codec
+# paths the pipeline knows: MP3 frame-sync, Ogg/Opus page parsing, MP4 box
+# traversal and H.264 decode. PyAV ships the libraries rather than requiring a
+# system ffmpeg, which is what makes it installable on Windows without a package
+# manager -- the reason it is preferred over a subprocess wrapper here.
+#
+# Named `video` rather than `av` or `ffmpeg` because an extra name is what users
+# type and what `Requirement.extra` interpolates into every pip hint; the codec
+# library it happens to install is an implementation detail that may change.
+video = ["av>=12.0.0"]
 serve = [
     "fastapi>=0.110.0",
     "uvicorn>=0.27.0",
@@ -128,6 +149,12 @@ dev = [
     "pre-commit>=3.6.0",
     "fastapi>=0.110.0",
     "torchvision>=0.15.0",  # see the pairing note on the `image` extra above
+    # The decode suites: without these, the cross-decoder equivalence tests and
+    # every corrupt-input test skip themselves and the phase looks green while
+    # proving nothing.
+    "soundfile>=0.12.1",
+    "av>=12.0.0",
+    "torchaudio>=2.0.0",  # same torch pairing note as torchvision
     "mlflow>=2.9.0",
     "prometheus-fastapi-instrumentator>=6.1.0",
     "slowapi>=0.1.9",
