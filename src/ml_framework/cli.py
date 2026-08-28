@@ -146,6 +146,25 @@ def _load_config(args: argparse.Namespace) -> ExperimentConfig:
     if getattr(args, "data_backend", None):
         cfg = cfg.with_overrides({"data.backend": args.data_backend})
 
+    # The staged-read and transport flags, folded in the same way. Table-driven
+    # rather than six `if`s, borrowed from `_apply_select_args`: the mapping IS the
+    # information, and a flag added without a config path is then a visibly missing
+    # row rather than a silently absent branch.
+    transport = {
+        flag: key
+        for flag, key in (
+            ("decoder", "data.params.decoder"),
+            ("on_corrupt", "data.integrity.on_corrupt"),
+            ("shuffle", "data.shards.shuffle"),
+            ("num_workers", "runtime.num_workers"),
+            ("prefetch_factor", "runtime.prefetch_factor"),
+            ("pin_memory", "runtime.pin_memory"),
+        )
+        if getattr(args, flag, None) is not None
+    }
+    if transport:
+        cfg = cfg.with_overrides({key: getattr(args, flag) for flag, key in transport.items()})
+
     # Whether the *framework* chose the model, which is what decides if the trivial
     # baseline is worth scoring. Compared against the surviving value rather than
     # set when synthesis ran: a later layer -- a YAML, a --set, an explicit --model
@@ -179,6 +198,57 @@ def _add_config_args(sub: argparse.ArgumentParser) -> None:
         default=None,
         metavar="NAME",
         help="Data-processing engine for this run: local (default), polars or spark",
+    )
+    # Staged-read controls. Like `--data-backend`, these are choices about *this
+    # invocation* rather than facts inferred from the data, so they live here and
+    # not on the synthesis surface. Every one defaults to None so "the user asked
+    # for this" stays distinguishable from "nobody said".
+    sub.add_argument(
+        "--decoder",
+        default=None,
+        metavar="NAME",
+        # No `choices=`: the set is open and validated by the registry, exactly as
+        # `--data-backend` is. `mlf decoders` lists what is available.
+        help="Media decoder for this run. Resolved from the corpus when omitted",
+    )
+    sub.add_argument(
+        "--on-corrupt",
+        default=None,
+        choices=("substitute", "raise"),
+        help="A corrupt sample is substituted (default) or stops the run. Never skipped",
+    )
+    sub.add_argument(
+        "--shuffle",
+        default=None,
+        choices=("block", "global", "none"),
+        help="Shard shuffle strategy: block (default, keeps reads local), global, none",
+    )
+    sub.add_argument(
+        "--num-workers",
+        type=int,
+        default=None,
+        metavar="N",
+        help="DataLoader workers (-1 = auto: 0 on Windows, else 4)",
+    )
+    sub.add_argument(
+        "--prefetch-factor",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Batches each worker prefetches (default 2). Ignored without workers",
+    )
+    sub.add_argument(
+        "--pin-memory",
+        dest="pin_memory",
+        action="store_true",
+        default=None,
+        help="Page-lock staging buffers for an async H2D copy (CUDA only)",
+    )
+    sub.add_argument(
+        "--no-pin-memory",
+        dest="pin_memory",
+        action="store_false",
+        help="Never page-lock, even on CUDA",
     )
 
 

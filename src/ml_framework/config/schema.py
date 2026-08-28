@@ -137,6 +137,26 @@ class RuntimeConfig(BaseModel):
     strategy: str = "auto"
     deterministic: bool = True
 
+    # ── Transport: how a batch gets from a worker to the device ──
+    # These live here rather than on `fit` for the reason this class's docstring
+    # gives: worker count, page-locking and prefetch depth are properties of
+    # *where the run happens*, not of the model or the data. `fit` is budget,
+    # patience and batch size.
+    #
+    # Page-locked staging buffers, so H2D is an async DMA rather than a bounce
+    # through pageable memory. Honoured only on CUDA and only for a host-landing
+    # decoder; auto-downgraded with a debug log otherwise, so the default is a
+    # no-op on a CPU box rather than a waste of pinned RAM.
+    pin_memory: bool = True
+    # DEFAULT FALSE, deliberately. Keeping workers alive between epochs is the
+    # single biggest throughput win on a many-worker image or audio run -- but
+    # `worker_init_fn` then runs once instead of per epoch, which changes the
+    # augmentation stream. Turning it on is a decision, not an inheritance.
+    persistent_workers: bool = False
+    # Batches each worker prefetches. torch's own default; raising it trades host
+    # RAM for tolerance of a bursty decode.
+    prefetch_factor: int = Field(default=2, ge=1)
+
 
 class SplitConfig(BaseModel):
     """How train/val/test are cut.

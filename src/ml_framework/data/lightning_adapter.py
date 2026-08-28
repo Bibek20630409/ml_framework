@@ -41,6 +41,49 @@ from .types import DataBundle
 log = logging.getLogger(__name__)
 
 
+def _to_tensor(array: np.ndarray) -> torch.Tensor:
+    """``from_numpy`` when the buffer is already what torch wants, a copy otherwise.
+
+    Tensor construction is attaching a dtype, a shape and strides to a pointer. It
+    only has to *copy* when the pointer is not already pointing at what torch
+    needs — and the previous unconditional ``torch.tensor(np.asarray(x,
+    dtype="float32"))`` copied every time, twice when ``x`` was float64.
+
+    The three conditions are exactly:
+
+    ``float32``        torch's compute dtype here; anything else must be cast.
+    C-contiguous       a Fortran-order or strided view has the wrong layout.
+    **writeable**      ``from_numpy`` on a read-only array (an ``np.memmap``
+                       view, which is exactly what a token shard hands back)
+                       produces a tensor whose in-place operations are undefined
+                       behaviour. torch *warns* rather than raising, so relying
+                       on it to complain is not an option.
+
+    Note what is deliberately absent: any handling of ``uint16``. torch has no
+    usable uint16 arithmetic, so a token corpus must be cast — and the cast
+    belongs in the ``collate_fn``, per batch over a few MB, not here, over the
+    whole corpus with a 4x blowup. At 15T tokens that is the difference between
+    30 TB on disk and 60 TB, against a memcpy-bound operation per step.
+    """
+    if array.dtype == np.float32 and array.flags["C_CONTIGUOUS"] and array.flags["WRITEABLE"]:
+        return torch.from_numpy(array)
+    return torch.tensor(np.ascontiguousarray(array, dtype="float32"))
+
+
+def _cuda_selected(accelerator: str) -> bool:
+    """Whether this run will actually reach a CUDA device.
+
+    ``"auto"`` has to ask torch, because that is precisely what Lightning will do.
+    Guessing wrong in the permissive direction costs page-locked host RAM for a
+    copy that never happens.
+    """
+    if accelerator in ("cpu", "mps"):
+        return False
+    if accelerator in ("gpu", "cuda"):
+        return True
+    return bool(torch.cuda.is_available())
+
+
 class BundleDataModule(pl.LightningDataModule):
     """Wraps a :class:`DataBundle` in Lightning's dataloader protocol.
 
@@ -60,6 +103,10 @@ class BundleDataModule(pl.LightningDataModule):
         num_workers: int = -1,
         output_dir: str | Path | None = None,
         collate_fn: Callable[[Any], Any] | None = None,
+        pin_memory: bool = False,
+        persistent_workers: bool = False,
+        prefetch_factor: int = 2,
+        accelerator: str = "auto",
     ) -> None:
         super().__init__()
         if bundle is None and bundle_factory is None:
@@ -70,6 +117,15 @@ class BundleDataModule(pl.LightningDataModule):
         self.num_workers_setting = num_workers
         self.output_dir = Path(output_dir) if output_dir is not None else None
         self._collate_fn = collate_fn
+        # `pin_memory` defaults to False here but True on `RuntimeConfig`. Not a
+        # contradiction: the config default is "pin when it would help", and the
+        # `pin_memory` property below decides whether it would. A direct caller
+        # constructing this class outside a run has no accelerator context, so the
+        # safe default for them is off.
+        self._pin_memory_setting = pin_memory
+        self.persistent_workers = persistent_workers
+        self.prefetch_factor = prefetch_factor
+        self._accelerator = accelerator
         self._datasets: dict[str, Any] = {}
 
     # ── bundle access ──
@@ -103,10 +159,14 @@ class BundleDataModule(pl.LightningDataModule):
     def _build_dataset(self, name: str) -> Any:
         split = self.bundle.split(name)
         if split.payload == "dataset":
+            # Already a lazily-decoding corpus -- including a device-landing one,
+            # whose items are not numpy at all. Returned untouched: there is no
+            # tensor to construct here, and Lightning's `transfer_batch_to_device`
+            # is a no-op for something already on the right device.
             return split.x
         if split.x is None:
             raise ValueError(f"split '{name}' has no features to build a dataset from")
-        x = torch.tensor(np.asarray(split.x, dtype="float32"), dtype=torch.float32)
+        x = _to_tensor(np.asarray(split.x))
         if split.y is None:
             return TensorDataset(x)
         # No explicit dtype: int64 labels stay int64 and float32 regression targets
@@ -147,8 +207,54 @@ class BundleDataModule(pl.LightningDataModule):
 
     # ── loaders ──
     @property
+    def lands_in(self) -> str:
+        """Where this bundle's decoder left its samples: ``"host"`` or ``"device"``.
+
+        Read from ``bundle.meta`` — the documented home for source-specific extras
+        the ``DataBundle`` contract should not name. Defaults to ``"host"``, which
+        is what every non-staged source produces.
+        """
+        if not self.is_ready:
+            return "host"
+        return str(self.bundle.meta.get("lands_in", "host"))
+
+    @property
     def _workers(self) -> int:
-        return resolve_num_workers(self.num_workers_setting)
+        requested = resolve_num_workers(self.num_workers_setting)
+        if self.lands_in == "device" and requested != 0:
+            # Enforced, not documented. A CUDA tensor cannot be returned from a
+            # DataLoader worker across a fork/spawn boundary without CUDA IPC,
+            # and the failure mode is a hang rather than an error.
+            log.warning(
+                "decoder lands in device memory; forcing num_workers=0 (a CUDA tensor "
+                "cannot be returned from a DataLoader worker). Decode is already "
+                "off-CPU, so worker parallelism buys nothing here."
+            )
+            return 0
+        return requested
+
+    @property
+    def pin_memory(self) -> bool:
+        """Page-locked staging buffers, so H2D is an async DMA.
+
+        False in two cases, both of which would otherwise cost something for
+        nothing:
+
+        * the decoder already landed the sample in **device** memory — pinning a
+          buffer that is already there is a no-op at best and a device-to-host
+          round trip at worst;
+        * there is no CUDA device to copy *to*, where the only effect is
+          page-locking host RAM for a transfer that never happens.
+        """
+        if not self._pin_memory_setting:
+            return False
+        if self.lands_in == "device":
+            log.debug("not pinning: the decoder already landed this batch on the device")
+            return False
+        if not _cuda_selected(self._accelerator):
+            log.debug("not pinning: no CUDA device is selected, so there is no H2D copy")
+            return False
+        return True
 
     @property
     def sampler_weights(self) -> np.ndarray | None:
@@ -165,12 +271,22 @@ class BundleDataModule(pl.LightningDataModule):
 
     def _loader(self, name: str, *, shuffle: bool = False, sampler: Any = None) -> DataLoader:
         dataset = self._datasets[name]
+        workers = self._workers
         kwargs: dict[str, Any] = {
             "batch_size": self.batch_size,
-            "num_workers": self._workers,
+            "num_workers": workers,
         }
         if self._collate_fn is not None:
             kwargs["collate_fn"] = self._collate_fn
+        if workers > 0:
+            # Guarded rather than passed unconditionally: torch raises for
+            # `persistent_workers=True` with `num_workers=0`, and requires
+            # `prefetch_factor` to be None there. Both are meaningless without
+            # workers to do the prefetching.
+            kwargs["persistent_workers"] = self.persistent_workers
+            kwargs["prefetch_factor"] = self.prefetch_factor
+        if self.pin_memory:
+            kwargs["pin_memory"] = True
         if sampler is not None:
             # A sampler and shuffle=True are mutually exclusive in torch.
             kwargs["sampler"] = sampler
@@ -205,6 +321,10 @@ class BundleDataModule(pl.LightningDataModule):
             num_workers=config.runtime.num_workers,
             output_dir=config.runtime.output_dir,
             collate_fn=getattr(preprocessor, "collate_fn", None),
+            pin_memory=config.runtime.pin_memory,
+            persistent_workers=config.runtime.persistent_workers,
+            prefetch_factor=config.runtime.prefetch_factor,
+            accelerator=config.runtime.accelerator,
         )
 
 
@@ -227,6 +347,10 @@ class TabularDataModule(BundleDataModule):
             batch_size=config.fit.batch_size,
             num_workers=config.runtime.num_workers,
             output_dir=config.runtime.output_dir,
+            pin_memory=config.runtime.pin_memory,
+            persistent_workers=config.runtime.persistent_workers,
+            prefetch_factor=config.runtime.prefetch_factor,
+            accelerator=config.runtime.accelerator,
         )
 
 
@@ -241,4 +365,8 @@ class ImageDataModule(BundleDataModule):
             batch_size=config.fit.batch_size,
             num_workers=config.runtime.num_workers,
             output_dir=config.runtime.output_dir,
+            pin_memory=config.runtime.pin_memory,
+            persistent_workers=config.runtime.persistent_workers,
+            prefetch_factor=config.runtime.prefetch_factor,
+            accelerator=config.runtime.accelerator,
         )

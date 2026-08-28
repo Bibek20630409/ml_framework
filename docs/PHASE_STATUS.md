@@ -24,7 +24,7 @@ predict what actually happened stops being evidence of anything.
 | P10 — Exporter migration | **partial** — ONNX done, TorchScript open | see below |
 | P11 — Model selection | **done** | `c42dc04` |
 | P12 — Pluggable data backends | **done** — all five phases | `c42dc04` |
-| P13 — Staged decode pipeline | **in progress** — P13a, P13b done; c–e open | see below |
+| P13 — Staged decode pipeline | **in progress** — P13a–P13c done; d, e open | see below |
 
 P11 and P12 share a commit. They were developed in sequence but could not be split
 into two: `cli.py`, `config/schema.py` and `core/registry.py` each carry changes for
@@ -1535,9 +1535,9 @@ the ratios can be re-measured rather than trusted.
 
 ## P13 — Staged decode pipeline
 
-**P13a and P13b landed. P13c–P13e are open.** Test baseline: **1096 passed, 18 skipped**
-(up from 922; the 18 remain the JVM-gated Spark tests — P13a added 62 and P13b 112, and
-neither skipped any, because both are built on the two zero-dependency decoders).
+**P13a–P13c landed. P13d and P13e are open.** Test baseline: **1122 passed, 18 skipped**
+(up from 922; the 18 remain the JVM-gated Spark tests — P13a added 62, P13b 112 and P13c 26,
+and none of them skipped, because all three are built on the two zero-dependency decoders).
 
 Storage → tensor is eleven stages, and this framework previously expressed about
 three of them. The two claims driving the phase:
@@ -1660,13 +1660,57 @@ to pass, the design has regressed.
   `n_samples`, which is the one number that must not depend on the state of the
   bytes. Verified against a corpus with 15% corruption: the index declares 20, not 17.
 
-### P13c–P13e — open
+### P13c — the transport tail (done)
 
-* **P13c — the transport tail.** `pin_memory` / `persistent_workers` /
-  `prefetch_factor` (none of which exist in the repo today), zero-copy `from_numpy`
-  when the buffer is already float32/C-contiguous/writeable, and the
-  `lands_in == "device"` branch. Ships alone, and its gate is byte-identical
-  artifacts against the previous commit at seed 42.
+The stages after decode — wrap as tensor, collate, **pin**, **H2D** — which the
+framework did not have at all: `pin_memory`, `persistent_workers` and
+`prefetch_factor` appeared nowhere in the repo, and `lightning_adapter.py:109`
+copied unconditionally.
+
+* `RuntimeConfig` += `pin_memory` (default True), `persistent_workers` (default
+  **False**), `prefetch_factor` (2). On `runtime`, not `fit`, because worker count,
+  page-locking and prefetch depth are properties of *where the run happens*.
+* `_to_tensor` — `from_numpy` when the buffer is already float32, C-contiguous and
+  **writeable**; a copy otherwise.
+* `_loader` — the three new kwargs, each guarded.
+* `pin_memory` / `_workers` properties — the `lands_in == "device"` branch.
+* Six CLI flags: `--decoder`, `--on-corrupt`, `--shuffle`, `--num-workers`,
+  `--prefetch-factor`, `--pin-memory`/`--no-pin-memory`.
+* **A pre-existing bug fixed**: `build_datamodule` went straight through
+  `get_datamodule_class`, and only `tabular` and `image` ever got a v1 compat class
+  — so `mlf lr` on a **text or time-series** config raised
+  `KeyError: Unknown datamodule 'text'`. Fixed by falling back to
+  `BundleDataModule.from_bundle` rather than by adding two more compat classes,
+  because datamodules stopped being an extension point in P1.
+
+**Every new behaviour is conditional, and every condition avoids a cost that buys
+nothing:**
+
+| Condition | Why |
+|---|---|
+| no CUDA device → don't pin | page-locking host RAM for a copy that never happens |
+| `lands_in == "device"` → don't pin | the buffer is already there; pinning is a no-op at best, a D2H round trip at worst |
+| `num_workers == 0` → omit prefetch/persistence | torch *raises* for `persistent_workers` there |
+| `lands_in == "device"` → force `num_workers = 0` | a CUDA tensor cannot cross a fork without CUDA IPC — and that failure is a **hang**, so it is enforced with a warning, not documented |
+
+**The gate, which is the only acceptable warrant for touching `_build_dataset`.**
+An 8-epoch run at seed 42 on `data/raw/sample.csv`, before and after:
+
+```
+IDENTICAL  predictions.csv          IDENTICAL  reference_stats.json
+IDENTICAL  metrics.json             IDENTICAL  preprocessor/preprocessor.json
+IDENTICAL  report.txt               IDENTICAL  hpo.json
+IDENTICAL  confusion_matrix.txt     IDENTICAL  metrics/metrics.csv
+scaler.pkl md5 1dd8c3a5… == 1dd8c3a5…
+```
+
+`config.json` differs by exactly the three new `runtime` fields and nothing else.
+Existing tabular bundles already carry C-contiguous float32, so `from_numpy` takes
+the fast path and produces bit-identical tensors — zero-copy is an optimization,
+and an optimization that changed a number would be a bug.
+
+### P13d–P13e — open
+
 * **P13d — `audio` and `video` sources, preprocessors and models.** The vocabulary
   landed in P13a; this adds `SourceSpec`s, `AudioSourceParams`/`VideoSourceParams`,
   the mel/clip preprocessors, `audio.cnn` and `video.r3d`, `serving/schemas.py`, and
@@ -1689,9 +1733,13 @@ to pass, the design has regressed.
    comparison is implemented — but proving it catches a real resync needs a
    committed ~2 KB truncated MP3 fixture, which P13d owes.
 4. **Nothing calls `StagedDataset` from a training run yet.** The dataset, sampler,
-   index and resume state are complete and tested, but `build_bundle` does not
-   construct them — that is P13d, where the audio/video sources land. `mlf
-   materialize` is fully usable today; `mlf train` does not yet consume its output.
+   index and resume state are complete and tested, and the transport layer honours
+   `lands_in`, but `build_bundle` does not construct them — that is P13d, where the
+   audio/video sources land. `mlf materialize` is fully usable today; `mlf train`
+   does not yet consume its output.
+5. **`LoaderState` is not yet wired into a checkpoint.** `BundleDataModule` does not
+   implement `state_dict`/`load_state_dict`, so mid-epoch resume is implemented and
+   tested as a unit but not reachable from `mlf train --resume`. P13d/P13e.
 5. **Parquet is deliberately not a decoder row.** Its read/demux/decode is already
    owned by `DataBackend` (P12), and the reference table itself notes the
    Thrift-footer→chunk-offset step is "same API, no seam". A second owner for one

@@ -334,9 +334,19 @@ def build_datamodule(config: ExperimentConfig) -> Any:
     Lightning into the import path of a GBDT training run. Importing it also
     registers the v1 datamodules, which is what ``get_datamodule_class`` reads.
     """
-    from ..core.registry import get_datamodule_class
+    from ..core.registry import _DATAMODULE_REGISTRY, get_datamodule_class
     from . import lightning_adapter  # noqa: F401  (registers tabular/image datamodules)
 
+    if config.data.kind not in _DATAMODULE_REGISTRY:
+        # Only `tabular` and `image` ever got a v1 compat class, so this raised
+        # `KeyError: Unknown datamodule 'text'` for every other kind -- `mlf lr` on
+        # a text or time-series config has been broken since those sources landed.
+        #
+        # Fixed by falling through rather than by adding two more compat classes:
+        # datamodules stopped being an extension point in P1, and every one of
+        # these is now a config-bound bundle factory and nothing else. The v1
+        # classes survive only because `data.kind` still selects between them.
+        return lightning_adapter.BundleDataModule.from_bundle(build_bundle(config), config)
     return get_datamodule_class(config.data.kind)(config)
 
 
