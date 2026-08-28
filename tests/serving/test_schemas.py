@@ -45,8 +45,23 @@ def test_the_request_schema_is_chosen_by_data_kind(kind, model):
 
 @pytest.mark.unit
 def test_an_unknown_data_kind_is_refused_by_name():
-    with pytest.raises(PayloadError, match="no request schema for data kind 'audio'"):
-        request_model("audio")
+    # A fictional kind on purpose: this used to say "audio", which stopped testing
+    # anything the moment audio got a request schema in P13.
+    with pytest.raises(PayloadError, match="no request schema for data kind 'hologram'"):
+        request_model("hologram")
+
+
+@pytest.mark.unit
+def test_audio_and_video_carry_a_request_schema_that_names_the_media_type():
+    """An image decoder can sniff JFIF or PNG magic; raw MP3 frames have no
+    container and no reliable header, and guessing wrong picks a decoder whose
+    failure mode is *silent*. So the caller states what it is sending."""
+    for kind in ("audio", "video"):
+        model = request_model(kind)
+        payload = model.model_validate({"inputs": [{"b64": "AAA=", "media_type": "audio/flac"}]})
+        assert payload.n_rows == 1
+        with pytest.raises(ValidationError):
+            model.model_validate({"inputs": [{"b64": "AAA="}]})
 
 
 @pytest.mark.unit

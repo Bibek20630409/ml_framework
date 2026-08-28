@@ -24,7 +24,7 @@ predict what actually happened stops being evidence of anything.
 | P10 — Exporter migration | **partial** — ONNX done, TorchScript open | see below |
 | P11 — Model selection | **done** | `c42dc04` |
 | P12 — Pluggable data backends | **done** — all five phases | `c42dc04` |
-| P13 — Staged decode pipeline | **in progress** — P13a–P13c done; d, e open | see below |
+| P13 — Staged decode pipeline | **in progress** — P13a–P13d done; e open | see below |
 
 P11 and P12 share a commit. They were developed in sequence but could not be split
 into two: `cli.py`, `config/schema.py` and `core/registry.py` each carry changes for
@@ -1535,9 +1535,9 @@ the ratios can be re-measured rather than trusted.
 
 ## P13 — Staged decode pipeline
 
-**P13a–P13c landed. P13d and P13e are open.** Test baseline: **1122 passed, 18 skipped**
-(up from 922; the 18 remain the JVM-gated Spark tests — P13a added 62, P13b 112 and P13c 26,
-and none of them skipped, because all three are built on the two zero-dependency decoders).
+**P13a–P13d landed. P13e is open.** Test baseline: **1151 passed, 18 skipped**
+(up from 922; the 18 remain the JVM-gated Spark tests — P13a added 62, P13b 112, P13c 26 and
+P13d 29, and none of them skipped, because all four rest on the zero-dependency decoders).
 
 Storage → tensor is eleven stages, and this framework previously expressed about
 three of them. The two claims driving the phase:
@@ -1709,16 +1709,77 @@ Existing tabular bundles already carry C-contiguous float32, so `from_numpy` tak
 the fast path and produces bit-identical tensors — zero-copy is an optimization,
 and an optimization that changed a number would be a bug.
 
-### P13d–P13e — open
+### P13d — `audio` and `video` as data kinds (done)
 
-* **P13d — `audio` and `video` sources, preprocessors and models.** The vocabulary
-  landed in P13a; this adds `SourceSpec`s, `AudioSourceParams`/`VideoSourceParams`,
-  the mel/clip preprocessors, `audio.cnn` and `video.r3d`, `serving/schemas.py`, and
-  `sniff.py` detection.
+The first sources that consume P13's machinery end to end. `mlf train --data ./clips`
+now sniffs an audio corpus, picks `audio.cnn`, reads through the shard index and the
+staged decode path, builds spectrograms in the collate, and trains.
+
+* `data/sources/staged_folder.py` — everything structural, shared by both kinds.
+* `data/sources/{audio,video}.py` — params, preprocessor, decode context.
+* `data/preprocess/{audio,video}.py` — the mel front-end and the CTHW permute, both
+  **in the collate**, so a *batch* pays for tensor construction rather than a corpus.
+* `plugins/{audio,video}.py` + `av_params.py` — `audio.cnn` and `video.r3d`.
+* All the switch sites: `_BUNDLE_BUILDERS`, `_CV_BUILDERS`, `_cv_population`,
+  `MODEL_RULES`, `serving/schemas.py`, `sniff.py`, `_check_required_by_kind`,
+  `autoconfig`.
+
+**Decisions worth keeping:**
+
+* **Labels come from the shard index, never from decoding.** `mlf materialize`
+  infers them from the class directories (sorted, so the order is stable across
+  machines) and records one per entry. Fold planning is then a JSON scan — the
+  analogue of `ImageFolder.targets`, and the difference between a second and an hour
+  on a corpus of four-second clips.
+* **Imbalance is corrected by loss weights, not by a sampler.** The image source
+  emits `meta["sample_weights"]` for a `WeightedRandomSampler`; these two emit
+  `class_weights` and deliberately no sample weights. A weighted random sampler over
+  sharded storage is one seek per sample, and it would fight `ShardShuffleSampler`
+  for ownership of the visit order.
+* **A fold's index is renumbered from zero.** `__len__` and the distributed sampler
+  both derive from the entry positions, so a sparse index would break the identity
+  the parity argument needs.
+* **Materialization is never implicit.** An unmaterialized corpus is refused with the
+  command that fixes it. Doing it silently inside `mlf train` would make training
+  occasionally take an hour for no stated reason, and would throw away the fault
+  ceiling and the non-zero exit that are the pass's whole value.
+* **`video.r3d` needs no `[video]` extra.** `torchvision.models.video` ships
+  `r3d_18`, so the *model* costs nothing beyond `[image]`; only the *decoder* needs
+  PyAV. Conflating them would make one of the two pip hints wrong.
+* **One input channel for audio, not three.** A spectrogram is not an RGB image;
+  stacking it three times to satisfy a pretrained stem wastes two thirds of the first
+  convolution. The stem is reshaped and its pretrained kernel **summed** across RGB,
+  which preserves the response magnitude batch norm was calibrated for.
+
+**A framework-wide bug this phase surfaced and fixed.** `BCEWithLogitsLoss.pos_weight`
+and `CrossEntropyLoss.weight` are registered as torch *buffers*, so they were written
+into every checkpoint — while every reload path deliberately passes
+`class_weights=None` (a loaded estimator predicts; it does not resume training). Any
+model trained with class weights therefore failed to reload:
+
+```
+RuntimeError: Error(s) in loading state_dict for AudioCNN:
+        Unexpected key(s) in state_dict: "criterion.pos_weight"
+```
+
+Latent since class-weight support landed and unreachable until audio became the first
+source to emit binary weights from its own imbalance correction. Fixed by marking the
+buffers non-persistent, which matches what they are: a property of the training data,
+recomputed at build time, never learned.
+
+**Verified end to end**, on a synthesized two-tone corpus (48 train / 16 test):
+zero-config sniff → `audio` / `binary` / `audio.cnn` → materialize → staged decode →
+mel collate → train → 100% test accuracy. And with 4 of 48 clips corrupted *after*
+indexing: 4 substitutions per epoch, each drawn from the same shard, run completes
+normally, `faults/rank0-worker0.jsonl` records each one with the index served instead.
+A healthy run writes no fault file at all.
+
+### P13e — open
+
 * **P13e — stall profiler and the fault→tracker path.** `core/stall.py`,
   `StagedDataCallback`, `bundle/faults.json` and `bundle/stall.json` always written.
 
-### Known gaps P13a leaves open, deliberately
+### Known gaps P13 leaves open, deliberately
 
 1. **Nothing consumes the registry yet.** `decoder_for` resolves and instantiates,
    but no source calls it — that is P13b/P13d. The phase is a foundation, and its
@@ -1727,19 +1788,24 @@ and an optimization that changed a number would be a bug.
    `data.kind: audio` today reaches `SOURCES` and fails with "unknown source", which
    is a clear error but not the eventual one. `_check_required_by_kind` grows its
    cases in P13d.
-3. **The compressed-audio and video decoders are untested against real files.** They
-   are gated on `av`, which is not installed here. `audio.mp3` now emits the
-   `expected_samples` / `n_samples` pair that `mlf materialize` compares, and the
-   comparison is implemented — but proving it catches a real resync needs a
-   committed ~2 KB truncated MP3 fixture, which P13d owes.
-4. **Nothing calls `StagedDataset` from a training run yet.** The dataset, sampler,
-   index and resume state are complete and tested, and the transport layer honours
-   `lands_in`, but `build_bundle` does not construct them — that is P13d, where the
-   audio/video sources land. `mlf materialize` is fully usable today; `mlf train`
-   does not yet consume its output.
-5. **`LoaderState` is not yet wired into a checkpoint.** `BundleDataModule` does not
+3. **The compressed-audio and video decoders are still untested against real files.**
+   Both are gated on `av`, which is not installed here, so `audio.mp3`, `audio.opus`
+   and `video.h264` are exercised only as registry entries. `audio.mp3` now emits the
+   `expected_samples`/`n_samples` pair `mlf materialize` compares and the comparison
+   is implemented — but proving it catches a real resync needs a committed ~2 KB
+   truncated MP3, and proving the H.264 frame-count check needs a single-GOP MP4.
+   Neither can be synthesized without an encoder. **This is the largest remaining
+   hole in P13**: the two rows the reference table calls most dangerous are the two
+   with no end-to-end coverage.
+4. **`LoaderState` is not wired into a checkpoint.** `BundleDataModule` does not
    implement `state_dict`/`load_state_dict`, so mid-epoch resume is implemented and
-   tested as a unit but not reachable from `mlf train --resume`. P13d/P13e.
+   unit-tested but not reachable from `mlf train --resume`. P13e.
+5. **`ShardShuffleSampler` is not wired into the loader either.** `StagedDataset` is
+   consumed through the ordinary `DataLoader(shuffle=True)` path, so `data.shards.shuffle`
+   is honoured by nothing yet — block shuffling and its read-locality benefit arrive
+   with the sampler wiring in P13e. The sampler itself is complete and tested.
+6. **`--decoder`, `--on-corrupt`, `--shuffle` reach the config but only the first two
+   are read.** `data.shards.shuffle` is inert until (5) lands.
 5. **Parquet is deliberately not a decoder row.** Its read/demux/decode is already
    owned by `DataBackend` (P12), and the reference table itself notes the
    Thrift-footer→chunk-offset step is "same API, no seam". A second owner for one

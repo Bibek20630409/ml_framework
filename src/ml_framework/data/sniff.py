@@ -32,6 +32,11 @@ from typing import Any
 
 from ..core.types import DataKind, FrameworkError, Task
 
+# The staged pipeline writes its index INTO the corpus directory, so every scan
+# over class directories has to skip it -- see `_class_folder_kind`. Safe to
+# import at module scope: `shards.py` pulls in numpy and the stdlib, nothing more.
+from .streaming.shards import INDEX_DIRNAME
+
 log = logging.getLogger(__name__)
 
 
@@ -59,6 +64,8 @@ MAX_CLASSES: int = 20
 TEXT_SUFFIXES: frozenset[str] = frozenset({".jsonl", ".ndjson", ".txt"})
 TABLE_SUFFIXES: frozenset[str] = frozenset({".csv", ".parquet", ".pq", ".json"})
 IMAGE_SUFFIXES: frozenset[str] = frozenset({".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"})
+AUDIO_SUFFIXES: frozenset[str] = frozenset({".wav", ".flac", ".mp3", ".opus", ".ogg", ".m4a"})
+VIDEO_SUFFIXES: frozenset[str] = frozenset({".mp4", ".m4v", ".mov", ".avi", ".mkv", ".webm"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,22 +109,37 @@ class Sniffed:
 
 
 # ── Kind ──────────────────────────────────────────────────
-def _looks_like_image_folder(path: Path) -> bool:
-    """A directory of class directories of images (the ``ImageFolder`` layout).
+def _class_folder_kind(path: Path) -> str | None:
+    """``"image"``, ``"audio"``, ``"video"`` or ``None`` for a class-directory tree.
 
-    Checked positively — there must be an actual image file under a subdirectory —
+    Checked positively — there must be an actual media file under a subdirectory —
     rather than by "it is a directory and nothing else matched". A directory of
     parquet part-files is also a directory, and it is a table.
+
+    A **census**, not a first-match: the winner is whichever media family has the
+    most files. A photo corpus with a stray README, or a video corpus whose
+    thumbnails sit beside the clips, would otherwise be classified by whatever the
+    filesystem happened to return first.
     """
     if not path.is_dir():
-        return False
+        return None
+    families = {"image": IMAGE_SUFFIXES, "audio": AUDIO_SUFFIXES, "video": VIDEO_SUFFIXES}
+    counts = dict.fromkeys(families, 0)
     for child in path.iterdir():
-        if not child.is_dir():
+        if not child.is_dir() or child.name == INDEX_DIRNAME:
             continue
         for item in child.iterdir():
-            if item.suffix.lower() in IMAGE_SUFFIXES:
-                return True
-    return False
+            suffix = item.suffix.lower()
+            for kind, suffixes in families.items():
+                if suffix in suffixes:
+                    counts[kind] += 1
+    best = max(counts, key=lambda k: counts[k])
+    return best if counts[best] else None
+
+
+def _looks_like_image_folder(path: Path) -> bool:
+    """Back-compatible shim: still exported, now derived from the census."""
+    return _class_folder_kind(path) == "image"
 
 
 def _mean_tokens(series: Any) -> float:
@@ -228,8 +250,9 @@ def sniff(
     if not source.exists():
         raise SniffError(f"no such dataset: {source}")
 
-    if _looks_like_image_folder(source):
-        return _sniff_images(source)
+    folder_kind = _class_folder_kind(source)
+    if folder_kind is not None:
+        return _sniff_class_folder(source, folder_kind)
 
     suffix = source.suffix.lower()
     if suffix in TEXT_SUFFIXES and suffix not in TABLE_SUFFIXES:
@@ -239,20 +262,28 @@ def sniff(
 
     raise SniffError(
         f"cannot tell what '{source}' is. Known: a directory of class directories "
-        f"(images), {sorted(TABLE_SUFFIXES | TEXT_SUFFIXES)}."
+        f"(images, audio or video), {sorted(TABLE_SUFFIXES | TEXT_SUFFIXES)}."
     )
 
 
-def _sniff_images(source: Path) -> Sniffed:
-    classes = sorted(child.name for child in source.iterdir() if child.is_dir())
-    task: Task = "binary" if len(classes) == 2 else "multiclass"
+def _sniff_class_folder(source: Path, kind: str = "image") -> Sniffed:
+    # `_mlf_shards` is the shard index, not a class. Counting it would make a
+    # two-class corpus look like three -- which picks `multiclass` over `binary`,
+    # and therefore a different head, a different loss and a different metric.
+    classes = sorted(
+        child.name for child in source.iterdir() if child.is_dir() and child.name != INDEX_DIRNAME
+    )
+    # Video defaults to multiclass even at two classes: `MODEL_RULES` has no
+    # ("video", "binary") row, so guessing binary here would produce a config that
+    # fails later with "no default model" rather than one that runs.
+    task: Task = "binary" if len(classes) == 2 and kind != "video" else "multiclass"
     inferences = (
-        Inference("data.kind", "image", "the directory holds class directories of images"),
+        Inference("data.kind", kind, f"the directory holds class directories of {kind} files"),
         Inference("task", task, f"the training folder has {len(classes)} class directories"),
     )
     return Sniffed(
         path=str(source),
-        kind="image",
+        kind=kind,  # type: ignore[arg-type]
         task=task,
         n_features=len(classes),
         inferences=inferences,

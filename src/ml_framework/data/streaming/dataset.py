@@ -38,6 +38,7 @@ collective exists, and can therefore fail safely.
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -123,6 +124,21 @@ class StagedDataset:
         self._fault_dir = Path(fault_dir) if fault_dir is not None else None
         self._log: FaultLog | None = None
 
+    @property
+    def decoder_lands_in(self) -> str:
+        """``"host"`` or ``"device"``, from the decoder's spec.
+
+        Surfaced on the dataset so a source can put it in ``bundle.meta`` without
+        reaching into the registry itself. The transport layer reads it there to
+        decide pinning and worker count.
+        """
+        from ...core.registry import DECODERS
+
+        try:
+            return str(DECODERS.get_spec(self.decoder.name).lands_in)
+        except Exception:  # noqa: BLE001 - a hand-built decoder need not be registered
+            return "host"
+
     # ── the invariant ──
     def __len__(self) -> int:
         """The **declared** sample count, never the decodable one.
@@ -147,15 +163,23 @@ class StagedDataset:
                 raise
             except Exception as exc:  # noqa: BLE001 - any codec may raise anything
                 fault = self._fault_for(index, exc)
-                self._record(fault)
                 if self.on_corrupt == "raise":
+                    self._record(fault)
                     raise CorruptSampleError(fault.summary()) from exc
                 if attempt == _MAX_SUBSTITUTIONS:
+                    self._record(fault)
                     raise ShardUnusableError(
                         f"gave up after {_MAX_SUBSTITUTIONS} substitutions starting from "
                         f"index {i}; the shard is unreadable rather than the samples"
                     ) from exc
-                index = self.policy.substitute(index, fault, epoch=self.epoch)
+                # Substitute FIRST, then record: `substituted_with` is the whole
+                # record of the policy having worked -- an index went in and a
+                # different index came out, so the sample *count* was unaffected.
+                # Recording before choosing would leave that field null on every
+                # fault and make the log unable to show the property that matters.
+                replacement = self.policy.substitute(index, fault, epoch=self.epoch)
+                self._record(replace(fault, substituted_with=replacement))
+                index = replacement
                 continue
 
             self.policy.note_success(index)

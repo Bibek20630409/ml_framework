@@ -44,10 +44,12 @@ from ..core.protocols import BuildContext
 from ..core.registry import MODELS, register_source
 from ..core.types import FrameworkError, Requirement
 from .sources import (
+    build_audio_bundle,
     build_image_bundle,
     build_tabular_bundle,
     build_text_bundle,
     build_timeseries_bundle,
+    build_video_bundle,
 )
 from .types import DataBundle
 
@@ -61,6 +63,8 @@ _BUNDLE_BUILDERS = {
     "image": build_image_bundle,
     "text": build_text_bundle,
     "timeseries": build_timeseries_bundle,
+    "audio": build_audio_bundle,
+    "video": build_video_bundle,
 }
 
 # The sources that accept an injected partition. A kind absent from this table
@@ -71,6 +75,11 @@ _CV_BUILDERS = {
     "timeseries": build_timeseries_bundle,
     "image": build_image_bundle,
     "text": build_text_bundle,
+    # Folding comes free for both: the staged sources accept an injected
+    # partition exactly as text did in P7, and their labels are a JSON scan of
+    # the shard index rather than a decode pass.
+    "audio": build_audio_bundle,
+    "video": build_video_bundle,
 }
 
 
@@ -311,6 +320,22 @@ def _cv_population(config: ExperimentConfig) -> tuple[int, Any]:
         labels = text_labels(config)
         return len(labels), labels
 
+    if config.data.kind in ("audio", "video"):
+        # A JSON scan of the shard index -- the same shape as the image branch, and
+        # for the same reason. `mlf materialize` recorded a label per entry, so
+        # planning folds costs a file read rather than a decode pass over the
+        # corpus. Decoding four seconds of audio, or sixteen frames of video, per
+        # sample just to learn its class would dominate the whole CV run.
+        from .sources.staged_folder import index_for, labels_of
+
+        # `_check_required_by_kind` already refused a config without one, so this
+        # is a type narrowing rather than a real branch -- but asserting it beats
+        # a `str(None)` that would turn into a confusing "no shard index for None".
+        path = config.data.path
+        assert path is not None, "audio/video configs require data.path"
+        values = np.asarray(labels_of(index_for(path, config), path), dtype="int64")
+        return len(values), values
+
     # The one place a distributed engine genuinely earns its keep: planning folds
     # needs a row count and one label column, and neither requires the feature
     # matrix. Under `spark` this is a `count()` plus a one-column collect, so a
@@ -430,5 +455,29 @@ register_source(
             Requirement("PIL", extra="image", min_version="9.0", dist="Pillow"),
         ),
         description="Directory-of-class-directories image folders (ImageFolder layout).",
+    )
+)
+# Both read through the staged pipeline (P13), so their requirement is the *decoder*
+# they will resolve to rather than anything the source itself imports -- which is
+# why neither lists one here: `mlf decoders` owns that message, and duplicating it
+# would produce two different pip hints for one missing package.
+register_source(
+    SourceSpec(
+        name="audio",
+        data_kind="audio",
+        build=build_audio_bundle,
+        payload="dataset",
+        requires=(Requirement("torchaudio", extra="audio", min_version="2.0"),),
+        description="Directory-of-class-directories audio clips, read through a shard index.",
+    )
+)
+register_source(
+    SourceSpec(
+        name="video",
+        data_kind="video",
+        build=build_video_bundle,
+        payload="dataset",
+        requires=(Requirement("torchvision", extra="image", min_version="0.15"),),
+        description="Directory-of-class-directories video clips, read through a shard index.",
     )
 )

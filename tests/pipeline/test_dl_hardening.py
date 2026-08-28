@@ -364,18 +364,21 @@ def test_cross_validation_works_for_gbdt_too(tabular_csv, make_config):
 def test_cross_validation_refuses_a_kind_it_cannot_partition(tabular_csv, make_config):
     """Better than silently cross-validating something else.
 
-    All four built-in kinds fold now — image over the training directory since P6,
-    text since P7 — so what is pinned here is the refusal *mechanism* rather than a
-    gap in coverage. It is the contract a third-party source meets: a source whose
-    ``build`` does not accept an injected partition is named and refused, not
-    handed one and expected to cope.
+    Every built-in kind folds now — image over the training directory since P6,
+    text since P7, audio and video off the shard index since P13 — so what is
+    pinned here is the refusal *mechanism* rather than a gap in coverage. It is the
+    contract a third-party source meets: a source whose ``build`` does not accept
+    an injected partition is named and refused, not handed one and expected to cope.
+
+    The placeholder kind is deliberately fictional. It used to be ``"audio"``,
+    which stopped testing anything the moment audio became foldable.
     """
     from ml_framework.data.builders import build_cv_bundles
 
     cfg = make_config(tabular_csv, "multiclass", **{"data.split.folds": 3})
     # `model_copy` rather than validation: the point is a kind the CV table does
     # not know, which a registered third-party source is free to introduce.
-    cfg = cfg.model_copy(update={"data": cfg.data.model_copy(update={"kind": "audio"})})
+    cfg = cfg.model_copy(update={"data": cfg.data.model_copy(update={"kind": "hologram"})})
     with pytest.raises(NotImplementedError, match="cross-validation is implemented for"):
         list(build_cv_bundles(cfg))
 

@@ -184,6 +184,12 @@ def materialize(
     ctx = DecodeContext()
     oracle = get_decoder(spec.oracle) if (probe and spec.oracle and _wants_oracle(spec)) else None
 
+    # A class-directory corpus already states its labels in its layout, and the
+    # shard name IS the top-level directory. Inferring them here is what lets fold
+    # planning and class-balance counting be a JSON scan later rather than a decode
+    # pass over the whole corpus. An explicit `labels` mapping still wins.
+    if labels is None:
+        labels, class_names = _labels_from_shards(candidates, class_names)
     chosen = _subsample(candidates, sample_rate=sample_rate, seed=seed)
     report = MaterializeReport(
         shards=shards, decoder=decoder_name, sampled=len(chosen) < len(candidates)
@@ -388,6 +394,27 @@ def _media_type_for(spec: Any, key: str) -> str:
         if suffix in candidate.suffixes and candidate.media_types:
             return candidate.media_types[0]
     return spec.media_types[0] if spec.media_types else ""
+
+
+def _labels_from_shards(
+    candidates: list[dict[str, Any]], class_names: Sequence[str]
+) -> tuple[dict[str, int], Sequence[str]]:
+    """``key -> class index`` from the shard (= class directory) names.
+
+    Sorted, so the mapping is stable across runs and machines — a class order that
+    depended on filesystem iteration would silently relabel the corpus when the
+    directory was copied, and every metric would still look plausible.
+
+    Returns an empty mapping when there is only one shard: a single class is not a
+    classification corpus, and labelling everything ``0`` would be a claim rather
+    than an inference.
+    """
+    shards = sorted({str(c["shard"]) for c in candidates})
+    if len(shards) < 2:
+        return {}, class_names
+    index = {name: i for i, name in enumerate(shards)}
+    mapping = {str(c["key"]): index[str(c["shard"])] for c in candidates}
+    return mapping, tuple(class_names) or tuple(shards)
 
 
 def _infer_decoder(candidates: Iterable[dict[str, Any]]) -> str:

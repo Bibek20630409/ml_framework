@@ -382,6 +382,14 @@ class DataConfig(BaseModel):
         elif self.kind == "timeseries":
             if not self.path or not self.target:
                 raise ValueError("timeseries data requires 'path' and 'target' (the value column)")
+        elif self.kind in ("audio", "video"):
+            # Same shape as image: a training folder and an explicitly held-back
+            # test folder. `target` is not required -- the label is the class
+            # directory, recorded per entry in the shard index at materialization.
+            if not self.path or not self.params.get("test_dir"):
+                raise ValueError(
+                    f"{self.kind} data requires 'path' (train dir) and 'params.test_dir'"
+                )
         self._check_temporal_leakage()
         return self
 

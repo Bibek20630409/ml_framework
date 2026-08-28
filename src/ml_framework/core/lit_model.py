@@ -116,6 +116,30 @@ def _as_weight_tensor(weights: Any) -> torch.Tensor | None:
     return torch.tensor(np.asarray(weights, dtype="float32"), dtype=torch.float32)
 
 
+def _unpersist(criterion: nn.Module, name: str) -> nn.Module:
+    """Keep a loss's class-weight buffer out of the checkpoint.
+
+    ``BCEWithLogitsLoss.pos_weight`` and ``CrossEntropyLoss.weight`` are registered
+    as buffers, so torch writes them into ``state_dict`` — but they are a property
+    of the **training data**, recomputed from the bundle every time a model is
+    built, and never learned. Persisting them puts a data statistic in the
+    checkpoint, and then reloading fails:
+
+        RuntimeError: Unexpected key(s) in state_dict: "criterion.pos_weight"
+
+    ...because every reload path deliberately passes ``class_weights=None`` (a
+    loaded estimator predicts; it does not resume training), so the rebuilt module
+    has no such buffer to load into. Marking them non-persistent is the fix that
+    matches what they are, rather than teaching four call sites to reconstruct a
+    number they should not need.
+
+    Silently a no-op when the weight is ``None``, which is the common case.
+    """
+    if getattr(criterion, name, None) is not None:
+        criterion._non_persistent_buffers_set.add(name)
+    return criterion
+
+
 class BaseModel(pl.LightningModule):
     def __init__(
         self,
@@ -180,9 +204,9 @@ class BaseModel(pl.LightningModule):
             if w is not None:
                 pos_weight = w.reshape(-1)[-1] if w.numel() > 1 else w.reshape(-1)[0]
                 pos_weight = pos_weight.to(dtype=torch.float32)
-            return nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+            return _unpersist(nn.BCEWithLogitsLoss(pos_weight=pos_weight), "pos_weight")
         if self.task == "multiclass":
-            return nn.CrossEntropyLoss(weight=w)
+            return _unpersist(nn.CrossEntropyLoss(weight=w), "weight")
         if self.task in CONTINUOUS_TASKS:
             return nn.MSELoss()
         if self.task in SEQUENCE_TASKS:
@@ -190,7 +214,7 @@ class BaseModel(pl.LightningModule):
             # padded positions in a batch are not a class to be predicted — they
             # are absence — and counting them would let a model score well by
             # learning to predict padding, which is most of a short sequence.
-            return nn.CrossEntropyLoss(ignore_index=IGNORE_INDEX, weight=w)
+            return _unpersist(nn.CrossEntropyLoss(ignore_index=IGNORE_INDEX, weight=w), "weight")
         raise ValueError(f"Unknown task: {self.task}")
 
     # ── Metrics ───────────────────────────────────────────

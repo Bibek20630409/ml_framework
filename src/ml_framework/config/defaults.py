@@ -169,6 +169,17 @@ MODEL_RULES: Final[dict[tuple[str, str], tuple[ModelRule, ...]]] = {
         ModelRule("nlp.hf_token", reason="the only per-token head"),
     ),
     ("text", "seq2seq"): (ModelRule("nlp.hf_seq2seq", reason="the only generative head"),),
+    ("audio", "binary"): (
+        ModelRule("audio.cnn", reason="a spectrogram CNN beats a raw-waveform net at this size"),
+    ),
+    ("audio", "multiclass"): (
+        ModelRule("audio.cnn", reason="a spectrogram CNN beats a raw-waveform net at this size"),
+    ),
+    # No binary row for video: a two-class video corpus is rare enough that
+    # guessing at it is worse than asking, and `select_model` says so by name.
+    ("video", "multiclass"): (
+        ModelRule("video.r3d", reason="Kinetics pretraining is a far better prior than scratch"),
+    ),
     ("timeseries", "forecasting"): (
         ModelRule(
             "ts.lstm",

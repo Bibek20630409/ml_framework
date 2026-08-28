@@ -105,17 +105,18 @@ def synthesize(
                 "resolves against the chosen model: sample weights for a tree, SMOTE otherwise",
             )
         )
-    if found.kind == "image":
-        # ImageFolder needs a held-back directory and there is no way to infer one,
-        # so the training folder is reused and the split carves validation and test
-        # out of it. Recorded as a weak inference because it is a real compromise:
-        # `test_dir` is the honest way to hold images back.
+    if found.kind in ("image", "audio", "video"):
+        # A class-directory corpus needs a held-back directory and there is no way
+        # to infer one, so the training folder is reused and the split carves
+        # validation and test out of it. Recorded as a weak inference because it is
+        # a real compromise: `test_dir` is the honest way to hold samples back.
         config["data"]["params"] = {"test_dir": found.path}
         inferences.append(
             Inference(
                 "data.params.test_dir",
                 found.path,
-                "no held-out image directory was given, so the training folder is reused",
+                f"no held-out {found.kind} directory was given, so the training "
+                "folder is reused",
                 weak=True,
             )
         )

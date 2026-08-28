@@ -9,13 +9,19 @@ datamodules stopped making sense while registering sources started to.
 a module must be importable with zero optional dependencies installed.
 """
 
+from .audio import audio_labels, build_audio_bundle
 from .image import build_image_bundle, train_labels
 from .tabular import build_tabular_bundle, read_table
 from .text import build_text_bundle, text_labels
 from .timeseries import build_timeseries_bundle
+from .video import build_video_bundle, video_labels
 
 __all__ = [
     "train_labels",
+    "audio_labels",
+    "video_labels",
+    "build_audio_bundle",
+    "build_video_bundle",
     "text_labels",
     "build_text_bundle",
     "build_tabular_bundle",

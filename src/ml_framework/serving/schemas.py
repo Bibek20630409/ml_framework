@@ -150,6 +150,50 @@ class ImageRequest(BaseModel):
         return len(self.inputs)
 
 
+class MediaItem(BaseModel):
+    """One audio or video clip: base64 bytes or a URL, plus what it is.
+
+    ``media_type`` is required here and absent on :class:`ImageItem`, and the
+    difference is not an oversight. An image decoder can sniff JFIF or PNG magic
+    from the first bytes; an audio payload is far more ambiguous — raw MP3 frames
+    have no container and no reliable header — and guessing wrong picks a decoder
+    whose failure mode is *silent*. Naming the type is cheap and the alternative
+    is a wrong answer nobody sees.
+    """
+
+    model_config = {"extra": "forbid"}
+
+    b64: str | None = None
+    url: str | None = None
+    media_type: str = Field(..., description="e.g. audio/flac, audio/mpeg, video/mp4")
+
+    @model_validator(mode="after")
+    def _exactly_one(self) -> MediaItem:
+        if (self.b64 is None) == (self.url is None):
+            raise ValueError("provide exactly one of 'b64' or 'url'")
+        return self
+
+
+class AudioRequest(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    inputs: list[MediaItem] = Field(..., min_length=1)
+
+    @property
+    def n_rows(self) -> int:
+        return len(self.inputs)
+
+
+class VideoRequest(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    inputs: list[MediaItem] = Field(..., min_length=1)
+
+    @property
+    def n_rows(self) -> int:
+        return len(self.inputs)
+
+
 class ForecastRequest(BaseModel):
     """``predict(X)`` is a lying signature for forecasting — a horizon is not a
     feature matrix, which is why the payload varies by kind rather than pretending
@@ -216,13 +260,15 @@ class ForecastResponse(BaseModel):
 
 
 # ── The table ─────────────────────────────────────────────
-DataKindLiteral = Literal["tabular", "image", "text", "timeseries"]
+DataKindLiteral = Literal["tabular", "image", "text", "timeseries", "audio", "video"]
 
 REQUEST_MODELS: dict[str, type[BaseModel]] = {
     "tabular": TabularRequest,
     "text": TextRequest,
     "image": ImageRequest,
     "timeseries": ForecastRequest,
+    "audio": AudioRequest,
+    "video": VideoRequest,
 }
 
 RESPONSE_MODELS: dict[str, type[BaseModel]] = {
@@ -230,6 +276,9 @@ RESPONSE_MODELS: dict[str, type[BaseModel]] = {
     "text": LabelledPredictResponse,
     "image": LabelledPredictResponse,
     "timeseries": ForecastResponse,
+    # Both are classifiers: one label per clip, like image.
+    "audio": LabelledPredictResponse,
+    "video": LabelledPredictResponse,
 }
 
 # `text` covers three tasks whose *outputs* have nothing in common — one class, one
@@ -244,6 +293,10 @@ RESPONSE_BY_OUTPUT_KIND: dict[str, type[BaseModel]] = {
 # Drift is a distributional comparison over named numeric features. Computing PSI
 # over token ids or pixel bytes would produce a number with no meaning, so /drift
 # answers 501 for those kinds instead — see api.py.
+#
+# UNCHANGED by P13: PSI over PCM samples or video frames is the same category of
+# nonsense as PSI over pixels. Audio and video drift is a real problem and it wants
+# embedding-space distances, not per-feature histograms over a waveform.
 DRIFT_CAPABLE_KINDS: frozenset[str] = frozenset({"tabular"})
 
 

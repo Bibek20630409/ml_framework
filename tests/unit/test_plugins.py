@@ -176,6 +176,8 @@ def test_builtin_model_specs_are_registered():
         "ts.prophet",
         "ts.lstm",
         "nlp.hf_text",
+        "audio.cnn",
+        "video.r3d",
         "nlp.hf_token",
         "nlp.hf_seq2seq",
     }
@@ -212,7 +214,7 @@ def test_builtin_source_specs_are_registered():
     assert (
         set(SOURCES.names())
         == set(available_datamodules())
-        == {"tabular", "image", "text", "timeseries"}
+        == {"tabular", "image", "text", "timeseries", "audio", "video"}
     )
 
 

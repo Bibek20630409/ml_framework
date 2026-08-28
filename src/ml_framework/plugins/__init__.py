@@ -47,12 +47,28 @@ from ..core.types import Capabilities, Requirement
 from . import gbdt as _gbdt  # registers xgboost / lightgbm / catboost
 from . import nlp as _nlp  # registers nlp.hf_text
 from . import ts as _ts  # registers ts.naive / ts.arima / ts.prophet / ts.lstm
+from .av_params import AudioCNNParams, VideoR3DParams
 from .params import CNNParams, MLPParams
 
 # The explicit builtin list, in registration order.
-BUILTINS: tuple[str, ...] = ("mlp", "cnn", *_gbdt.BUILTINS, *_ts.BUILTINS, *_nlp.BUILTINS)
+BUILTINS: tuple[str, ...] = (
+    "mlp",
+    "cnn",
+    "audio.cnn",
+    "video.r3d",
+    *_gbdt.BUILTINS,
+    *_ts.BUILTINS,
+    *_nlp.BUILTINS,
+)
 
-__all__ = ["BUILTINS", "CNNParams", "MLPParams", "model_class"]
+__all__ = [
+    "BUILTINS",
+    "AudioCNNParams",
+    "CNNParams",
+    "MLPParams",
+    "VideoR3DParams",
+    "model_class",
+]
 
 
 def _lazy_build(module: str) -> Callable[..., Any]:
@@ -84,6 +100,8 @@ def model_class(name: str) -> type:
     lazy = {
         "mlp": ".mlp",
         "cnn": ".cnn",
+        "audio.cnn": ".audio",
+        "video.r3d": ".video",
         "ts.lstm": ".ts.lstm",
         "nlp.hf_text": ".nlp.hf_text",
         "nlp.hf_token": ".nlp.hf_token",
@@ -176,6 +194,56 @@ register_model_spec(
         description="Transfer-learning CNN over a torchvision backbone (default resnet18).",
     )
 )
+
+# Audio and video ride the *lightning* backend like every other neural plugin --
+# no fourth training backend, for the same reason `nlp.hf_text` and `ts.lstm` do
+# not have one: the fit loop is an epoch loop over batches, which is what that
+# backend already is.
+register_model_spec(
+    ModelSpec(
+        name="audio.cnn",
+        backend="lightning",
+        build=_lazy_build(".audio"),
+        tasks=frozenset({"binary", "multiclass"}),
+        data_kinds=frozenset({"audio"}),
+        requires=(
+            *_TORCH_REQUIREMENTS,
+            Requirement("torchvision", extra="image", min_version="0.15"),
+            Requirement("torchaudio", extra="audio", min_version="2.0"),
+        ),
+        capabilities=Capabilities(accepts=frozenset({"dataset"}), **_NEURAL_CAPS),
+        # Architecture knobs are deliberately not tuned, exactly as for `cnn`:
+        # swapping the backbone or discarding pretrained weights inside a small
+        # trial budget wastes the budget. lr/batch_size come from the backend.
+        search_space={},
+        params_model=AudioCNNParams,
+        auto_priority=10,
+        description="Log-mel spectrogram CNN over a torchvision backbone (default resnet18).",
+    )
+)
+
+# NOTE: no `[video]` requirement. torchvision.models.video ships r3d_18, so the
+# MODEL costs nothing beyond `[image]`; only the DECODER needs PyAV. Conflating
+# the two would make the pip hint for one of them wrong.
+register_model_spec(
+    ModelSpec(
+        name="video.r3d",
+        backend="lightning",
+        build=_lazy_build(".video"),
+        tasks=frozenset({"binary", "multiclass"}),
+        data_kinds=frozenset({"video"}),
+        requires=(
+            *_TORCH_REQUIREMENTS,
+            Requirement("torchvision", extra="image", min_version="0.15"),
+        ),
+        capabilities=Capabilities(accepts=frozenset({"dataset"}), **_NEURAL_CAPS),
+        search_space={},
+        params_model=VideoR3DParams,
+        auto_priority=10,
+        description="3-D ResNet over video clips (r3d_18, Kinetics-400 pretrained).",
+    )
+)
+
 
 # Third-party plugins, after the builtins so a duplicate name is a deliberate
 # `override=True` on their side rather than an accident of import order.
