@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +37,7 @@ from torch.utils.data import DataLoader, TensorDataset, WeightedRandomSampler
 
 from ..core.registry import register_datamodule
 from ..utils.seed import resolve_num_workers
+from .streaming.state import LoaderState
 from .types import DataBundle
 
 log = logging.getLogger(__name__)
@@ -107,6 +109,9 @@ class BundleDataModule(pl.LightningDataModule):
         persistent_workers: bool = False,
         prefetch_factor: int = 2,
         accelerator: str = "auto",
+        shuffle: str = "block",
+        seed: int = 42,
+        resume_state: bool = True,
     ) -> None:
         super().__init__()
         if bundle is None and bundle_factory is None:
@@ -127,6 +132,14 @@ class BundleDataModule(pl.LightningDataModule):
         self.prefetch_factor = prefetch_factor
         self._accelerator = accelerator
         self._datasets: dict[str, Any] = {}
+        # Staged-corpus ordering and the mid-epoch resume position. Inert for
+        # every non-staged source, whose train split has no shard index.
+        self._shuffle = shuffle
+        self._seed = seed
+        self._resume_state = resume_state
+        self._sampler: Any = None
+        self._state = LoaderState(seed=seed, shuffle=shuffle)
+        self._resume_skip = 0
 
     # ── bundle access ──
     @property
@@ -263,11 +276,98 @@ class BundleDataModule(pl.LightningDataModule):
         weights = self.bundle.meta.get("sample_weights")
         return None if weights is None else np.asarray(weights)
 
-    def _train_sampler(self) -> WeightedRandomSampler | None:
+    def _train_sampler(self) -> Any | None:
+        """The training sampler: shard-aware, weighted, or neither.
+
+        Exactly one can win, and the order is not arbitrary. A staged corpus reads
+        through a shard index, and :class:`ShardShuffleSampler` is what keeps every
+        read inside one open shard — the entire reason the corpus is sharded. A
+        ``WeightedRandomSampler`` over that storage is one seek per sample and
+        would throw the locality away, which is why the staged sources correct
+        imbalance with loss weights instead and never emit ``sample_weights``.
+
+        So the two never actually collide in practice; this order makes that
+        explicit rather than leaving it to whichever check ran first.
+        """
+        staged = self._shard_sampler()
+        if staged is not None:
+            return staged
         weights = self.sampler_weights
         if weights is None:
             return None
         return WeightedRandomSampler(weights.tolist(), len(weights))
+
+    def _shard_sampler(self) -> Any | None:
+        """A :class:`ShardShuffleSampler` when the train split is a staged corpus.
+
+        Built once and cached, because it carries the epoch and any resume offset
+        — rebuilding it per ``train_dataloader()`` call would silently reset both.
+        """
+        if self._sampler is not None:
+            return self._sampler
+        dataset = self._datasets.get("train")
+        index = getattr(dataset, "index", None)
+        if index is None:
+            return None
+
+        from .streaming.sampler import ShardShuffleSampler
+
+        self._sampler = ShardShuffleSampler(
+            index,
+            seed=self._seed,
+            shuffle=self._shuffle,  # type: ignore[arg-type]
+            epoch=self._state.epoch,
+            skip=self._resume_skip,
+        )
+        # Consumed once: the resumed epoch is short, every epoch after it is whole.
+        self._resume_skip = 0
+        return self._sampler
+
+    def set_epoch(self, epoch: int) -> None:
+        """Reshuffle for a new epoch, and advance the recorded position.
+
+        Called by ``StagedDataCallback``, because Lightning's
+        ``DistributedSamplerWrapper`` calls ``set_epoch`` on *itself* rather than
+        on the sampler it wraps — so a wrapped sampler would otherwise serve the
+        same order every epoch and the shuffle would be decorative.
+        """
+        sampler = self._shard_sampler()
+        if sampler is not None:
+            sampler.set_epoch(epoch)
+        self._state = replace(self._state, epoch=epoch, samples_seen=0)
+
+    # ── resume ──
+    def state_dict(self) -> dict[str, Any]:
+        """The loader's position, which Lightning stores in the checkpoint.
+
+        Lightning already checkpoints the model, the optimizer and the epoch. What
+        it cannot checkpoint is *which samples this epoch had already served*, and
+        without that a mid-epoch resume silently replays them — an extra partial
+        pass over a subset of the corpus, visible only as an unexplained kink in
+        the loss curve.
+        """
+        if not self._resume_state:
+            return {}
+        return replace(self._state, index_digest=self._index_digest).to_dict()
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        """Restore the position, or refuse if the corpus changed underneath it."""
+        if not self._resume_state or not state:
+            return
+        from .streaming.state import LoaderState
+
+        restored = LoaderState.from_dict(state)
+        # Raises when the index digest no longer matches: "sample 41,000" would
+        # name different bytes, so resuming would replay a different corpus while
+        # reporting it as the same run.
+        self._resume_skip = restored.resume_skip(index_digest=self._index_digest)
+        self._state = restored
+
+    @property
+    def _index_digest(self) -> str:
+        if not self.is_ready:
+            return ""
+        return str(self.bundle.meta.get("index_digest", ""))
 
     def _loader(self, name: str, *, shuffle: bool = False, sampler: Any = None) -> DataLoader:
         dataset = self._datasets[name]
@@ -325,6 +425,9 @@ class BundleDataModule(pl.LightningDataModule):
             persistent_workers=config.runtime.persistent_workers,
             prefetch_factor=config.runtime.prefetch_factor,
             accelerator=config.runtime.accelerator,
+            shuffle=config.data.shards.shuffle,
+            seed=config.runtime.seed,
+            resume_state=config.data.shards.resume_state,
         )
 
 
@@ -351,6 +454,9 @@ class TabularDataModule(BundleDataModule):
             persistent_workers=config.runtime.persistent_workers,
             prefetch_factor=config.runtime.prefetch_factor,
             accelerator=config.runtime.accelerator,
+            shuffle=config.data.shards.shuffle,
+            seed=config.runtime.seed,
+            resume_state=config.data.shards.resume_state,
         )
 
 
@@ -369,4 +475,7 @@ class ImageDataModule(BundleDataModule):
             persistent_workers=config.runtime.persistent_workers,
             prefetch_factor=config.runtime.prefetch_factor,
             accelerator=config.runtime.accelerator,
+            shuffle=config.data.shards.shuffle,
+            seed=config.runtime.seed,
+            resume_state=config.data.shards.resume_state,
         )

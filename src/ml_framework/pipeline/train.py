@@ -194,6 +194,7 @@ def train(
             (out / "reference_stats.json").write_text(
                 json.dumps(bundle.reference_stats), encoding="utf-8"
             )
+        _write_data_reports(out)
 
         run_logger.log_params(_tracked_params(config))
         run_logger.log_metrics(metrics)
@@ -357,6 +358,52 @@ def _baseline_metrics(predictions: Any, bundle: Any, task: str) -> dict[str, flo
     if not scores:
         log.info("no meaningful trivial baseline for task '%s'; skipping", task)
     return scores
+
+
+def _write_data_reports(out: Path) -> None:
+    """Guarantee ``stall.json`` and ``faults.json`` exist, for every backend.
+
+    The Lightning callback writes the real numbers at ``on_fit_end``; this fills
+    in zero-valued defaults for a backend with no epoch loop to measure — a GBDT
+    fit is one ``fit(X, y)`` call and has no batches to be starved of.
+
+    ``only_if_absent`` so the defaults never clobber a real measurement, and the
+    files are always present either way: "no faults" is a materially different
+    claim from "nobody looked", and an absent file cannot tell them apart.
+    """
+    from ..core.stall import FAULTS_FILE, STALL_FILE, write_data_reports
+
+    write_data_reports(out, only_if_absent=True)
+
+    # Two lines in report.txt, which is the file a human actually opens. Appended
+    # here rather than written by `evaluate`: the numbers come from the fit loop,
+    # and threading them through the evaluation path would couple two things that
+    # otherwise share nothing.
+    report = out / "report.txt"
+    if not report.is_file():
+        return
+    try:
+        stall = json.loads((out / STALL_FILE).read_text(encoding="utf-8"))
+        faults = json.loads((out / FAULTS_FILE).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+
+    lines = ["", "Data pipeline"]
+    if stall.get("measured"):
+        lines.append(f"  waiting for batches: {stall['data_wait_pct']:.1f}% of wall time")
+        gpu = stall.get("gpu_stall_pct")
+        # `None` is not `0.0`: a run with no CUDA device has no device to stall,
+        # and printing zero would be indistinguishable from a perfectly fed GPU.
+        lines.append(
+            f"  GPU stall:           {gpu:.1f}%"
+            if gpu is not None
+            else "  GPU stall:           not measured (no CUDA device)"
+        )
+    else:
+        lines.append("  not measured")
+    lines.append(f"  corrupt samples:     {faults.get('faults', 0)} (substituted)")
+    with report.open("a", encoding="utf-8") as handle:
+        handle.write("\n".join(lines) + "\n")
 
 
 def _save_preprocessor(bundle: Any, out: Path) -> dict[str, Any] | None:

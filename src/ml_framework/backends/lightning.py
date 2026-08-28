@@ -364,6 +364,16 @@ class LightningBackend(BaseBackend):
 
             callbacks.append(Timer(duration=timedelta(seconds=run.budget.max_seconds)))
 
+        # Always appended, not only for a staged corpus: measuring how much of the
+        # wall clock went into waiting for batches is worth having on every run,
+        # and the callback is inert when there is nothing to reshuffle and no
+        # faults to aggregate. It never raises -- a throughput measurement must not
+        # be the reason a finished run fails.
+        from .staged import StagedDataCallback
+
+        staged = StagedDataCallback(output_dir=out, run_logger=run.run_logger)
+        callbacks.append(staged)
+
         hooks = self.trial_hooks(run.trial, monitor=task_spec.monitor) if run.trial else None
         if hooks:
             callbacks.extend(hooks.callbacks)

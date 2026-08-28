@@ -291,3 +291,174 @@ def test_build_datamodule_works_for_kinds_with_no_v1_compat_class(tmp_path):
 
     dm = build_datamodule(config)
     assert isinstance(dm, BundleDataModule)
+
+
+# ── The staged wiring P13e added ──────────────────────────────────────
+def _staged_bundle(tmp_path):
+    """A real staged corpus, small enough to be fast."""
+    import io
+    import wave
+
+    from ml_framework.core.registry import get_decoder
+    from ml_framework.data.streaming.dataset import StagedDataset
+    from ml_framework.data.streaming.materialize import materialize
+    from ml_framework.data.streaming.shards import ShardIndex
+    from ml_framework.data.streaming.sources_io import DirSource
+
+    root = tmp_path / "clips"
+    rng = np.random.default_rng(0)
+    for ci in range(2):
+        (root / f"class-{ci}").mkdir(parents=True, exist_ok=True)
+        for k in range(8):
+            buf = io.BytesIO()
+            with wave.open(buf, "wb") as h:
+                h.setnchannels(1)
+                h.setsampwidth(2)
+                h.setframerate(16_000)
+                h.writeframes(rng.integers(-2000, 2000, 800, dtype="int16").tobytes())
+            (root / f"class-{ci}" / f"{k:03d}.wav").write_bytes(buf.getvalue())
+    materialize(root)
+
+    index = ShardIndex.read(ShardIndex.location(root))
+    dataset = StagedDataset(
+        index, source=DirSource(root), decoder=get_decoder("audio.pcm"), integrity="loud"
+    )
+    split = Split(payload="dataset", x=dataset, y=np.asarray(index.labels()))
+    return (
+        DataBundle(
+            train=split,
+            val=split,
+            test=split,
+            schema=FeatureSchema(),
+            task="binary",
+            data_kind="audio",
+            meta={"lands_in": "host", "index_digest": index.index_digest},
+        ),
+        index,
+    )
+
+
+def test_a_staged_corpus_gets_a_shard_sampler(tmp_path):
+    """`ShardShuffleSampler` is what keeps every read inside one open shard — the
+    entire reason the corpus is sharded in the first place."""
+    from ml_framework.data.streaming.sampler import ShardShuffleSampler
+
+    bundle, _ = _staged_bundle(tmp_path)
+    dm = BundleDataModule(bundle, shuffle="block", seed=7)
+    dm.setup()
+
+    sampler = dm._train_sampler()
+    assert isinstance(sampler, ShardShuffleSampler)
+    assert sampler.seed == 7
+    assert sampler.shuffle == "block"
+
+
+def test_an_ordinary_bundle_gets_no_shard_sampler(tmp_path):
+    """Inert for every non-staged source, whose train split has no shard index."""
+    dm = BundleDataModule(make_bundle())
+    dm.setup()
+    assert dm._train_sampler() is None
+
+
+def test_the_shard_sampler_is_built_once_so_the_epoch_survives(tmp_path):
+    """Rebuilding it per `train_dataloader()` call would silently reset the epoch
+    and any resume offset."""
+    bundle, _ = _staged_bundle(tmp_path)
+    dm = BundleDataModule(bundle)
+    dm.setup()
+
+    first = dm._train_sampler()
+    dm.set_epoch(4)
+    assert dm._train_sampler() is first
+    assert first.epoch == 4
+
+
+def test_set_epoch_reshuffles_a_staged_corpus(tmp_path):
+    bundle, _ = _staged_bundle(tmp_path)
+    dm = BundleDataModule(bundle, shuffle="block", seed=3)
+    dm.setup()
+
+    dm.set_epoch(0)
+    first = list(dm._train_sampler())
+    dm.set_epoch(1)
+    second = list(dm._train_sampler())
+
+    assert sorted(first) == sorted(second)
+    assert first != second, "a new epoch must reorder, or the shuffle is decorative"
+
+
+def test_the_shard_sampler_wins_over_a_weighted_one(tmp_path):
+    """They never actually collide — the staged sources correct imbalance with
+    loss weights precisely so they do not — but the order makes that explicit."""
+    from ml_framework.data.streaming.sampler import ShardShuffleSampler
+
+    bundle, _ = _staged_bundle(tmp_path)
+    bundle = DataBundle(
+        train=bundle.train,
+        val=bundle.val,
+        test=bundle.test,
+        schema=bundle.schema,
+        task=bundle.task,
+        data_kind=bundle.data_kind,
+        meta={**bundle.meta, "sample_weights": np.ones(16)},
+    )
+    dm = BundleDataModule(bundle)
+    dm.setup()
+
+    assert isinstance(dm._train_sampler(), ShardShuffleSampler)
+
+
+# ── Mid-epoch resume ──────────────────────────────────────────────────
+def test_the_datamodule_checkpoints_its_position(tmp_path):
+    """Lightning checkpoints the model, the optimizer and the epoch. What it
+    cannot checkpoint is which samples this epoch already served."""
+    bundle, index = _staged_bundle(tmp_path)
+    dm = BundleDataModule(bundle)
+    dm.setup()
+    dm.set_epoch(2)
+
+    state = dm.state_dict()
+
+    assert state["epoch"] == 2
+    assert state["index_digest"] == index.index_digest
+
+
+def test_resuming_skips_what_was_already_served(tmp_path):
+    bundle, index = _staged_bundle(tmp_path)
+    dm = BundleDataModule(bundle, seed=5)
+    dm.setup()
+
+    dm.load_state_dict(
+        {"version": 1, "index_digest": index.index_digest, "seed": 5, "epoch": 0, "samples_seen": 6}
+    )
+    resumed = list(dm._train_sampler())
+
+    assert len(resumed) == index.n_samples - 6
+
+
+def test_resuming_against_a_changed_corpus_is_refused(tmp_path):
+    """ "Sample 41,000" would name different bytes, so continuing would replay a
+    different dataset while reporting it as the same run."""
+    from ml_framework.data.streaming.state import LoaderStateError
+
+    bundle, _ = _staged_bundle(tmp_path)
+    dm = BundleDataModule(bundle)
+    dm.setup()
+
+    with pytest.raises(LoaderStateError, match="shard index changed"):
+        dm.load_state_dict({"version": 1, "index_digest": "0" * 32, "samples_seen": 3})
+
+
+def test_resume_state_can_be_turned_off(tmp_path):
+    bundle, _ = _staged_bundle(tmp_path)
+    dm = BundleDataModule(bundle, resume_state=False)
+    dm.setup()
+    assert dm.state_dict() == {}
+
+
+def test_an_ordinary_bundle_checkpoints_a_position_that_costs_nothing(tmp_path):
+    """Non-staged sources have no index digest, so the state is inert rather than
+    absent — which keeps `state_dict` one shape for every kind."""
+    dm = BundleDataModule(make_bundle())
+    dm.setup()
+    assert dm.state_dict()["index_digest"] == ""

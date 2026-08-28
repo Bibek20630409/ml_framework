@@ -24,7 +24,7 @@ predict what actually happened stops being evidence of anything.
 | P10 — Exporter migration | **partial** — ONNX done, TorchScript open | see below |
 | P11 — Model selection | **done** | `c42dc04` |
 | P12 — Pluggable data backends | **done** — all five phases | `c42dc04` |
-| P13 — Staged decode pipeline | **in progress** — P13a–P13d done; e open | see below |
+| P13 — Staged decode pipeline | **done** — all five sub-phases | see below |
 
 P11 and P12 share a commit. They were developed in sequence but could not be split
 into two: `cli.py`, `config/schema.py` and `core/registry.py` each carry changes for
@@ -1535,9 +1535,9 @@ the ratios can be re-measured rather than trusted.
 
 ## P13 — Staged decode pipeline
 
-**P13a–P13d landed. P13e is open.** Test baseline: **1151 passed, 18 skipped**
-(up from 922; the 18 remain the JVM-gated Spark tests — P13a added 62, P13b 112, P13c 26 and
-P13d 29, and none of them skipped, because all four rest on the zero-dependency decoders).
+**All five sub-phases landed.** Test baseline: **1181 passed, 18 skipped** (up from 922;
+the 18 remain the JVM-gated Spark tests — P13a added 62, P13b 112, P13c 26, P13d 29 and
+P13e 30, and none of them skipped, because all five rest on the zero-dependency decoders).
 
 Storage → tensor is eleven stages, and this framework previously expressed about
 three of them. The two claims driving the phase:
@@ -1774,10 +1774,54 @@ indexing: 4 substitutions per epoch, each drawn from the same shard, run complet
 normally, `faults/rank0-worker0.jsonl` records each one with the index served instead.
 A healthy run writes no fault file at all.
 
-### P13e — open
+### P13e — stall profiler, epoch shuffling and the fault→tracker path (done)
 
-* **P13e — stall profiler and the fault→tracker path.** `core/stall.py`,
-  `StagedDataCallback`, `bundle/faults.json` and `bundle/stall.json` always written.
+The last sub-phase, and the one that makes the previous four *legible*: it reports
+what fraction of a run went into waiting for data, and it wires up the sampler and
+resume state P13b built but nothing had yet used.
+
+* `core/stall.py` — `StallProfile` / `StallProbe`, plus `write_data_reports`.
+* `backends/staged.py` — `StagedDataCallback`: `set_epoch`, the stall probe, and
+  fault aggregation, appended to the Trainer's callbacks on **every** run.
+* `BundleDataModule` now builds a `ShardShuffleSampler` for a staged corpus and
+  implements `state_dict`/`load_state_dict`, so `data.shards.shuffle` is honoured
+  and `mlf train --resume` continues mid-epoch instead of replaying it.
+* `bundle/stall.json` and `bundle/faults.json`, always written; two lines appended
+  to `report.txt`; `stall/*` and `data/*` metrics to the `RunLogger`.
+
+**Why a separate module from `core/profile.py`.** That module's docstring promises
+nothing in it imports torch, and a GPU-utilization measurement cannot honour that.
+More importantly `ModelProfile` is the *bake-off* record — numbers comparable
+across candidates in one run — whereas stall is a property of the data pipeline,
+identical for every candidate. It would be a field with the wrong owner.
+
+**`gpu_stall_pct` is `None`, never `0.0`, when there is no CUDA device.** A
+measurement that did not happen must not read as a measurement of zero: 0% stall
+on a CPU box is indistinguishable from a perfectly fed GPU, which is the single
+most misleading number the module could produce. `report.txt` says
+"not measured (no CUDA device)" rather than printing a figure.
+
+**The fault ceiling still never raises here.** The callback logs a WARNING and
+reports the rate; `mlf materialize` remains the only place it aborts, because a
+content-dependent abort at training time is rank-divergent — the collective hang
+the whole phase exists to prevent.
+
+**Two bugs found by writing the tests.** `StallProbe` never set its wall-clock
+origin when `warmup=0`, so `wall_ms` was the raw `perf_counter` value — an
+arbitrary number of hours, against which every percentage rounded to zero. And
+`SampleFault.substituted_with` was always `null`, because the fault was recorded
+before the replacement was chosen — losing exactly the field that evidences the
+policy working.
+
+**A layering regression caught by an existing test.** `pipeline/train.py` calls the
+report writer on every run, and the writer initially lived in `backends/staged.py`,
+which imports Lightning at module scope. That put Lightning into the import path of
+a torch-free GBDT run; `tests/integration/test_torch_free_serving.py` failed
+immediately. The writer moved to `core/stall.py`, which is torch-free at module
+scope (the CUDA event timing is imported inside its methods).
+
+**Verified end to end**: a four-epoch audio run reports `data_wait_pct: 56.9`,
+`gpu_stall_pct: null`, and writes both JSON files plus the `report.txt` block.
 
 ### Known gaps P13 leaves open, deliberately
 
@@ -1797,15 +1841,19 @@ A healthy run writes no fault file at all.
    Neither can be synthesized without an encoder. **This is the largest remaining
    hole in P13**: the two rows the reference table calls most dangerous are the two
    with no end-to-end coverage.
-4. **`LoaderState` is not wired into a checkpoint.** `BundleDataModule` does not
-   implement `state_dict`/`load_state_dict`, so mid-epoch resume is implemented and
-   unit-tested but not reachable from `mlf train --resume`. P13e.
-5. **`ShardShuffleSampler` is not wired into the loader either.** `StagedDataset` is
-   consumed through the ordinary `DataLoader(shuffle=True)` path, so `data.shards.shuffle`
-   is honoured by nothing yet — block shuffling and its read-locality benefit arrive
-   with the sampler wiring in P13e. The sampler itself is complete and tested.
-6. **`--decoder`, `--on-corrupt`, `--shuffle` reach the config but only the first two
-   are read.** `data.shards.shuffle` is inert until (5) lands.
+4. **Mid-epoch resume is wired but not proven against a real interrupted run.**
+   `state_dict`/`load_state_dict` round-trip and the skip arithmetic are unit-tested,
+   and the corpus-changed refusal works — but no test kills a run mid-epoch and
+   restarts it, because doing so reliably in CI needs a fixture that can be
+   interrupted deterministically.
+5. **Nothing is proven under an actual multi-process DDP run.** The batch-count
+   parity argument is verified by instantiating `DistributedSampler` for two ranks
+   directly, which tests the arithmetic that matters and needs no process group.
+   What it does not test is the collective behaviour itself — that needs two real
+   processes and a GPU box, which is the same gap P12's `spark-contract` job has.
+6. **The stall profiler's 10-batch warmup consumes a small epoch.** A corpus with
+   fewer than 11 batches reports `measured: false` with a reason rather than a
+   number. Correct, and thin on toy data; real runs have hundreds of batches.
 5. **Parquet is deliberately not a decoder row.** Its read/demux/decode is already
    owned by `DataBackend` (P12), and the reference table itself notes the
    Thrift-footer→chunk-offset step is "same API, no seam". A second owner for one
