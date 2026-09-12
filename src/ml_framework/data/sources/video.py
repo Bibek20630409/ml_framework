@@ -58,18 +58,43 @@ def video_labels(config) -> list[int]:
     return labels_of(index_for(config.data.path, config), str(config.data.path))
 
 
-def build_video_bundle(config, *, indices: Any = None) -> DataBundle:
-    """Materialize a video :class:`DataBundle` from a validated config."""
-    params = VideoSourceParams.model_validate(dict(config.data.params))
-    preprocessor = VideoPreprocessor(clip_len=params.clip_len, img_size=params.img_size)
+def video_preprocessor(config) -> VideoPreprocessor:
+    """The clip geometry this config implies, without touching the corpus.
 
-    # The decoder needs the geometry up front so it can stop early; the user's own
-    # `decoder_params` still win, because an explicit setting is a decision.
-    decoder_params = {
+    Sibling of ``audio_preprocessor``, and for the same caller: the tail probe in
+    ``mlf materialize --probe-full``.
+    """
+    params = VideoSourceParams.model_validate(dict(config.data.params))
+    return VideoPreprocessor(clip_len=params.clip_len, img_size=params.img_size)
+
+
+def video_decoder_params(config) -> dict[str, Any]:
+    """The decoder params a video run implies, geometry included.
+
+    The decoder needs the geometry **up front** so it can stop after ``clip_len``
+    frames instead of decoding a whole file and discarding most of it. The user's
+    own ``decoder_params`` still win, because an explicit setting is a decision.
+
+    Split out from :func:`build_video_bundle` because ``mlf materialize`` needs the
+    same dict and was passing ``data.decoder_params`` raw — so every video
+    materialization decoded at the decoder's default geometry rather than the
+    configured one, and the shard index recorded ``n_units`` for clips nobody asked
+    for.
+    """
+    params = VideoSourceParams.model_validate(dict(config.data.params))
+    return {
         "clip_len": params.clip_len,
         "frame_stride": params.frame_stride,
         **dict(config.data.decoder_params),
     }
+
+
+def build_video_bundle(config, *, indices: Any = None) -> DataBundle:
+    """Materialize a video :class:`DataBundle` from a validated config."""
+    params = VideoSourceParams.model_validate(dict(config.data.params))
+    preprocessor = video_preprocessor(config)
+
+    decoder_params = video_decoder_params(config)
     config = config.model_copy(
         update={"data": config.data.model_copy(update={"decoder_params": decoder_params})}
     )

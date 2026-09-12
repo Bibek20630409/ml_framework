@@ -200,6 +200,10 @@ markers = [
     "unit: fast isolated tests",
     "integration: end-to-end training tests",
     "serving: FastAPI endpoint tests",
+    # Skipped unless torch.cuda.is_available(). The h2d/gpu_transform stages are
+    # otherwise exercised with device="cpu", which tests every decision but runs no
+    # device kernel -- these are the part that needs real hardware.
+    "gpu: needs a CUDA device; skipped everywhere else",
 ]
 
 

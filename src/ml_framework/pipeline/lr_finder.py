@@ -56,6 +56,11 @@ def find_lr(config: ExperimentConfig) -> float:
     out.mkdir(parents=True, exist_ok=True)
 
     dm = build_datamodule(config)
+    # `torch_lr_finder` iterates the loader itself, so Lightning never calls
+    # `on_after_batch_transfer` — and a deferred transform would simply never run,
+    # handing the model raw waveforms instead of spectrograms. Keep the whole tail
+    # in the collate for this one caller.
+    dm.set_device_transform(False)
     dm.setup()
     model = build_model(config, input_dim=dm.input_dim, output_dim=dm.output_dim)
 

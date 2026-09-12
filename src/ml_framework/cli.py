@@ -64,7 +64,7 @@ from typing import Any
 
 from .config import ExperimentConfig
 from .core.export import EXPORT_FORMATS
-from .core.types import STAGES, FrameworkError
+from .core.types import DECODER_STAGES, FrameworkError
 from .utils import setup_logging
 
 log = logging.getLogger(__name__)
@@ -159,6 +159,7 @@ def _load_config(args: argparse.Namespace) -> ExperimentConfig:
             ("num_workers", "runtime.num_workers"),
             ("prefetch_factor", "runtime.prefetch_factor"),
             ("pin_memory", "runtime.pin_memory"),
+            ("device_transform", "runtime.device_transform"),
         )
         if getattr(args, flag, None) is not None
     }
@@ -249,6 +250,19 @@ def _add_config_args(sub: argparse.ArgumentParser) -> None:
         dest="pin_memory",
         action="store_false",
         help="Never page-lock, even on CUDA",
+    )
+    sub.add_argument(
+        "--device-transform",
+        dest="device_transform",
+        action="store_true",
+        default=None,
+        help="Run the transform stage after H2D, on the device (CUDA only; the default)",
+    )
+    sub.add_argument(
+        "--no-device-transform",
+        dest="device_transform",
+        action="store_false",
+        help="Keep the transform in the collate, in a worker, even on CUDA",
     )
 
 
@@ -495,7 +509,11 @@ def _format_detail(kind: str, spec: Any) -> list[str]:
             f"output: {spec.output_dtype} {spec.output_layout}",
             # Sorted read/demux/decode rather than alphabetically: the pipeline
             # order is the information, and "decode,demux,read" reads backwards.
-            f"stages: {','.join(s for s in STAGES if s in spec.stages)}",
+            # The decoder's HEAD stages only -- the tail (construct, transform,
+            # h2d, gpu_transform) belongs to the preprocessor and the transport
+            # layer, and listing it per decoder would attribute it to the wrong
+            # thing.
+            f"stages: {','.join(s for s in DECODER_STAGES if s in spec.stages)}",
         ]
         if spec.suffixes:
             lines.append(f"files:  {' '.join(spec.suffixes)}")
@@ -602,6 +620,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     materialize_p.add_argument(
         "--force", action="store_true", help="Rewrite an index that already exists"
+    )
+    # The walk above covers read/demux/decode. This covers the other four stages,
+    # which are per-batch and therefore invisible to a per-sample probe -- and it
+    # needs a config, because the preprocessor that owns them is a property of the
+    # run's data kind rather than of the corpus on disk.
+    materialize_p.add_argument(
+        "--probe-full",
+        action="store_true",
+        help="Also push one batch through construct/transform/h2d/gpu_transform (needs --config)",
     )
 
     init_p = sub.add_parser("init", help="Write a config inferred from a dataset")
@@ -970,16 +997,42 @@ def main(argv: list[str] | None = None) -> int:
         if ceiling is None:
             ceiling = cfg.data.integrity.max_fault_rate if cfg else 0.01
 
+        # The tail stages belong to a preprocessor, and which preprocessor is a
+        # property of the *run* rather than of the bytes on disk -- so unlike the
+        # decode probe, this one cannot be inferred from the corpus.
+        tail_preprocessor = None
+        if args.probe_full:
+            if cfg is None:
+                log.error(
+                    "--probe-full needs --config: the construct/transform stages belong to "
+                    "the data kind's preprocessor, which a corpus directory does not state."
+                )
+                return 1
+            from .data.sources import preprocessor_for
+
+            try:
+                tail_preprocessor = preprocessor_for(cfg)
+            except ValueError as exc:
+                log.error("%s", exc)
+                return 1
+
+        # Not `dict(cfg.data.decoder_params)`: a video decoder needs the clip
+        # geometry up front so it can stop early, and that lives in `data.params`.
+        # Passing the raw dict made every video materialization decode at the
+        # decoder's default geometry rather than the configured one.
+        from .data.sources import decoder_params_for
+
         try:
             _, report = materialize(
                 path,
                 index_dir=index_dir,
                 decoder=args.decoder,
-                decoder_params=dict(cfg.data.decoder_params) if cfg else None,
+                decoder_params=decoder_params_for(cfg) if cfg else None,
                 data_kind=cfg.data.kind if cfg else "tabular",
                 max_fault_rate=ceiling,
                 sample_rate=args.sample_rate,
                 seed=cfg.runtime.seed if cfg else 42,
+                tail_preprocessor=tail_preprocessor,
             )
         except MaterializeError as exc:
             # The one place the fault ceiling raises. Safe here and nowhere else:

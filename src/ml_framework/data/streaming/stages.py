@@ -1,11 +1,16 @@
 """
 data/streaming/stages.py
 ────────────────────────
-The vocabulary of the staged read path: **read → demux → decode**, and the types
-that flow between them.
+The vocabulary of the staged read path's **head** — read → demux → decode — and
+the types that flow between them.
 
-Three stages, not two. The distinction is not pedantry — it is the only way to
-describe the formats honestly:
+The whole pipeline is seven stages (``core.types.STAGES``); this module owns the
+first three, and the tail — construct → transform → h2d → gpu_transform — is
+declared by ``BasePreprocessor.stages`` and executed by the transport layer. The
+seam is exactly where :class:`Decoded` stops.
+
+Three head stages, not two. The distinction is not pedantry — it is the only way
+to describe the formats honestly:
 
 * a pre-tokenized ``.bin`` shard has **neither** demux nor decode (a memmap slice
   is a page fault, not a call),
@@ -36,16 +41,29 @@ import numpy as np
 # `DataKind` and `Payload` rather than here — `core.plugins.DecoderSpec` is typed
 # against them, and core may not import from the data layer. Re-exported so a
 # decoder module has one obvious import.
-from ...core.types import LANDS_IN, LAYOUTS, STAGES, LandsIn, Layout, Stage
+from ...core.types import (
+    DECODER_STAGES,
+    LANDS_IN,
+    LAYOUTS,
+    STAGES,
+    TAIL_STAGES,
+    DecoderStage,
+    LandsIn,
+    Layout,
+    Stage,
+)
 
 __all__ = [
+    "DECODER_STAGES",
     "LANDS_IN",
     "LAYOUTS",
     "STAGES",
+    "TAIL_STAGES",
     "Blob",
     "BlobSource",
     "DecodeContext",
     "Decoded",
+    "DecoderStage",
     "LandsIn",
     "Layout",
     "Packet",

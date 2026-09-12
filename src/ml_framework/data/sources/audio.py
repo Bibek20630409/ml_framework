@@ -67,14 +67,25 @@ def audio_labels(config) -> list[int]:
     return labels_of(index_for(config.data.path, config), str(config.data.path))
 
 
-def build_audio_bundle(config, *, indices: Any = None) -> DataBundle:
-    """Materialize an audio :class:`DataBundle` from a validated config."""
+def audio_preprocessor(config) -> AudioPreprocessor:
+    """The front-end this config implies, without touching the corpus.
+
+    Split out so ``mlf materialize --probe-full`` can run the tail stages over a
+    corpus that has no bundle yet — building one would decode the whole thing, and
+    the point of the probe is to be cheaper than that.
+    """
     params = AudioSourceParams.model_validate(dict(config.data.params))
-    preprocessor = AudioPreprocessor(
+    return AudioPreprocessor(
         sample_rate=params.sample_rate,
         clip_seconds=params.clip_seconds,
         n_mels=params.n_mels,
     )
+
+
+def build_audio_bundle(config, *, indices: Any = None) -> DataBundle:
+    """Materialize an audio :class:`DataBundle` from a validated config."""
+    params = AudioSourceParams.model_validate(dict(config.data.params))
+    preprocessor = audio_preprocessor(config)
     return build_staged_bundle(
         config,
         data_kind="audio",

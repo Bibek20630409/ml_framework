@@ -9,23 +9,30 @@ training set. What has to round-trip through the bundle is the *configuration*,
 because serving must produce exactly the spectrogram training did. Train/serve
 skew here is silent and produces a model that merely looks bad.
 
-**The front-end runs in the collate, per batch, on the GPU when there is one.**
-That is deliberate and it is the point at which this file participates in the
-staged pipeline:
+**This file is the tail of the staged pipeline for audio, and it is two stages,
+not one.** Until now they were fused in a single ``_collate`` whose docstring
+claimed the front-end ran "on the GPU when there is one" — it never did: the
+collate builds a CPU tensor inside a DataLoader worker, so ``mel.to(x.device)``
+resolved to CPU on every machine, every run. Splitting them makes the claim true
+by making it a placement the transport layer can actually make:
 
 * the *decoder* returns int16 or float32 PCM and nothing more — decode reverses a
   compression scheme and stops;
-* **tensor construction** happens here, once per batch, where a few MB is cast and
-  stacked rather than a corpus;
-* the mel transform is a matmul against a fixed filterbank, so running it on a
-  batch is meaningfully faster than running it per sample in a worker, and it
-  keeps the workers doing IO rather than FFTs.
+* :meth:`build_tensor` is **construct**: cast, length-fit and stack, once per
+  batch, where a few MB is copied rather than a corpus;
+* :meth:`transform_batch` is the mel filterbank — a matmul, and the only part
+  worth putting on a device. It runs wherever its input already is, so the
+  transport layer decides: in the collate on a CPU box, and after the H2D copy on
+  a CUDA one.
+
+Deferring it also shrinks the copy: what crosses the bus is a waveform, not a
+spectrogram.
 
 Clips are **fixed-length by construction**: a batch of ragged waveforms cannot be
 stacked, and padding to the longest clip in each batch would make the input length
-depend on batch composition. :meth:`fit_length` centre-crops or zero-pads to
-exactly ``clip_seconds``, so every batch has the same shape and a model can state
-its input size.
+depend on batch composition. :meth:`AudioPreprocessor._span` centre-crops or
+zero-pads every clip to exactly ``clip_seconds``, so every batch has the same shape
+and a model can state its input size.
 
 ``torchaudio`` is imported inside the methods, so this module stays importable on
 an install without the ``[audio]`` extra — the rule every plugin module follows.
@@ -34,13 +41,13 @@ an install without the ``[audio]`` extra — the rule every plugin module follow
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
-from .base import BasePreprocessor
+from .base import BasePreprocessor, host_array
 
 log = logging.getLogger(__name__)
 
@@ -57,9 +64,27 @@ DEFAULT_N_MELS = 64
 # later, where the cause is no longer visible.
 LOG_EPSILON = 1e-10
 
+# Full-scale divisor per integer PCM width, applied to scale integer PCM into
+# [-1, 1). 32768 rather than 32767, matching libsndfile — so a corpus read as int16
+# and one read as float32 produce the same spectrogram instead of differing by one
+# ULP. Both values are powers of two, so the division is exact in float32 and the
+# order of "scale then average" versus "average then scale" cannot change a result;
+# `build_tensor` relies on that when it averages a stereo clip before scaling it.
+#
+# A float dtype is absent rather than mapped to 1.0: "no scaling applies" and
+# "scale by one" would compute the same answer, but only the first is true, and
+# `build_tensor` skips the pass entirely for it.
+_PCM_SCALE: dict[Any, float] = {np.int16: 32768.0, np.int32: 2147483648.0}
+
 
 class AudioPreprocessor(BasePreprocessor):
-    """Fixed-length PCM → log-mel spectrogram, with a batching collate."""
+    """Fixed-length PCM → log-mel spectrogram, split across the tail's stages."""
+
+    # `gpu_transform` is a claim about `transform_batch`: it is a torch matmul
+    # against a filterbank moved to the input's device, so it is correct on either
+    # side of the H2D copy. That claim is what licenses the transport layer to
+    # defer it.
+    stages = frozenset({"construct", "transform", "gpu_transform"})
 
     def __init__(
         self,
@@ -114,8 +139,12 @@ class AudioPreprocessor(BasePreprocessor):
             )
         return self._mel
 
-    def fit_length(self, pcm: np.ndarray) -> np.ndarray:
-        """Centre-crop or zero-pad one waveform to exactly ``clip_samples``.
+    def _span(self, have: int) -> tuple[slice, slice]:
+        """``(source slice, destination slice)`` placing one clip in a fixed row.
+
+        **Pure arithmetic — moves no data.** The whole crop/pad rule, stated once
+        as offsets so that :meth:`build_tensor` can write straight into the batch
+        buffer rather than building a per-sample array first.
 
         Fixed length by construction rather than per-batch padding: padding to the
         longest clip in each batch would make the input size depend on batch
@@ -124,36 +153,25 @@ class AudioPreprocessor(BasePreprocessor):
 
         A **centre** crop rather than a leading one because the informative part of
         a clip is usually not at its start — a leading crop on a corpus with
-        leading silence trains on silence.
+        leading silence trains on silence. And a centre *pad* for the mirror
+        reason: a short clip flush-left would put every one of them against the
+        same edge, which a convolution can learn.
         """
-        if pcm.ndim > 1:
-            # (channels, samples) -> mono. Averaged in float to avoid the integer
-            # wrap that summing loud stereo in int16 would produce.
-            pcm = pcm.mean(axis=0, dtype="float32")
-
         want = self.clip_samples
-        have = int(pcm.shape[-1])
-        if have == want:
-            return pcm
-        if have > want:
+        if have >= want:
             start = (have - want) // 2
-            return pcm[start : start + want]
-        pad = want - have
-        left = pad // 2
-        return np.pad(pcm, (left, pad - left), mode="constant")
+            return slice(start, start + want), slice(0, want)
+        left = (want - have) // 2
+        return slice(0, have), slice(left, left + have)
 
-    def to_float32(self, pcm: np.ndarray) -> np.ndarray:
-        """Scale integer PCM into [-1, 1); pass float through untouched.
+    @staticmethod
+    def _mono(pcm: np.ndarray) -> np.ndarray:
+        """``(channels, samples)`` -> mono, averaged in float.
 
-        Divided by 32768 rather than 32767, matching libsndfile — so a corpus read
-        as int16 and one read as float32 produce the same spectrogram instead of
-        differing by one ULP.
+        In float rather than in the source dtype to avoid the integer wrap that
+        summing loud stereo in int16 would produce.
         """
-        if pcm.dtype == np.int16:
-            return pcm.astype("float32") / 32768.0
-        if pcm.dtype == np.int32:
-            return pcm.astype("float32") / 2147483648.0
-        return np.ascontiguousarray(pcm, dtype="float32")
+        return pcm.mean(axis=0, dtype="float32")
 
     def log_mel(self, waveforms: Any) -> Any:
         """``(B, samples)`` float32 → ``(B, 1, n_mels, frames)`` log-mel.
@@ -168,47 +186,74 @@ class AudioPreprocessor(BasePreprocessor):
         spec = mel(waveforms)
         return torch.log(spec + LOG_EPSILON).unsqueeze(1)
 
-    # ── the collate: where tensor construction happens ──
-    @property
-    def collate_fn(self) -> Callable[[Sequence[Any]], Any]:
-        return self._collate
+    # ── construct ──
+    def build_tensor(self, batch: Sequence[Any]) -> tuple[Any, Any]:
+        """Decoded PCM → ``(B, samples)`` float32, plus the labels.
 
-    def _collate(self, batch: Sequence[Any]) -> Any:
-        """Decoded PCM → a batched spectrogram tensor.
+        The boundary the staged pipeline draws: everything before it produced numpy
+        buffers and described them, everything after it is torch. The cast, the
+        length fit and the stack all happen here so a *batch* pays for them — a few
+        MB — rather than the corpus.
 
-        This is the boundary the staged pipeline draws. Everything before it
-        produced numpy buffers and described them; everything after it is torch.
-        Doing the cast and the stack here means a *batch* pays for them — a few MB
-        — rather than the corpus.
+        No spectrogram yet. What this returns is what crosses the bus, and a
+        waveform is smaller than its mel.
+
+        **One allocation for the batch, written through directly.** The obvious
+        spelling — widen each clip to float32, fit it to length, then ``np.stack``
+        the results — copies twice and allocates a temporary per sample: once to
+        widen, again to gather the scattered buffers into one block. Here the
+        destination is allocated first and each sample is cast straight into its
+        row, so the widen *is* the gather. The zero padding comes free from
+        ``np.zeros``, and the geometry is :meth:`_span`.
         """
         import torch
 
-        waves: list[np.ndarray] = []
+        # The scale is read from the ORIGINAL dtype, before `_mono` turns a stereo
+        # int16 clip into float32 -- reading it after would silently skip the
+        # divide and hand the model raw sample values three orders too large.
+        samples: list[tuple[np.ndarray, float | None]] = []
         labels: list[int] = []
         for item in batch:
             sample, label = item if isinstance(item, tuple) else (item, None)
-            pcm = getattr(sample, "array", sample)
-            waves.append(self.fit_length(self.to_float32(np.asarray(pcm))))
+            pcm = host_array(sample)
+            scale = _PCM_SCALE.get(pcm.dtype.type)
+            samples.append((self._mono(pcm) if pcm.ndim > 1 else pcm, scale))
             if label is not None:
                 labels.append(int(label))
 
-        # One stack, one H2D-ready contiguous buffer.
-        x = torch.from_numpy(np.ascontiguousarray(np.stack(waves, axis=0), dtype="float32"))
-        features = self.log_mel(x)
-        if not labels:
-            return features
-        return features, torch.tensor(labels, dtype=torch.int64)
+        out = np.zeros((len(samples), self.clip_samples), dtype="float32")
+        for i, (pcm, scale) in enumerate(samples):
+            src, dst = self._span(int(pcm.shape[-1]))
+            # The int16 -> float32 cast happens in this assignment, into the final
+            # buffer. Only the written span is scaled; the padding stays zero.
+            out[i, dst] = pcm[src]
+            if scale is not None:
+                out[i, dst] /= scale
+
+        x = torch.from_numpy(out)
+        y = torch.tensor(labels, dtype=torch.int64) if labels else None
+        return x, y
+
+    # ── transform / gpu_transform ──
+    def transform_batch(self, x: Any) -> Any:
+        """The mel front-end, on whatever device ``x`` is already on.
+
+        Device-agnostic by construction — :meth:`log_mel` moves the filterbank to
+        the input rather than the other way round — which is the whole reason this
+        may run either in the collate or after the H2D copy.
+        """
+        return self.log_mel(x)
 
     # ── contract ──
     def transform(self, x: Any) -> Any:
         """Serving path: one waveform (or several) → the same spectrogram.
 
-        Routed through :meth:`collate_fn` rather than reimplemented, because a
-        second implementation of the front-end is exactly how train/serve skew
-        gets in.
+        Routed through the same two methods training uses rather than
+        reimplemented, because a second implementation of the front-end is exactly
+        how train/serve skew gets in.
         """
         items = x if isinstance(x, (list, tuple)) else [x]
-        return self._collate(list(items))
+        return self.collate_staged(list(items))
 
     def _write(self, dest: Path) -> list[str]:
         # Everything needed to rebuild the front-end is in `params()`, which

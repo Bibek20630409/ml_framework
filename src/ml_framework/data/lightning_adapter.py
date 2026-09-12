@@ -15,6 +15,14 @@ parameterized by the two things that genuinely differ:
 Datamodules stop being an extension point here; *sources* are the extension
 point, and this class is a thin adapter that turns any bundle into loaders.
 
+**It also owns the last two stages of the staged read pipeline.** ``h2d`` is
+Lightning's copy, but where it happens relative to the *transform* is this class's
+decision: :attr:`BundleDataModule.defers_transform` moves the preprocessor's
+``transform_batch`` from the collate to :meth:`on_after_batch_transfer` whenever
+there is a CUDA device and the preprocessor has declared the work device-agnostic.
+That is the difference between a worker CPU running an FFT and the GPU running it,
+and — for video — between the bus carrying float32 and carrying uint8.
+
 It also keeps the derived-attribute surface v1 exposed after ``setup()``
 (``input_dim``, ``output_dim``, ``class_weights``, ``feature_cols``,
 ``reference_stats``), because the training pipeline, the LR finder and the HPO
@@ -112,6 +120,7 @@ class BundleDataModule(pl.LightningDataModule):
         shuffle: str = "block",
         seed: int = 42,
         resume_state: bool = True,
+        device_transform: bool = True,
     ) -> None:
         super().__init__()
         if bundle is None and bundle_factory is None:
@@ -140,6 +149,10 @@ class BundleDataModule(pl.LightningDataModule):
         self._sampler: Any = None
         self._state = LoaderState(seed=seed, shuffle=shuffle)
         self._resume_skip = 0
+        # Permission, not a decision: `defers_transform` decides. Off makes the
+        # pipeline behave exactly as it did before the tail was split, which is
+        # what a caller driving the loaders itself needs — see `set_device_transform`.
+        self._device_transform = device_transform
 
     # ── bundle access ──
     @property
@@ -269,6 +282,104 @@ class BundleDataModule(pl.LightningDataModule):
             return False
         return True
 
+    # ── the transform seam: before or after H2D ──
+    @property
+    def defers_transform(self) -> bool:
+        """Whether the transform stage runs **after** the H2D copy.
+
+        Four conditions, and each one is a case where deferring would be wrong
+        rather than merely unhelpful:
+
+        * ``device_transform`` is off — a caller that drives the loaders itself has
+          no ``on_after_batch_transfer`` hook, so the transform must stay in the
+          collate or the model is handed a raw waveform;
+        * an explicit ``collate_fn`` was supplied — that callable did some unknown
+          part of the tail, and adding a second transform on top of it would apply
+          the front-end twice;
+        * the preprocessor does not declare ``gpu_transform`` — it has not claimed
+          its transform is device-agnostic, and assuming it is would be exactly the
+          kind of unstated assumption this pipeline exists to remove;
+        * the decoder landed the sample in **device** memory — there is no host
+          tail at all, so there is nothing to move.
+
+        Everything else reduces to "is there a device to defer *to*", which is the
+        same question :func:`_cuda_selected` answers for pinning.
+        """
+        if not self._device_transform or self._collate_fn is not None:
+            return False
+        if "gpu_transform" not in self._preprocessor_stages:
+            return False
+        if self.lands_in == "device":
+            return False
+        return _cuda_selected(self._accelerator)
+
+    @property
+    def _preprocessor_stages(self) -> frozenset[str]:
+        """The tail stages the bundle's preprocessor declares, or none.
+
+        Defaults to empty for a preprocessor that predates the split (or a
+        third-party one), which is what keeps such a preprocessor on the single
+        opaque ``collate_fn`` path it was written for.
+        """
+        if not self.is_ready:
+            return frozenset()
+        return frozenset(getattr(self.bundle.preprocessor, "stages", frozenset()))
+
+    def set_device_transform(self, enabled: bool) -> None:
+        """Allow or forbid deferring the transform past the H2D copy.
+
+        For a caller that iterates ``train_dataloader()`` itself instead of handing
+        the datamodule to a ``Trainer``: Lightning is what calls
+        :meth:`on_after_batch_transfer`, so without it a deferred transform would
+        simply never run. ``mlf lr`` is the one such caller in this repo.
+        """
+        self._device_transform = enabled
+
+    @property
+    def collate(self) -> Callable[[Any], Any] | None:
+        """The batching callable this run's loaders get.
+
+        Three sources, in precedence order: an explicit ``collate_fn`` (a caller
+        who knows better), the preprocessor's split tail with the transform kept or
+        dropped, and finally the preprocessor's own opaque ``collate_fn``.
+        """
+        if self._collate_fn is not None:
+            return self._collate_fn
+        preprocessor = self.preprocessor
+        if preprocessor is None:
+            return None
+        if "construct" in self._preprocessor_stages:
+            return (
+                preprocessor._collate_deferred
+                if self.defers_transform
+                else preprocessor._collate_full
+            )
+        return getattr(preprocessor, "collate_fn", None)
+
+    def on_after_batch_transfer(self, batch: Any, dataloader_idx: int = 0) -> Any:
+        """**gpu_transform.** Lightning's hook for "the batch is on the device now".
+
+        The one place the deferred transform runs, and the reason the split exists:
+        the mel matmul and the video permute are arithmetic, and arithmetic belongs
+        where the accelerator is rather than in a DataLoader worker that should be
+        doing IO.
+
+        A no-op whenever the transform already ran in the collate, so a CPU run and
+        a run whose preprocessor never split its tail both pass straight through.
+        """
+        preprocessor = self.preprocessor
+        if not self.defers_transform or preprocessor is None:
+            # The `is None` half is unreachable -- `defers_transform` reads the
+            # preprocessor's own `stages` and a missing one declares nothing -- but
+            # stating it keeps the narrowing local instead of spread across two
+            # properties.
+            return batch
+        transform = preprocessor.transform_batch
+        if isinstance(batch, (list, tuple)) and len(batch) == 2:
+            x, y = batch
+            return transform(x), y
+        return transform(batch)
+
     @property
     def sampler_weights(self) -> np.ndarray | None:
         if not self.is_ready:
@@ -376,8 +487,9 @@ class BundleDataModule(pl.LightningDataModule):
             "batch_size": self.batch_size,
             "num_workers": workers,
         }
-        if self._collate_fn is not None:
-            kwargs["collate_fn"] = self._collate_fn
+        collate = self.collate
+        if collate is not None:
+            kwargs["collate_fn"] = collate
         if workers > 0:
             # Guarded rather than passed unconditionally: torch raises for
             # `persistent_workers=True` with `num_workers=0`, and requires
@@ -413,14 +525,19 @@ class BundleDataModule(pl.LightningDataModule):
 
     @classmethod
     def from_bundle(cls, bundle: DataBundle, config) -> BundleDataModule:
-        """Wrap an already-built bundle using a config's loader settings."""
-        preprocessor = bundle.preprocessor
+        """Wrap an already-built bundle using a config's loader settings.
+
+        No ``collate_fn`` is passed: the batching rule is read off the bundle's own
+        preprocessor by :attr:`collate`, which is what lets the transform stage be
+        placed rather than baked in. Passing it here would pin the whole tail into
+        the collate and make ``device_transform`` unreachable.
+        """
         return cls(
             bundle,
             batch_size=config.fit.batch_size,
             num_workers=config.runtime.num_workers,
             output_dir=config.runtime.output_dir,
-            collate_fn=getattr(preprocessor, "collate_fn", None),
+            device_transform=config.runtime.device_transform,
             pin_memory=config.runtime.pin_memory,
             persistent_workers=config.runtime.persistent_workers,
             prefetch_factor=config.runtime.prefetch_factor,
@@ -457,6 +574,7 @@ class TabularDataModule(BundleDataModule):
             shuffle=config.data.shards.shuffle,
             seed=config.runtime.seed,
             resume_state=config.data.shards.resume_state,
+            device_transform=config.runtime.device_transform,
         )
 
 

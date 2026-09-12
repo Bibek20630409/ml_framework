@@ -602,9 +602,15 @@ class LightningBackend(BaseBackend):
             # 0 workers: an evaluation pass is not worth a process pool, and
             # spawning one mid-run is a reliable source of Windows surprises.
             num_workers=0,
-            # The same batching rule training used. Without it a text split
-            # arrives as a list of raw strings and the model is handed something
-            # it has no way to read.
+            # The preprocessor's batching rule, passed explicitly. Without it a
+            # text split arrives as a list of raw strings and the model is handed
+            # something it has no way to read.
+            #
+            # Explicit for a second reason now: `collate_fn` is the WHOLE tail
+            # (construct + transform), and supplying it also tells the datamodule
+            # not to defer the transform past H2D. This loop iterates the loader
+            # itself, so `on_after_batch_transfer` would never fire and a deferred
+            # transform would silently not run.
             collate_fn=getattr(bundle.preprocessor, "collate_fn", None),
         )
         dm.setup()

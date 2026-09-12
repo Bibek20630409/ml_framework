@@ -49,11 +49,36 @@ DataKind = Literal["tabular", "image", "text", "timeseries", "audio", "video"]
 Payload = Literal["arrays", "frame", "dataset", "series"]
 
 # ── Staged-read vocabulary (P13) ──────────────────────────
-# Storage → tensor is `read → demux → decode`: three stages, not two. The
-# distinction is what lets the formats be described honestly — a pre-tokenized
-# `.bin` shard has neither demux nor decode (a memmap slice is a page fault, not a
-# call), while an MP3 has both. Declared per decoder on `DecoderSpec.stages`.
-Stage = Literal["read", "demux", "decode"]
+# Storage → a tensor the model can consume, named end to end. Seven stages, and
+# the split is not pedantry — each name marks a place where the cost, the device,
+# or the thing that can go wrong is genuinely different:
+#
+#   read             a positioned read. Bytes, from wherever they live.
+#   demux            container → elementary-stream packets. Real for MP3/MP4,
+#                    degenerate for a JPEG (one image, one packet).
+#   decode           reverse a compression scheme. A pre-tokenized `.bin` shard
+#                    has neither of the two above (a memmap slice is a page
+#                    fault, not a call); an MP3 has both.
+#   construct        attach a dtype, a shape and strides to a pointer. NOT decode:
+#                    a token shard decodes to nothing and constructs a tensor, a
+#                    device decoder decodes and constructs nothing at all.
+#   transform        change dtype/layout/scale — the mel matmul, the THWC→CTHW
+#                    permute + normalize. A copy, and usually the 4x one.
+#   h2d              host → device. Async only from a page-locked buffer.
+#   gpu_transform    the same `transform` work, run AFTER h2d. Not a different
+#                    operation: a different *placement*, which is why one
+#                    implementation serves both and only the seam moves.
+#
+# The last four are the tail. Nothing about them belongs to a decoder — they are
+# declared by a preprocessor (`BasePreprocessor.stages`) and executed by the
+# transport layer, which is what keeps decode and tensor construction the two
+# independent axes `data/streaming/stages.py` argues they are.
+Stage = Literal["read", "demux", "decode", "construct", "transform", "h2d", "gpu_transform"]
+
+# What a *decoder* can claim. Narrower than `Stage` on purpose: `DecoderSpec` is
+# typed against this, so a decoder declaring `h2d` is a type error rather than a
+# claim nothing would ever execute.
+DecoderStage = Literal["read", "demux", "decode"]
 
 # The physical arrangement of a decoded buffer, before any transform. `nv12` is
 # listed because it is what a hardware video decoder actually emits; calling that
@@ -76,7 +101,20 @@ LandsIn = Literal["host", "device"]
 # Consumer: the corrupt-sample policy in `data/streaming/integrity.py`.
 Integrity = Literal["checked", "loud", "silent", "none"]
 
-STAGES: Final[tuple[Stage, ...]] = ("read", "demux", "decode")
+STAGES: Final[tuple[Stage, ...]] = (
+    "read",
+    "demux",
+    "decode",
+    "construct",
+    "transform",
+    "h2d",
+    "gpu_transform",
+)
+# The two halves, because every consumer wants one or the other and neither wants
+# the union. `mlf decoders --show` renders the head; `BasePreprocessor.stages` and
+# the tail probe range over the tail.
+DECODER_STAGES: Final[tuple[DecoderStage, ...]] = ("read", "demux", "decode")
+TAIL_STAGES: Final[tuple[Stage, ...]] = ("construct", "transform", "h2d", "gpu_transform")
 LAYOUTS: Final[tuple[Layout, ...]] = ("hwc", "chw", "nv12", "pcm", "mel", "tokens", "thwc")
 LANDS_IN: Final[tuple[LandsIn, ...]] = ("host", "device")
 INTEGRITIES: Final[tuple[Integrity, ...]] = ("checked", "loud", "silent", "none")

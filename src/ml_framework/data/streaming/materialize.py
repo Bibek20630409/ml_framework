@@ -30,6 +30,16 @@ could trip it while rank 1 does not — and a rank-divergent abort is exactly th
 collective hang this phase exists to prevent. Here there is one process, no
 collective exists yet, and failing is safe, deterministic and early. So this is the
 only place the ceiling raises; at runtime it is counted and logged.
+
+## What this pass does *not* cover on its own
+
+Read → demux → decode is three of the pipeline's seven stages. Everything after
+decode — construct, transform, h2d, gpu_transform — is per *batch* rather than per
+sample, and a corpus that probes clean here can still fail on the first training
+step: ragged shapes that will not stack, a filterbank geometry that does not divide
+the clip, a "device-agnostic" transform that is not. ``tail_preprocessor`` (the
+``--probe-full`` flag) pushes one batch of cleanly-decoded samples through those
+four as well, reusing the buffers this pass already decoded. See ``tail_probe.py``.
 """
 
 from __future__ import annotations
@@ -49,6 +59,7 @@ from .integrity import SampleFault
 from .shards import ShardEntry, ShardIndex, ShardIndexWriter, digest_bytes
 from .sources_io import DirSource, TarSource, scan_tar
 from .stages import DecodeContext, SampleRef
+from .tail_probe import DEFAULT_PROBE_BATCH, TailReport
 
 log = logging.getLogger(__name__)
 
@@ -77,6 +88,9 @@ class MaterializeReport:
     shards: list[str] = field(default_factory=list)
     decoder: str = ""
     sampled: bool = False
+    # Present only under `--probe-full`. `None` means the tail was not probed,
+    # which must not read the same as "the tail was probed and had nothing to say".
+    tail: TailReport | None = None
 
     @property
     def n_faults(self) -> int:
@@ -107,6 +121,9 @@ class MaterializeReport:
             lines.append(f"  - {fault.summary()}")
         if self.n_faults > 10:
             lines.append(f"  ... and {self.n_faults - 10} more (see faults.jsonl)")
+        if self.tail is not None:
+            lines.append("")
+            lines.append(self.tail.render())
         return "\n".join(lines)
 
 
@@ -168,11 +185,19 @@ def materialize(
     sample_rate: float = 1.0,
     seed: int = 42,
     probe: bool = True,
+    tail_preprocessor: Any = None,
+    tail_batch: int = DEFAULT_PROBE_BATCH,
 ) -> tuple[ShardIndex, MaterializeReport]:
     """Walk ``path``, probe every sample, write the index, and report.
 
     Raises :class:`MaterializeError` when the fault rate exceeds
     ``max_fault_rate`` — the one place that ceiling is enforced.
+
+    ``tail_preprocessor`` extends the probe past decode: one batch of the samples
+    that decoded cleanly is pushed through construct → transform → h2d →
+    gpu_transform, which is the half of the pipeline the walk above cannot see. It
+    raises too, and for the same reason the ceiling does — a single process,
+    before any collective exists, is the only safe place to fail.
     """
     candidates, source, shards = discover(path)
     if not candidates:
@@ -196,9 +221,13 @@ def materialize(
     )
 
     root = ShardIndex.location(path, index_dir)
+    # Kept only when the tail is being probed, and capped at one batch: this is
+    # what `probe_tail` needs, and holding the whole corpus decoded would defeat
+    # the reason the corpus is streamed in the first place.
+    tail_samples: list[Any] = []
     with ShardIndexWriter(root, data_kind=data_kind) as writer:
         for i, candidate in enumerate(chosen):
-            entry, fault = _probe_one(
+            entry, fault, decoded = _probe_one(
                 i,
                 candidate,
                 source=source,
@@ -214,6 +243,14 @@ def materialize(
                 report.faults.append(fault)
             else:
                 report.n_ok += 1
+                if (
+                    tail_preprocessor is not None
+                    and decoded is not None
+                    and len(tail_samples) < tail_batch
+                ):
+                    # The (sample, label) shape `StagedDataset.__getitem__` yields,
+                    # so the probe exercises exactly what a collate will receive.
+                    tail_samples.append(decoded if entry.label is None else (decoded, entry.label))
             # The entry is written either way: the index declares what SHOULD
             # exist, and a sample that failed today is what substitution is for.
             # Dropping it would shrink `n_samples`, which is the one number that
@@ -230,6 +267,23 @@ def materialize(
     _write_faults(root, report.faults)
     source.close()
     engine.close()
+
+    if tail_preprocessor is not None:
+        from .tail_probe import TailProbeError, probe_tail
+
+        if not tail_samples:
+            raise TailProbeError(
+                "nothing decoded cleanly, so the tail could not be probed. Fix the "
+                "decode faults above first."
+            )
+        report.tail = probe_tail(tail_samples, tail_preprocessor)
+        if not report.tail.ok:
+            stage, detail = report.tail.failure  # type: ignore[misc]
+            raise TailProbeError(
+                f"the corpus decodes, but stage '{stage}' fails on the first batch: "
+                f"{detail}\n\nEvery sample here read, demuxed and decoded cleanly -- this "
+                f"is the half of the pipeline a decode probe cannot see.\n\n" + report.render()
+            )
 
     if report.fault_rate > max_fault_rate:
         raise MaterializeError(
@@ -252,7 +306,13 @@ def _probe_one(
     oracle: Any,
     labels: dict[str, int],
     probe: bool,
-) -> tuple[ShardEntry, SampleFault | None]:
+) -> tuple[ShardEntry, SampleFault | None, Any]:
+    """``(entry, fault, decoded)``.
+
+    ``decoded`` is handed back rather than discarded so the tail probe can reuse
+    it: decoding the corpus a second time to build one batch would double the cost
+    of the whole pass to learn nothing new. ``None`` when nothing was decoded.
+    """
     key = candidate["key"]
     ref = SampleRef(
         index=i,
@@ -271,7 +331,7 @@ def _probe_one(
         label=labels.get(key),
     )
     if not probe:
-        return entry, None
+        return entry, None, None
 
     def fault(kind: str, detail: str) -> SampleFault:
         return SampleFault(
@@ -289,7 +349,7 @@ def _probe_one(
         digest = digest_bytes(blob.data)
         decoded = decoder.decode(decoder.demux(blob), ctx=ctx)
     except Exception as exc:  # noqa: BLE001 - any codec may raise anything
-        return entry, fault("decode_error", f"{type(exc).__name__}: {exc}")
+        return entry, fault("decode_error", f"{type(exc).__name__}: {exc}"), None
 
     problem = _cross_check(decoded, spec=spec, oracle=oracle, ref=ref, source=source, ctx=ctx)
     n_units = _n_units(decoded)
@@ -306,8 +366,8 @@ def _probe_one(
     )
     if problem is not None:
         kind, detail = problem
-        return entry, fault(kind, detail)
-    return entry, None
+        return entry, fault(kind, detail), decoded
+    return entry, None, decoded
 
 
 def _cross_check(

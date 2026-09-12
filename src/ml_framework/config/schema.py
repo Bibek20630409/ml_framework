@@ -156,6 +156,16 @@ class RuntimeConfig(BaseModel):
     # Batches each worker prefetches. torch's own default; raising it trades host
     # RAM for tolerance of a bursty decode.
     prefetch_factor: int = Field(default=2, ge=1)
+    # Run the preprocessor's transform stage AFTER the H2D copy, on the device,
+    # instead of in a DataLoader worker. Honoured only where it is both possible
+    # and useful: a CUDA device, a host-landing decoder, and a preprocessor that
+    # declares `gpu_transform` (audio's mel, video's permute+normalize). Inert
+    # everywhere else, so the default costs nothing on a CPU box or a GBDT run.
+    #
+    # The knob exists because "the transform moved to the GPU" changes where a
+    # slow run's time is going, and finding that out from a wall-clock number is
+    # the failure this repo keeps designing against. Turn it off to compare.
+    device_transform: bool = True
 
 
 class SplitConfig(BaseModel):

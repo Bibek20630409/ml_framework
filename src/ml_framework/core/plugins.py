@@ -42,13 +42,13 @@ from .types import (
     DIST_NAME,
     Capabilities,
     DataKind,
+    DecoderStage,
     FrameworkError,
     Integrity,
     LandsIn,
     Layout,
     Payload,
     Requirement,
-    Stage,
     Task,
     unmet_requirements,
 )
@@ -271,7 +271,8 @@ class DecoderSpec:
     The three declared columns each have exactly one named consumer:
 
     * ``stages`` — ``mlf decoders --show``, and ``materialize`` (which only times a
-      stage that is declared).
+      stage that is declared). The *head* of the pipeline only; the tail is
+      declared by ``BasePreprocessor.stages``.
     * ``lands_in`` — ``BundleDataModule``, which skips pinning and forces
       ``num_workers=0`` when a decoder returns device memory.
     * ``integrity`` — the corrupt-sample policy, which refuses to run a corpus
@@ -298,7 +299,11 @@ class DecoderSpec:
     # Which of read/demux/decode this decoder actually performs. The methods always
     # exist (BaseDecoder supplies defaults), so this is a declaration, not a
     # capability check — no caller branches on it.
-    stages: frozenset[Stage] = frozenset({"decode"})
+    #
+    # Typed `DecoderStage`, not `Stage`: the four tail stages (construct, transform,
+    # h2d, gpu_transform) belong to the preprocessor and the transport layer, and a
+    # decoder claiming one would be a claim nothing executes.
+    stages: frozenset[DecoderStage] = frozenset({"decode"})
     # What `decode()` leaves in memory, BEFORE any tensor is built. Decode and
     # tensor construction are independent axes, so recording the decoder's own
     # output dtype is what makes the cost of the conversion visible.
