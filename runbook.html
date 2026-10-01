@@ -1,0 +1,1362 @@
+<title>ML Pipeline Runbook — ml_framework v2.0.0</title>
+<style>
+  :root {
+    --bg: #F4F6F9;
+    --surface: #FFFFFF;
+    --surface-2: #FAFBFC;
+    --ink: #171B24;
+    --ink-soft: #566072;
+    --ink-faint: #8A93A3;
+    --border: #E3E7EE;
+    --border-strong: #CDD4DF;
+
+    --train: #B65E17; --train-tint: #FBF0E4; --train-edge: #EAD3B8;
+    --serve: #0F736D; --serve-tint: #E2F1F0; --serve-edge: #B9DDDA;
+    --bundle: #444AA0; --bundle-tint: #ECEDF8; --bundle-edge: #C9CCEC;
+    --shared: #4A5568; --shared-tint: #EEF0F3; --shared-edge: #D6DAE1;
+
+    --fix: #B0203A; --fix-tint: #FBE9EC; --fix-edge: #EEC3CB;
+
+    --mono: ui-monospace, "Cascadia Code", "SF Mono", "Segoe UI Mono", Menlo, Consolas, monospace;
+    --sans: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    --shadow: 0 1px 2px rgba(20,27,40,.04), 0 6px 18px rgba(20,27,40,.06);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0D1015; --surface: #161A21; --surface-2: #1B2028;
+      --ink: #E8EBF1; --ink-soft: #9BA5B4; --ink-faint: #6B7484;
+      --border: #262C37; --border-strong: #333B48;
+      --train: #E39A55; --train-tint: #241B12; --train-edge: #3B2C1A;
+      --serve: #4CB8B1; --serve-tint: #102220; --serve-edge: #1D3A37;
+      --bundle: #9297EC; --bundle-tint: #191A2C; --bundle-edge: #2E3055;
+      --shared: #A6B0BF; --shared-tint: #1C222B; --shared-edge: #333B48;
+      --fix: #F2889B; --fix-tint: #2A151A; --fix-edge: #4A2530;
+      --shadow: 0 1px 2px rgba(0,0,0,.3), 0 8px 22px rgba(0,0,0,.35);
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #0D1015; --surface: #161A21; --surface-2: #1B2028;
+    --ink: #E8EBF1; --ink-soft: #9BA5B4; --ink-faint: #6B7484;
+    --border: #262C37; --border-strong: #333B48;
+    --train: #E39A55; --train-tint: #241B12; --train-edge: #3B2C1A;
+    --serve: #4CB8B1; --serve-tint: #102220; --serve-edge: #1D3A37;
+    --bundle: #9297EC; --bundle-tint: #191A2C; --bundle-edge: #2E3055;
+    --shared: #A6B0BF; --shared-tint: #1C222B; --shared-edge: #333B48;
+    --fix: #F2889B; --fix-tint: #2A151A; --fix-edge: #4A2530;
+    --shadow: 0 1px 2px rgba(0,0,0,.3), 0 8px 22px rgba(0,0,0,.35);
+  }
+  :root[data-theme="light"] {
+    --bg: #F4F6F9; --surface: #FFFFFF; --surface-2: #FAFBFC;
+    --ink: #171B24; --ink-soft: #566072; --ink-faint: #8A93A3;
+    --border: #E3E7EE; --border-strong: #CDD4DF;
+    --train: #B65E17; --train-tint: #FBF0E4; --train-edge: #EAD3B8;
+    --serve: #0F736D; --serve-tint: #E2F1F0; --serve-edge: #B9DDDA;
+    --bundle: #444AA0; --bundle-tint: #ECEDF8; --bundle-edge: #C9CCEC;
+    --shared: #4A5568; --shared-tint: #EEF0F3; --shared-edge: #D6DAE1;
+    --fix: #B0203A; --fix-tint: #FBE9EC; --fix-edge: #EEC3CB;
+    --shadow: 0 1px 2px rgba(20,27,40,.04), 0 6px 18px rgba(20,27,40,.06);
+  }
+
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font-family: var(--sans); line-height: 1.5; -webkit-font-smoothing: antialiased; }
+  .wrap { max-width: 940px; margin: 0 auto; padding: clamp(1.5rem,4vw,3rem) clamp(1rem,3vw,1.5rem) 4rem; }
+
+  header { margin-bottom: 2rem; }
+  .eyebrow { font-family: var(--mono); font-size: .72rem; letter-spacing: .14em; text-transform: uppercase; color: var(--ink-faint); margin: 0 0 .7rem; }
+  h1 { font-size: clamp(1.6rem,1rem+2.6vw,2.5rem); line-height: 1.1; letter-spacing: -.02em; text-wrap: balance; margin: 0 0 .8rem; font-weight: 680; }
+  .lede { max-width: 62ch; color: var(--ink-soft); font-size: 1rem; margin: 0; }
+  .lede b { color: var(--ink); font-weight: 600; }
+
+  .legend { display: flex; flex-wrap: wrap; gap: .8rem 1.4rem; margin-top: 1.5rem; font-size: .82rem; }
+  .legend span { display: inline-flex; align-items: center; gap: .5rem; color: var(--ink-soft); }
+  .sw { width: 13px; height: 13px; border-radius: 4px; flex: none; }
+  .sw-train { background: var(--train); } .sw-serve { background: var(--serve); }
+  .sw-bundle { background: var(--bundle); } .sw-shared { background: var(--shared); }
+
+  .phase { margin: 2rem 0 0; background: var(--ink); color: var(--bg); border-radius: 10px; padding: .7rem 1.1rem; display: flex; align-items: baseline; gap: .7rem; flex-wrap: wrap; box-shadow: var(--shadow); }
+  @media (prefers-color-scheme: dark) { .phase { background: var(--surface-2); color: var(--ink); border: 1px solid var(--border-strong); } }
+  :root[data-theme="dark"] .phase { background: var(--surface-2); color: var(--ink); border: 1px solid var(--border-strong); }
+  :root[data-theme="light"] .phase { background: var(--ink); color: var(--bg); border: none; }
+  .phase .pn { font-family: var(--mono); font-size: .72rem; letter-spacing: .1em; opacity: .7; }
+  .phase .pt { font-weight: 650; font-size: .98rem; letter-spacing: -.01em; }
+
+  .arrow { display: flex; justify-content: center; align-items: center; height: 30px; color: var(--border-strong); }
+  .arrow svg { width: 16px; height: 30px; }
+  .arrow.short { height: 20px; }
+
+  .node { background: var(--surface); border: 1px solid var(--border); border-left: 3px solid var(--shared); border-radius: 10px; padding: .85rem 1rem; box-shadow: var(--shadow); }
+  .node.t { border-left-color: var(--train); background: linear-gradient(var(--train-tint),var(--train-tint)) padding-box; border-color: var(--train-edge); }
+  .node.s { border-left-color: var(--serve); background: linear-gradient(var(--serve-tint),var(--serve-tint)) padding-box; border-color: var(--serve-edge); }
+  .node.b { border-left-color: var(--bundle); background: linear-gradient(var(--bundle-tint),var(--bundle-tint)) padding-box; border-color: var(--bundle-edge); }
+  .node-head { display: flex; align-items: baseline; gap: .6rem; flex-wrap: wrap; margin-bottom: .35rem; }
+  .step-badge { font-family: var(--mono); font-size: .68rem; font-weight: 600; letter-spacing: .04em; color: var(--ink-faint); text-transform: uppercase; }
+  .node h3 { margin: 0; font-size: 1rem; font-weight: 640; letter-spacing: -.01em; }
+  .node p { margin: .3rem 0 0; font-size: .85rem; color: var(--ink-soft); }
+  .node p code, .note code { font-family: var(--mono); font-size: .86em; }
+  .node pre { margin: .55rem 0 0; font-family: var(--mono); font-size: .74rem; background: var(--surface-2); border: 1px solid var(--border); border-radius: 7px; padding: .5rem .6rem; overflow-x: auto; color: var(--ink); line-height: 1.55; }
+  /* commands added or changed in the operational-procedure pass */
+  .node pre .new { color: var(--fix); }
+  .node.t pre, .node.s pre, .node.b pre { border-color: rgba(0,0,0,.06); }
+  @media (prefers-color-scheme: dark) { .node.t pre, .node.s pre, .node.b pre { border-color: rgba(255,255,255,.07); } }
+  :root[data-theme="dark"] .node.t pre, :root[data-theme="dark"] .node.s pre, :root[data-theme="dark"] .node.b pre { border-color: rgba(255,255,255,.07); }
+
+  .tag { font-family: var(--mono); font-size: .62rem; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; padding: .12rem .45rem; border-radius: 5px; }
+  .tag-train { background: var(--train); color: #fff; } .tag-serve { background: var(--serve); color: #fff; }
+  .tag-shared { background: var(--shared); color: #fff; } .tag-bundle { background: var(--bundle); color: #fff; }
+  .tag-manual { background: var(--fix); color: #fff; }
+  @media (prefers-color-scheme: dark) { .tag-train,.tag-serve,.tag-shared,.tag-bundle,.tag-manual { color: #10131A; } }
+  :root[data-theme="dark"] .tag-train, :root[data-theme="dark"] .tag-serve, :root[data-theme="dark"] .tag-shared, :root[data-theme="dark"] .tag-bundle, :root[data-theme="dark"] .tag-manual { color: #10131A; }
+  :root[data-theme="light"] .tag-train, :root[data-theme="light"] .tag-serve, :root[data-theme="light"] .tag-shared, :root[data-theme="light"] .tag-bundle, :root[data-theme="light"] .tag-manual { color: #fff; }
+
+  /* make-target / trigger chips */
+  .chips { display: flex; flex-wrap: wrap; gap: .4rem; margin-top: .55rem; }
+  .chip { font-family: var(--mono); font-size: .68rem; color: var(--ink-soft); background: var(--surface-2); border: 1px solid var(--border); border-radius: 999px; padding: .16rem .55rem; }
+  .chip b { color: var(--ink); font-weight: 600; }
+  .node.t .chip, .node.s .chip, .node.b .chip { background: rgba(255,255,255,.5); }
+  @media (prefers-color-scheme: dark) { .node.t .chip, .node.s .chip, .node.b .chip { background: rgba(255,255,255,.04); } }
+  :root[data-theme="dark"] .node.t .chip, :root[data-theme="dark"] .node.s .chip, :root[data-theme="dark"] .node.b .chip { background: rgba(255,255,255,.04); }
+
+  /* command → the file that actually executes it */
+  .runs { margin-top: .6rem; border: 1px solid var(--border); border-radius: 8px; background: var(--surface-2); overflow: hidden; }
+  .node.t .runs, .node.s .runs, .node.b .runs { background: rgba(255,255,255,.45); border-color: rgba(0,0,0,.08); }
+  @media (prefers-color-scheme: dark) { .node.t .runs, .node.s .runs, .node.b .runs { background: rgba(255,255,255,.03); border-color: rgba(255,255,255,.08); } }
+  :root[data-theme="dark"] .node.t .runs, :root[data-theme="dark"] .node.s .runs, :root[data-theme="dark"] .node.b .runs { background: rgba(255,255,255,.03); border-color: rgba(255,255,255,.08); }
+  .runs .rh { font-family: var(--mono); font-size: .6rem; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; color: var(--ink-faint); padding: .42rem .6rem .34rem; }
+  .runs dl { margin: 0; display: grid; grid-template-columns: minmax(8rem, 17rem) 1fr; }
+  .runs dt, .runs dd { margin: 0; padding: .34rem .6rem; font-family: var(--mono); font-size: .71rem; line-height: 1.5; border-top: 1px solid var(--border); overflow-wrap: anywhere; }
+  .node.t .runs dt, .node.t .runs dd, .node.s .runs dt, .node.s .runs dd, .node.b .runs dt, .node.b .runs dd { border-color: rgba(0,0,0,.07); }
+  @media (prefers-color-scheme: dark) { .node.t .runs dt, .node.t .runs dd, .node.s .runs dt, .node.s .runs dd, .node.b .runs dt, .node.b .runs dd { border-color: rgba(255,255,255,.07); } }
+  :root[data-theme="dark"] .node.t .runs dt, :root[data-theme="dark"] .node.t .runs dd, :root[data-theme="dark"] .node.s .runs dt, :root[data-theme="dark"] .node.s .runs dd, :root[data-theme="dark"] .node.b .runs dt, :root[data-theme="dark"] .node.b .runs dd { border-color: rgba(255,255,255,.07); }
+  .runs dt { color: var(--ink); font-weight: 600; }
+  .runs dd { color: var(--ink-soft); }
+  .runs dd b { color: var(--ink); font-weight: 600; }
+  .runs dd i { font-style: normal; color: var(--ink-faint); }
+  @media (max-width: 560px) {
+    .runs dl { grid-template-columns: 1fr; }
+    .runs dt { padding-bottom: .08rem; }
+    .runs dd { border-top: none; padding-top: 0; }
+    .runs dl > dt:first-of-type { border-top: 1px solid var(--border); }
+  }
+
+  .note { margin-top: .55rem; display: flex; gap: .5rem; align-items: flex-start; font-size: .8rem; color: var(--ink-soft); background: var(--shared-tint); border: 1px solid var(--shared-edge); border-radius: 7px; padding: .45rem .6rem; }
+  .note b { font-weight: 700; color: var(--ink); }
+  .note .l { font-family: var(--mono); font-size: .6rem; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; flex: none; padding-top: .1rem; color: var(--ink-faint); }
+
+  .node.loop { border-style: dashed; border-left-style: solid; border-left-color: var(--fix); background: var(--fix-tint); border-color: var(--fix-edge); }
+  .node.loop h3 { color: var(--fix); }
+  .node.loop .note { background: transparent; border-color: var(--fix-edge); color: var(--fix); }
+  .node.loop .note .l { color: var(--fix); }
+  .node.loop .note b { color: var(--fix); }
+
+  table.fmt { width: 100%; border-collapse: collapse; margin-top: .6rem; font-size: .78rem; }
+  table.fmt th, table.fmt td { text-align: left; padding: .3rem .5rem; border-bottom: 1px solid var(--border); }
+  table.fmt th { font-family: var(--mono); font-size: .66rem; text-transform: uppercase; letter-spacing: .06em; color: var(--ink-faint); font-weight: 600; }
+  table.fmt td { color: var(--ink-soft); }
+  table.fmt td code { font-family: var(--mono); font-size: .88em; color: var(--ink); }
+  .node.s table.fmt th, .node.s table.fmt td { border-color: var(--serve-edge); }
+  .node.t table.fmt th, .node.t table.fmt td { border-color: var(--train-edge); }
+  .node.b table.fmt th, .node.b table.fmt td { border-color: var(--bundle-edge); }
+
+  .footnote { margin-top: 2.5rem; padding-top: 1.3rem; border-top: 1px solid var(--border); font-size: .85rem; color: var(--ink-soft); }
+  .footnote b { color: var(--ink); }
+  .footnote p { margin: 0 0 .7rem; }
+
+  @media (prefers-reduced-motion: reduce) { * { scroll-behavior: auto; } }
+</style>
+
+<div class="wrap">
+  <header>
+    <p class="eyebrow">ml_framework v2.0.0 · complete lifecycle runbook</p>
+    <h1>The pipeline, as it actually runs</h1>
+    <p class="lede">Every command in the repo, in the order you'd actually type them — stage&nbsp;0 from a clean clone through stage&nbsp;15 in production. Two things to hold onto: this is <b>not one straight line</b> (a <b>training path</b> and an <b>inference path</b> that meet only at the model bundle), and the later stages fire on <b>their own triggers</b>, not because the stage above finished. Data that has to be <b>decoded</b> takes one extra fork at stage&nbsp;5b.</p>
+    <p class="lede" style="margin-top:.7rem">Every block is followed by a <b>what actually runs</b> table: the command on the left, the repo file that executes it on the right, with the line number of the entry point where one exists. Paths are repo-relative; <code>file:line</code> pairs point at the function the command lands in.</p>
+    <p class="lede" style="margin-top:.7rem">Where exit&nbsp;0 is not proof, a second table — <b>what a healthy result looks like</b> — says what to read and what the answer should be, and a <b>symptom&nbsp;→&nbsp;cause&nbsp;→&nbsp;command</b> table says where to go when it isn't. Both exist because of the rule this page is built on: <b>every claim here is a state you have to observe, not one the command prints.</b> Most commands below can fail while exiting&nbsp;0 — a model that lost to its own baseline, a corpus that dropped a tenth of its samples, an ONNX graph missing its preprocessor, an Airflow task that <i>cannot</i> turn red. Each of those is named at the stage it happens in.</p>
+
+    <div class="legend">
+      <span><i class="sw sw-shared"></i> Shared / dev-loop</span>
+      <span><i class="sw sw-train"></i> Training path</span>
+      <span><i class="sw sw-bundle"></i> The handoff bundle</span>
+      <span><i class="sw sw-serve"></i> Inference path</span>
+      <span><i class="sw" style="background:var(--fix)"></i> <b style="color:var(--fix);font-weight:600">Red in a command block</b>&nbsp;— added or changed in the operational-procedure pass</span>
+    </div>
+  </header>
+
+  <!-- PHASE 1 -->
+  <div class="phase" id="phase-1"><span class="pn">PHASE 1</span><span class="pt">Bootstrap, discovery &amp; quality controls</span></div>
+  <div class="arrow short"><svg viewBox="0 0 16 30"><path d="M8 0 V22 M2 16 L8 24 L14 16" fill="none" stroke="currentColor" stroke-width="1.6"/></svg></div>
+
+  <div class="node" id="stage-0">
+    <div class="node-head"><span class="step-badge">Stage 0</span><h3>Bootstrap the clone</h3><span class="tag tag-shared">shared</span></div>
+    <p><b>The base install carries no ML runtime.</b> You pick the model families you need from 19 extras — and the editable install is what generates the <code>mlf</code> executable from <code>[project.scripts]</code>.</p>
+    <pre>pip install -e ".[lightning]"   # MLP / CNN — pulls torch + pytorch-lightning
+pip install -e ".[gbdt]"        # XGBoost / LightGBM / CatBoost, with no torch at all
+pip install -e ".[gbdt,serve]"  # + FastAPI, to serve a tree model — ~500 MB lighter
+pip install -e ".[audio]"       # soundfile + torchaudio — FLAC/WAV decode, the mel front-end
+pip install -e ".[video]"       # PyAV — MP3 frame-sync, Ogg pages, MP4 boxes, H.264
+pip install -e ".[dev]"         # every runtime + the toolchain, for running the suite
+
+mlf --help                      # confirm the console script resolved; lists all 15 verbs
+pre-commit install              # git hook: black, isort, ruff and mypy run before each commit
+cp .env.example .env            # then set MINIO_*, AWS_*, MLF_API_KEY
+<span class="new">
+# --- what tells you it worked -------------------------------------------
+pip check                       # the extras above can and do disagree with each other
+python -c "import torch, torchvision; print(torch.__version__, torchvision.__version__)"
+#   run this AFTER any [image]/[audio]/[video] install — see the note below
+pre-commit run --all-files      # proves the hook works now, not at your first commit
+grep -c . .env                  # a copied-but-unedited .env is the classic stage-4 failure</span></pre>
+    <div class="runs">
+      <div class="rh">what actually runs</div>
+      <dl>
+        <dt>pip install -e ".[…]"</dt>
+        <dd><b>pyproject.toml</b><i>:29</i> <code>[project.optional-dependencies]</code> — the 19 extras, one list each</dd>
+        <dt>the <code>mlf</code> executable</dt>
+        <dd><b>pyproject.toml</b><i>:166–167</i> <code>[project.scripts] mlf = "ml_framework.cli:main"</code></dd>
+        <dt>mlf --help</dt>
+        <dd><b>src/ml_framework/cli.py</b><i>:544</i> <code>build_parser()</code> — every verb is one <code>sub.add_parser</code> in here</dd>
+        <dt>pre-commit install</dt>
+        <dd><b>.pre-commit-config.yaml</b> — black, isort, ruff, mypy hooks</dd>
+        <dt>cp .env.example .env</dt>
+        <dd><b>.env.example</b> — read at runtime by <b>docker-compose.yml</b> and <b>src/ml_framework/serving/asgi.py</b></dd>
+        <dt>make install / install-mlops</dt>
+        <dd><b>Makefile</b><i>:10</i> and <i>:15</i></dd>
+      </dl>
+    </div>
+    <div class="chips"><span class="chip"><b>make install</b></span><span class="chip"><b>make install-mlops</b></span><span class="chip">once per clone</span></div>
+    <div class="note"><span class="l">note</span><div><b>torch, torchvision and torchaudio are one pair-wise family.</b> Every torchvision and torchaudio release pins one exact torch patch, so install <code>[lightning,image,audio]</code> together and from one index — a bare <code>[image]</code> or <code>[audio]</code> silently replaces your torch to match.</div></div>
+    <div class="note"><span class="l">split</span><div><code>[video]</code> installs the <b>decoder</b>, not a model. <code>video.r3d</code> is <code>torchvision.models.video.r3d_18</code> and costs nothing beyond <code>[image]</code>; only reading an MP4 needs PyAV. The two are separate extras because conflating them would make one of the two <code>pip install</code> hints wrong.</div></div>
+  </div>
+  <div class="arrow"><svg viewBox="0 0 16 30"><path d="M8 0 V22 M2 16 L8 24 L14 16" fill="none" stroke="currentColor" stroke-width="1.6"/></svg></div>
+
+  <div class="node" id="stage-1">
+    <div class="node-head"><span class="step-badge">Stage 1</span><h3>See what this install can train</h3><span class="tag tag-shared">shared</span></div>
+    <p>The only commands that take <b>no config at all</b> — they describe the framework, not a run. This is the intended first move after installing.</p>
+    <pre>mlf models              # every registered model, its backend, and whether it is ready
+mlf models --show       # plus tasks, data kinds and each model's own search space
+mlf models --all        # plus third-party plugins that failed to *import*
+mlf backends            # the fit-loop shapes: lightning · gbdt · forecast
+mlf data-backends       # the processing engines: local · polars · spark
+mlf decoders            # the media formats, and HOW EACH ONE FAILS
+mlf decoders --show     # plus stages, output dtype/layout, and the integrity note</pre>
+    <div class="runs">
+      <div class="rh">what actually runs</div>
+      <dl>
+        <dt>all four verbs</dt>
+        <dd><b>src/ml_framework/cli.py</b><i>:955–971</i> — one shared branch that picks a registry, then <code>_print_plugins()</code> at <i>:419</i></dd>
+        <dt>the registries themselves</dt>
+        <dd><b>src/ml_framework/core/registry.py</b><i>:135–145</i> — <code>MODELS</code> · <code>BACKENDS</code> · <code>DATA_BACKENDS</code> · <code>DECODERS</code></dd>
+        <dt>what fills them</dt>
+        <dd><b>src/ml_framework/plugins/__init__.py</b> · <b>backends/__init__.py</b> · <b>data/backends/__init__.py</b> · <b>data/streaming/decoders/__init__.py</b> — imported for their side effect at <b>cli.py</b><i>:958–963</i></dd>
+        <dt>--show / the 2nd column</dt>
+        <dd><b>src/ml_framework/cli.py</b><i>:480</i> <code>_second_column()</code> and <i>:496</i> <code>_format_detail()</code></dd>
+        <dt>the integrity values</dt>
+        <dd><b>src/ml_framework/data/streaming/integrity.py</b>; each decoder declares its own in <b>data/streaming/decoders/*.py</b></dd>
+      </dl>
+    </div>
+    <div class="note"><span class="l">note</span><div>These deliberately list models whose optional extra is <b>missing</b>, each with the <code>pip install</code> line that fixes it. Listing only what happens to be installed would describe the machine rather than the framework.</div></div>
+    <div class="note"><span class="l">integrity</span><div><code>mlf decoders</code>' second column is not "is it installed" — it is <b>what a failure surfaces</b>, which is the one thing you cannot discover by trying it. Four values, and the last two are why the offline pass in stage&nbsp;5b exists at all.
+    <table class="fmt" style="margin-top:.45rem">
+      <tr><th>value</th><th>meaning</th><th>formats</th></tr>
+      <tr><td><code>checked</code></td><td>a verified checksum; damage <b>raises</b></td><td>FLAC (CRC-16) · PNG (Adler-32 + CRC-32) · Opus (page CRC)</td></tr>
+      <tr><td><code>loud</code></td><td>no checksum, but structural damage raises</td><td>WAV · JPEG · MP4 (missing <code>moov</code>)</td></tr>
+      <tr><td><code>silent</code></td><td>valid-shaped <b>wrong</b> result, <b>no error</b></td><td>MP3 resync · mid-stream H.264 · NVDEC</td></tr>
+      <tr><td><code>none</code></td><td>no integrity information exists at all</td><td>flat <code>uint16</code> token shards</td></tr>
+    </table></div></div>
+  </div>
+  <div class="arrow"><svg viewBox="0 0 16 30"><path d="M8 0 V22 M2 16 L8 24 L14 16" fill="none" stroke="currentColor" stroke-width="1.6"/></svg></div>
+
+  <div class="node" id="stage-2">
+    <div class="node-head"><span class="step-badge">Stage 2</span><h3>Quality gates</h3><span class="tag tag-shared">shared</span></div>
+    <p>Lint, format, type-check, test — guards both paths. Identical to what CI re-runs on push, across Python 3.10–3.14.</p>
+    <pre>make format   # black src tests ; isort src tests
+make lint     # ruff check src tests ; black --check src tests
+make type     # mypy src
+make test     # pytest
+make cov      # pytest --cov=ml_framework --cov-report=term-missing --cov-report=xml</pre>
+    <div class="runs">
+      <div class="rh">what actually runs</div>
+      <dl>
+        <dt>make format · lint · type</dt>
+        <dd><b>Makefile</b><i>:18 · :22 · :26</i> — tool settings in <b>pyproject.toml</b> (<code>[tool.black]</code>, <code>[tool.ruff]</code>, <code>[tool.isort]</code>, <code>[tool.mypy]</code>)</dd>
+        <dt>make test · cov</dt>
+        <dd><b>Makefile</b><i>:29 · :32</i> → <b>pyproject.toml</b><i>:196</i> <code>[tool.pytest.ini_options]</code>, which sets <code>testpaths</code>, <code>addopts</code> and the markers</dd>
+        <dt>the same gates in CI</dt>
+        <dd><b>.github/workflows/ci.yml</b><i>:9</i> job <code>test</code> — steps <i>Lint</i> <i>:40</i>, <i>Type check</i> <i>:44</i>, <i>Test</i> <i>:46</i></dd>
+      </dl>
+    </div>
+    <div class="chips"><span class="chip"><b>make lint type test</b></span><span class="chip">coverage floor: 80%</span></div>
+  </div>
+  <div class="arrow"><svg viewBox="0 0 16 30"><path d="M8 0 V22 M2 16 L8 24 L14 16" fill="none" stroke="currentColor" stroke-width="1.6"/></svg></div>
+
+  <!-- PHASE 2 -->
+  <div class="phase" id="phase-2"><span class="pn">PHASE 2</span><span class="pt">Images &amp; the local stack</span></div>
+  <div class="arrow short"><svg viewBox="0 0 16 30"><path d="M8 0 V22 M2 16 L8 24 L14 16" fill="none" stroke="currentColor" stroke-width="1.6"/></svg></div>
+
+  <div class="node" id="stage-3">
+    <div class="node-head"><span class="step-badge">Stage 3</span><h3>Build the images</h3><span class="tag tag-shared">shared</span></div>
+    <p>One Dockerfile, five stages — but they are a <b>dependency graph, not a sequence</b>. <code>src</code> and <code>base</code> are shared intermediates, built once and cached and never named on the command line. The three real targets are independent siblings: building one never builds another, and none of them has to exist before the others.</p>
+    <pre>src ──┬── base ──┬── train         ENTRYPOINT mlf, for batch training jobs
+      │          └── serve         gunicorn API, deep-learning models
+      └── serve-gbdt               same API, no torch — branches off src
+
+docker build --target train      -t ml-framework-train .
+docker build --target serve      -t ml-framework-serve .
+docker build --target serve-gbdt -t ml-framework-serve-gbdt .
+
+docker build -t ml-framework .   # no --target → Docker builds the LAST stage, which is train
+<span class="new">
+# --- what tells you it worked -------------------------------------------
+docker images | grep ml-framework            # all three tagged, and their sizes
+docker image inspect ml-framework-serve --format '{{.Config.Cmd}}'
+docker run --rm ml-framework-train --help    # ENTRYPOINT is mlf — this IS `mlf --help`
+
+# the two claims in the notes below, checked rather than trusted.
+docker run --rm --entrypoint sh ml-framework-serve -c 'ls /app/outputs 2&gt;&amp;1'  # no model
+docker run --rm --entrypoint python ml-framework-serve-gbdt -c "import torch"  # must FAIL</span></pre>
+    <div class="runs">
+      <div class="rh">what actually runs</div>
+      <dl>
+        <dt>every docker build here</dt>
+        <dd><b>Dockerfile</b> — <code>src</code> <i>:6</i> · <code>base</code> <i>:21</i> · <code>serve</code> <i>:29</i> · <code>serve-gbdt</code> <i>:54</i> · <code>train</code> <i>:65</i>. <code>train</code> being written last is what a bare <code>docker build</code> picks</dd>
+        <dt>what the images run</dt>
+        <dd><code>serve</code> / <code>serve-gbdt</code> <code>CMD</code> at <b>Dockerfile</b><i>:38 · :59</i> → <b>src/ml_framework/serving/asgi.py</b>; <code>train</code> <code>ENTRYPOINT</code> at <i>:67</i> → the <code>mlf</code> console script</dd>
+        <dt>what gets copied in</dt>
+        <dd><b>.dockerignore</b> decides the context; the <code>src</code> stage copies <code>src/</code> and <code>configs/</code> only</dd>
+        <dt>make docker-serve</dt>
+        <dd><b>Makefile</b><i>:47</i></dd>
+      </dl>
+    </div>
+    <div class="runs">
+      <div class="rh">what a healthy result looks like</div>
+      <dl>
+        <dt>docker build (exit 0)</dt>
+        <dd>proves <b>the layers built</b>, and nothing else. <i>No stage here runs the entrypoint, so an <code>mlf</code> that cannot import also exits 0 — the build is not a smoke test</i></dd>
+        <dt>docker images</dt>
+        <dd>three tags, none of them <code>&lt;none&gt;</code>. <b><code>serve-gbdt</code> is dramatically smaller than <code>serve</code></b> <i>— if the two are close, torch arrived in the gbdt image through a transitive pin</i></dd>
+        <dt>docker run … train --help</dt>
+        <dd><b>the <code>mlf</code> usage block and exit 0.</b> <i>The only proof the console script resolved inside the image. A bare <code>docker build</code> that succeeded and an <code>mlf</code> that is not on PATH look identical until this runs</i></dd>
+        <dt>… serve-gbdt -c "import torch"</dt>
+        <dd><b>ModuleNotFoundError and exit 1 — that is the pass.</b> <i>Exit 0 means torch leaked in, and CI's <code>gbdt-no-torch</code> job is then the only thing still guarding the boundary</i></dd>
+        <dt>ls /app/outputs</dt>
+        <dd><b>empty or absent</b> — the "no model" claim below, made falsifiable. <i>Anything listed here means a bundle was baked into the image and it is no longer a runtime</i></dd>
+        <dt>image inspect .Config.Cmd</dt>
+        <dd><code>serve</code> / <code>serve-gbdt</code> → the gunicorn <code>CMD</code>; <code>train</code> → <b>empty</b>, because that stage sets <code>ENTRYPOINT</code> with no <code>CMD</code></dd>
+      </dl>
+    </div>
+    <div class="chips"><span class="chip"><b>make docker-serve</b></span><span class="chip">optional — stage 4 builds what it needs</span></div>
+    <div class="note"><span class="l">order</span><div>Listed train-first to match this page, not the Dockerfile — where <code>serve</code> is written above <code>train</code> so the two serving variants sit together. <b>Neither order means anything at build time.</b> The one place it does matter is a bare <code>docker build</code> with no <code>--target</code>, which takes whichever stage is last.</div></div>
+    <div class="note"><span class="l">no model</span><div><b>None of these images contains a model</b> — the Dockerfile copies <code>src/</code> and <code>configs/</code> and nothing else. A serving image is a <i>runtime</i>, not an artifact: the bundle arrives later, either mounted (<code>./outputs:/app/outputs:ro</code>) or pulled from the registry. That is why one can be built here with nothing trained yet — and it has to be, since stage&nbsp;4's <code>api</code> service builds from <code>--target serve</code> before any model exists.</div></div>
+    <div class="note"><span class="l">note</span><div>The trade-off worth knowing: these targets can be built early <i>because</i> they are guesses — a fixed extras list chosen without knowing your model, and six of the twelve model families fall outside both. <code>mlf dockerfile</code> (stage&nbsp;9) installs exactly what the bundle declared in <code>manifest.requires</code>, third-party plugins included — which is also why it <b>cannot</b> run until stage&nbsp;8 has produced a bundle to read.</div></div>
+  </div>
+  <div class="arrow"><svg viewBox="0 0 16 30"><path d="M8 0 V22 M2 16 L8 24 L14 16" fill="none" stroke="currentColor" stroke-width="1.6"/></svg></div>
+
+  <div class="node" id="stage-4">
+    <div class="node-head"><span class="step-badge">Stage 4</span><h3>Bring up the local stack</h3><span class="tag tag-shared">shared</span></div>
+    <p>Five services at once: api, mlflow, minio, prometheus, grafana. The <code>train</code> service sits behind a <code>tools</code> profile, so <code>up</code> deliberately skips it.</p>
+    <pre>docker compose up --build   # rebuild what changed, then start all five in the foreground
+docker compose ps           # which services came up, and which ports they landed on
+# api :8000 · mlflow :5000 · prometheus :9090 · grafana :3000 (admin/admin) · minio :9001
+
+docker compose down         # stop and remove them; -v also drops mlflow-data / minio-data
+<span class="new">
+# --- what tells you it worked -------------------------------------------
+docker compose ps           # five services, every State "running" — read the column
+curl -s localhost:8000/health         # the api is the one that can come up empty
+curl -s localhost:5000/health         # mlflow
+curl -s localhost:9090/-/healthy      # prometheus
+
+# --- why it failed, if it did -------------------------------------------
+docker compose logs --tail=30 api     # an exited api almost always died on the bundle
+docker compose ps -a                  # -a also shows the ones that exited immediately</span></pre>
+    <div class="runs">
+      <div class="rh">what actually runs</div>
+      <dl>
+        <dt>docker compose up / ps / down</dt>
+        <dd><b>docker-compose.yml</b> — <code>api</code> <i>:12</i> · <code>train</code> <i>:29</i> (profile <code>tools</code>, <i>:38</i>) · <code>mlflow</code> <i>:40</i> · <code>minio</code> <i>:57</i> · <code>prometheus</code> <i>:69</i> · <code>grafana</code> <i>:76</i></dd>
+        <dt>what the <code>api</code> service runs</dt>
+        <dd><b>docker-compose.yml</b><i>:25</i> <code>command: mlf serve --artifacts outputs …</code> → <b>src/ml_framework/cli.py</b><i>:1137</i> → <b>src/ml_framework/serving/api.py</b><i>:75</i> <code>create_app()</code></dd>
+        <dt>prometheus / grafana config</dt>
+        <dd><b>deploy/monitoring/prometheus.yml</b> · <b>deploy/monitoring/grafana/provisioning/</b> · dashboard JSON at <b>deploy/monitoring/grafana/dashboards/ml-framework.json</b>, all bind-mounted</dd>
+        <dt>make stack-up / stack-down</dt>
+        <dd><b>Makefile</b><i>:52 · :55</i></dd>
+      </dl>
+    </div>
+    <div class="runs">
+      <div class="rh">what a healthy result looks like</div>
+      <dl>
+        <dt>docker compose ps</dt>
+        <dd><b>five rows, every State <code>running</code></b> — and <code>train</code> absent, which is correct: it sits behind the <code>tools</code> profile. <i><code>ps</code> without <code>-a</code> hides a service that already exited, so a four-row table looks like a short list rather than a failure</i></dd>
+        <dt>curl /health on :8000</dt>
+        <dd>JSON with <code>"status":"ok"</code> plus <code>task</code>, <code>model</code>, <code>backend</code>, <code>n_features</code>. <b>This is the only service that can be "up" and useless</b> <i>— the container runs, the model did not load</i></dd>
+        <dt>a connection refused on :8000</dt>
+        <dd>the api exited. <b>The usual cause is an empty <code>outputs/</code></b> <i>— the mount is read-only and <code>mlf serve --artifacts outputs</code> has nothing to read, which is the ordering trap below</i></dd>
+        <dt>grafana on :3000</dt>
+        <dd>logs in at <code>admin/admin</code> and the <i>ML Framework — Serving</i> dashboard is already provisioned. <i>An empty dashboard list means the bind-mount path was wrong, not that provisioning is off</i></dd>
+      </dl>
+    </div>
+    <div class="chips"><span class="chip"><b>make stack-up</b></span><span class="chip"><b>make stack-down</b></span></div>
+    <div class="note"><span class="l">order</span><div>The <code>api</code> service mounts <code>./outputs</code> <b>read-only</b> and its command is <code>mlf serve --artifacts outputs</code>. Start it before a bundle exists and it has nothing to load — run stage&nbsp;8 first, or bring up only <code>mlflow minio</code> here.</div></div>
+  </div>
+  <div class="arrow"><svg viewBox="0 0 16 30"><path d="M8 0 V22 M2 16 L8 24 L14 16" fill="none" stroke="currentColor" stroke-width="1.6"/></svg></div>
+
+  <!-- PHASE 3 -->
+  <div class="phase" id="phase-3"><span class="pn">PHASE 3</span><span class="pt">Training path &mdash; produce the bundle</span></div>
+  <div class="arrow short"><svg viewBox="0 0 16 30"><path d="M8 0 V22 M2 16 L8 24 L14 16" fill="none" stroke="currentColor" stroke-width="1.6"/></svg></div>
+
+  <div class="node t" id="stage-5">
+    <div class="node-head"><span class="step-badge">Stage 5</span><h3>Data layer &mdash; DVC, engines, contracts</h3><span class="tag tag-train">training</span></div>
+    <p>Point DVC at the MinIO the stack just started, fetch, clean at scale, then gate. <b>The Spark job and <code>dvc repro</code> are alternatives, not sequential steps.</b></p>
+    <pre>dvc remote add -d minio s3://dvc -f    # make MinIO the default remote (-f overwrites)
+dvc remote modify minio endpointurl http://localhost:9000   # aim it at the local stack
+dvc pull                               # fetch the data version this commit pins
+
+# clean raw → processed Parquet: drop nulls, dedup, write the columns training reads
+python -m ml_framework.pipeline.spark_preprocess \
+  --input data/raw/sample.csv --output data/processed --target-col label
+#   ↑ no --data-backend → spark. The identical cleaning with no JVM at all:
+python -m ml_framework.pipeline.spark_preprocess \
+  --input data/raw/sample.csv --output data/processed --target-col label \
+  --data-backend local
+
+# quality gate: target non-null, features numeric non-null, no duplicate rows
+python -m ml_framework.pipeline.contracts \
+  --input data/processed --target-col label --data-backend local   # local is this one's default
+
+dvc repro            # OR: run preprocess → train as one content-addressed DAG
+dvc dag              # print that DAG
+dvc status           # which stages are stale, and what changed under them
+dvc metrics show     # the scores DVC tracks, read from outputs/metrics.json</pre>
+    <div class="runs">
+      <div class="rh">what actually runs</div>
+      <dl>
+        <dt>dvc remote add / modify</dt>
+        <dd>writes <b>.dvc/config</b> — no project code involved</dd>
+        <dt>spark_preprocess</dt>
+        <dd><b>src/ml_framework/pipeline/spark_preprocess.py</b><i>:84</i> <code>main()</code> → <i>:38</i> <code>preprocess()</code></dd>
+        <dt>--data-backend, on any of them</dt>
+        <dd><b>src/ml_framework/core/registry.py</b><i>:169</i> <code>get_data_backend()</code> → <b>src/ml_framework/data/backends/local.py</b> · <b>polars_backend.py</b> · <b>spark.py</b></dd>
+        <dt>contracts</dt>
+        <dd><b>src/ml_framework/pipeline/contracts.py</b><i>:70</i> <code>main()</code> → <i>:53</i> <code>validate_file()</code> → <i>:41</i> <code>validate_dataframe()</code></dd>
+        <dt>dvc repro / dag / status</dt>
+        <dd><b>dvc.yaml</b> — stage <code>preprocess</code> shells the module above, stage <code>train</code> shells <code>mlf train</code>; its <code>${…}</code> come from <b>params.yaml</b></dd>
+        <dt>dvc metrics show</dt>
+        <dd><b>dvc.yaml</b> <code>metrics:</code> → <code>outputs/metrics.json</code>, written by <b>src/ml_framework/pipeline/train.py</b></dd>
+        <dt>make dvc-repro / benchmark</dt>
+        <dd><b>Makefile</b><i>:58</i> · <i>:44</i> → <b>benchmarks/data_backends.py</b></dd>
+      </dl>
+    </div>
+    <div class="chips"><span class="chip"><b>make dvc-repro</b></span><span class="chip">spark engine needs Java 11/17</span></div>
+    <div class="note"><span class="l">engines</span><div>Which engine parses the data is a per-run choice, not a property of the file — <code>--data-backend local | polars | spark</code>, defined on <b>three</b> parsers with three different defaults: <code>spark_preprocess</code> defaults to <code>spark</code>, <code>contracts</code> to <code>local</code>, and <code>mlf train / tune / select</code> take it as a config override that falls through to <code>data.backend</code> (<code>local</code>). <b>The preprocess module no longer imports pyspark</b> — it goes through whichever engine you name, so <code>--data-backend local</code> runs the same cleaning with no JVM. It keeps its name because DVC, the DAG and CI reference the path, and it keeps the <code>spark</code> default for the same reason: changing it would quietly change what the pipeline does. <code>make benchmark</code> times pandas against polars over a full <code>build_bundle</code> — <b>2.8–3.7× to polars</b>, which is why the flag is worth reaching for on the training side too.</div></div>
+    <div class="note"><span class="l">note</span><div><b>contracts is not a <code>dvc repro</code> stage</b> — <code>dvc.yaml</code> defines only preprocess&nbsp;&rarr;&nbsp;train, and its outputs are the v2 bundle paths (<code>manifest.json</code>, <code>config.json</code>, <code>model/</code>, <code>preprocessor/</code>). The gate runs standalone, or as Airflow's <code>validate_data</code> task.</div></div>
+  </div>
+  <div class="arrow"><svg viewBox="0 0 16 30"><path d="M8 0 V22 M2 16 L8 24 L14 16" fill="none" stroke="currentColor" stroke-width="1.6"/></svg></div>
+
+  <div class="node t" id="stage-5b">
+    <div class="node-head"><span class="step-badge">Stage 5b</span><h3>Materialize a media corpus <span style="font-weight:400;color:var(--ink-faint);font-size:.82rem">(audio · video · images · token shards)</span></h3><span class="tag tag-train">training</span></div>
+    <p><b>Tabular data skips this entirely.</b> For anything that has to be <i>decoded</i>, one offline pass walks the corpus, decode-probes every sample, and writes a shard index — the sample list, the labels, and a digest per sample. It is <b>never implicit</b>: <code>mlf train</code> refuses a media corpus that has not been through it, and names this command.</p>
+    <pre>mlf materialize --data ./clips/train        # walk, decode-probe, write the index
+mlf materialize --data ./clips/train --force    # rebuild an index that already exists
+
+mlf materialize --data ./clips --sample-rate 0.05   # probe 5% for a quick smoke check
+mlf materialize -c configs/audio.yaml --decoder audio.flac \
+                --max-fault-rate 0.02               # exits 1 above the ceiling
+
+# the walk covers read→demux→decode. This runs the other four stages too, once:
+mlf materialize -c configs/audio.yaml --probe-full   # needs a config — see below
+
+# writes, beside the data — a property of the CORPUS, not of a run:
+./clips/train/_mlf_shards/
+  shards.json      ← the manifest. n_samples lives here, and nowhere else
+  entries.jsonl    ← one line per sample: shard, offset, nbytes, label, digest
+  faults.jsonl     ← what could not be decoded. Empty on a clean corpus, never absent
+<span class="new">
+# --- what tells you it worked -------------------------------------------
+cat ./clips/train/_mlf_shards/shards.json            # n_samples lives here
+wc -l ./clips/train/_mlf_shards/entries.jsonl        # must EQUAL n_samples
+wc -l ./clips/train/_mlf_shards/faults.jsonl         # 0 on a clean corpus
+head -1 ./clips/train/_mlf_shards/entries.jsonl      # shard · offset · nbytes · digest
+
+# calibrating the device tolerance: run the probe and read the number it prints
+mlf materialize -c configs/audio.yaml --probe-full 2&gt;&amp;1 | grep -i 'max abs diff'</span></pre>
+    <div class="runs">
+      <div class="rh">what actually runs</div>
+      <dl>
+        <dt>mlf materialize</dt>
+        <dd><b>src/ml_framework/cli.py</b><i>:973–1048</i> → <b>src/ml_framework/data/streaming/materialize.py</b><i>:175</i> <code>materialize()</code>; the per-sample probe at <i>:298</i> <code>_probe_one()</code></dd>
+        <dt>--force / the index it guards</dt>
+        <dd><b>src/ml_framework/data/streaming/shards.py</b> — <code>ShardIndex.location()</code> / <code>.exists()</code>, called from <b>cli.py</b><i>:987–988</i></dd>
+        <dt>--decoder</dt>
+        <dd>resolved through <b>src/ml_framework/core/registry.py</b><i>:194</i> <code>get_decoder()</code>; the decoders are <b>src/ml_framework/data/streaming/decoders/*.py</b>. Omitted → <b>materialize.py</b><i>:480</i> <code>_infer_decoder()</code></dd>
+        <dt>--probe-full</dt>
+        <dd><b>src/ml_framework/data/streaming/tail_probe.py</b><i>:116</i> <code>probe_tail()</code>; the preprocessor it needs comes from <b>src/ml_framework/data/sources/__init__.py</b> <code>preprocessor_for()</code></dd>
+        <dt>DEVICE_AGREEMENT_TOLERANCE</dt>
+        <dd><b>src/ml_framework/data/streaming/tail_probe.py</b><i>:62</i>; the comparison that uses it at <i>:206</i></dd>
+        <dt>--max-fault-rate (exit 1)</dt>
+        <dd><code>MaterializeError</code> at <b>materialize.py</b><i>:77</i>, caught and turned into the exit code at <b>cli.py</b><i>:1037</i></dd>
+        <dt>the three files it writes</dt>
+        <dd><code>shards.json</code> + <code>entries.jsonl</code> ← <b>data/streaming/shards.py</b>; <code>faults.jsonl</code> ← <b>materialize.py</b><i>:519</i> <code>_write_faults()</code></dd>
+        <dt>the cross-checks</dt>
+        <dd><b>materialize.py</b><i>:373</i> <code>_cross_check()</code> — duration vs frame count, and the host <code>oracle</code> for a device decoder</dd>
+      </dl>
+    </div>
+    <div class="runs">
+      <div class="rh">what a healthy result looks like</div>
+      <dl>
+        <dt>the line-count invariant</dt>
+        <dd><b><code>wc -l entries.jsonl</code> equals <code>n_samples</code> in <code>shards.json</code>.</b> <i>Fewer lines means samples were dropped before the index was written, and every run over this corpus inherits the shortfall silently — the shard index is a property of the corpus, not of a run, so nothing downstream recomputes it</i></dd>
+        <dt>faults.jsonl</dt>
+        <dd><b>0 lines, and the file present.</b> <i>Absent is the broken case, not the clean one. Lines here are samples that will be substituted at train time, at which point they become <code>outputs/faults/</code> in stage&nbsp;8</i></dd>
+        <dt>exit code</dt>
+        <dd>0, <b>or 1 when the fault rate crossed <code>--max-fault-rate</code></b>. <i>That exit 1 is the ceiling working. Without the flag there is no ceiling, and a corpus that is 30% undecodable materializes quietly</i></dd>
+        <dt>--probe-full's diff line</dt>
+        <dd>the <code>host vs device max abs diff</code> value. <b>Set <code>DEVICE_AGREEMENT_TOLERANCE</code> an order of magnitude above it</b> <i>— the tolerance is a source constant (<code>tail_probe.py</code><i>:62</i>), so calibrating it means editing code, not passing a flag</i></dd>
+      </dl>
+    </div>
+    <div class="chips"><span class="chip">once per corpus</span><span class="chip">shared by every run over it</span><span class="chip">exits 1 above <b>max_fault_rate</b></span></div>
+    <div class="note"><span class="l">seven stages</span><div><b>Storage → a tensor the model consumes is seven named stages, and this pass walks three of them.</b> The split is not pedantry: each name marks a place where the cost, the device, or the thing that can go wrong is genuinely different. <code>mlf decoders --show</code> renders the head; the tail is declared by the <i>preprocessor</i>, because nothing about it belongs to a codec.
+    <table class="fmt" style="margin-top:.45rem">
+      <tr><th>stage</th><th>what it is</th><th>runs where</th></tr>
+      <tr><td><code>read</code></td><td>a positioned read — bytes, from wherever they live</td><td>worker</td></tr>
+      <tr><td><code>demux</code></td><td>container → packets. Real for MP3/MP4, degenerate for a JPEG</td><td>worker</td></tr>
+      <tr><td><code>decode</code></td><td>reverse a compression scheme</td><td>worker</td></tr>
+      <tr><td><code>construct</code></td><td>attach a dtype, a shape and strides to a pointer</td><td>collate</td></tr>
+      <tr><td><code>transform</code></td><td>dtype/layout/scale — the mel matmul, the THWC→CTHW permute</td><td>collate <i>or</i> device</td></tr>
+      <tr><td><code>h2d</code></td><td>host → device. Async only from a page-locked buffer</td><td>trainer</td></tr>
+      <tr><td><code>gpu_transform</code></td><td><i>the same</i> <code>transform</code>, run after the copy</td><td>device</td></tr>
+    </table>
+    A pre-tokenized <code>.bin</code> shard has neither demux nor decode — a memmap slice is a page fault, not a call. A device decoder has decode and then <b>no tail at all</b>: no construct, no pinned buffer, no copy.</div></div>
+    <div class="note"><span class="l">commands</span><div><b>Which verb runs which stages</b> — and the answer is never the file name, always <code>data.kind</code>. A <b>tabular</b> run executes <i>none</i> of the seven whatever the verb: a table is <code>payload="arrays"</code>, one tensor built at <code>setup()</code>, no decoder and no collate. The seven are the <i>staged</i> path — audio, video, token shards.
+    <table class="fmt" style="margin-top:.45rem">
+      <tr><th>command</th><th>stages it executes</th></tr>
+      <tr><td><code>mlf materialize --data ./clips</code></td><td><code>read</code> · <code>demux</code> · <code>decode</code></td></tr>
+      <tr><td><code>mlf materialize -c cfg.yaml --probe-full</code></td><td><b>all seven</b> (<code>h2d</code>/<code>gpu_transform</code> skipped without CUDA)</td></tr>
+      <tr><td><code>mlf train -c cfg.yaml</code></td><td><b>all seven</b>, per batch, every epoch</td></tr>
+      <tr><td><code>mlf tune</code> · <code>mlf hpo</code> · <code>mlf select</code></td><td>as <code>train</code> — they fit models</td></tr>
+      <tr><td><code>mlf lr</code></td><td><code>read</code>…<code>transform</code> plus <code>h2d</code>; <b>never</b> <code>gpu_transform</code></td></tr>
+      <tr><td><code>mlf serve</code> (audio/video)</td><td><b>none</b> — <code>/predict</code> returns <b>501</b>, see stage&nbsp;10</td></tr>
+      <tr><td><code>mlf decoders</code> · <code>models</code> · <code>init</code> · <code>export</code> · <code>dockerfile</code></td><td>none — they describe the framework, they do not read data</td></tr>
+    </table>
+    <code>mlf lr</code> is the odd row, and the reason a <code>device_transform</code> switch exists at all: <code>torch_lr_finder</code> drives the loader itself, so Lightning never fires the post-copy hook and a deferred transform would simply never run. It is turned off for that one caller rather than hoped about.</div></div>
+    <div class="note"><span class="l">probe-full</span><div><b>The last four stages are per <i>batch</i>, so a per-sample decode probe cannot reach them</b> — and a corpus can walk clean here and still die on step 1: ragged clips that will not stack, a filterbank geometry that does not divide the clip, a "device-agnostic" transform that is not. <code>--probe-full</code> pushes one batch of cleanly-decoded samples through construct → transform → h2d → gpu_transform, <i>reusing the buffers the walk already decoded</i>, and checks the device transform against the host one rather than taking the declaration's word. It needs <code>--config</code>, and that is not an oversight: which preprocessor owns the tail is a property of the run's data kind, not of the bytes on disk — and for video it is also where the <b>clip geometry</b> comes from, so the probe decodes the clips the run will actually read rather than whole files.</div></div>
+    <div class="note"><span class="l">tolerance</span><div><b>The host-vs-device agreement threshold is an estimate, not a measurement.</b> It was chosen on a CPU-only machine, where the device path is a no-op copy and the observed drift is exactly 0 — so a <code>gpu_transform</code> failure on your first real GPU run may be the threshold rather than your corpus. Calibrate it once: run this, read the <code>host vs device max abs diff</code> line the report prints, and set <code>DEVICE_AGREEMENT_TOLERANCE</code> an order of magnitude above it. The risk until then is one-sided and mild — too tight fails a healthy corpus loudly, rather than passing a skewed one in silence.</div></div>
+    <div class="note"><span class="l">why</span><div><b>Two failure modes are invisible at training time by construction.</b> An MP3 resyncs past damage and returns <i>shorter audio with no error</i>; a damaged H.264 stream emits <i>artifacted frames</i> while libavcodec merely logs. Both produce correctly-shaped tensors, so no handler in the training loop will ever run — they do not crash anything, they quietly make the model worse. This pass is the only place they can be caught: it compares decoded duration against the frame count, decoded frames against the container's declared count, and a device decoder against a host <code>oracle</code>.</div></div>
+    <div class="note"><span class="l">ceiling</span><div><b>This is the only place the fault ceiling raises</b>, and the reason is structural. At training time under DDP the same check would be a <i>content-dependent</i> abort — rank 0 could trip it while rank 1 does not, one rank stops, the rest block on the next collective, and the run <b>hangs with no error message</b>. Here there is one process and no collective, so failing is safe, deterministic and early. At runtime the rate is counted, logged and reported — never raised.</div></div>
+    <div class="note"><span class="l">note</span><div>A sample that fails to decode <b>still gets an index entry</b>. The index declares what <i>should</i> exist, not what happens to decode today — dropping it would shrink <code>n_samples</code>, which is the one number every rank derives its batch count from. Labels come from the class directories (sorted, so the order is stable across machines), which is what makes fold planning a JSON scan rather than a decode pass over the whole corpus.</div></div>
+  </div>
+  <div class="arrow"><svg viewBox="0 0 16 30"><path d="M8 0 V22 M2 16 L8 24 L14 16" fill="none" stroke="currentColor" stroke-width="1.6"/></svg></div>
+
+  <div class="node t" id="stage-6">
+    <div class="node-head"><span class="step-badge">Stage 6</span><h3>Experimentation <span style="font-weight:400;color:var(--ink-faint);font-size:.82rem">(optional)</span></h3><span class="tag tag-train">training</span></div>
+    <p><b>Tuning is on by default inside <code>mlf train</code></b>, so these verbs exist to search and <i>report</i> without fitting the winner at full budget. Paste the result back into the YAML, or emit it.</p>
+    <pre># sweep the learning rate across a range and plot where the loss stops improving
+mlf lr   --config configs/example_tabular.yaml               # needs the [diagnostics] extra
+
+# search the space, report the best config, and write it out — fits nothing at full budget
+mlf tune --config configs/example_gbdt.yaml --emit-config configs/tuned.yaml
+
+mlf hpo  --config configs/example_gbdt.yaml                  # the v1 name, kept as an alias
+
+# control the search wherever it runs — on `train`, `tune` or `select`:
+--no-tune              # skip the search, fit the parameters already in the config
+--tune-trials 100      # how many candidates to sample
+--tune-budget 10m      # wall-clock cap on the search: 900, 30s, 10m, 2h</pre>
+    <div class="runs">
+      <div class="rh">what actually runs</div>
+      <dl>
+        <dt>mlf lr</dt>
+        <dd><b>src/ml_framework/cli.py</b><i>:1178</i> → <b>src/ml_framework/pipeline/lr_finder.py</b><i>:50</i> <code>find_lr()</code>; the polite refusal at <i>:29</i> <code>_check_supported()</code>. Imported lazily via <b>pipeline/__init__.py</b> so a torch-free install still starts</dd>
+        <dt>mlf tune / mlf hpo</dt>
+        <dd><b>src/ml_framework/cli.py</b><i>:1185–1204</i> → <b>src/ml_framework/pipeline/tune.py</b><i>:238</i> <code>tune()</code>; the CV objective at <i>:433</i> <code>_cv_objective()</code></dd>
+        <dt>the search space</dt>
+        <dd><b>pipeline/tune.py</b><i>:116</i> <code>effective_space()</code>, fed by each plugin's own spec — <b>src/ml_framework/plugins/params.py</b> and <b>plugins/**/params.py</b></dd>
+        <dt>--tune-trials / --tune-budget / --no-tune</dt>
+        <dd>defined at <b>cli.py</b><i>:269</i> <code>_add_tune_args()</code>, applied at <i>:293</i> <code>_apply_tune_args()</code>; duration parsing in <b>src/ml_framework/config/defaults.py</b> <code>parse_duration()</code></dd>
+        <dt>--emit-config</dt>
+        <dd><b>src/ml_framework/pipeline/train.py</b><i>:420</i> <code>_emit_config()</code> — one writer, shared by <code>tune</code>, <code>select</code> and <code>train</code></dd>
+      </dl>
+    </div>
+    <div class="note"><span class="l">note</span><div><code>mlf lr</code> is capability-gated: on a GBDT config it refuses politely rather than crashing inside <code>torch_lr_finder</code>. Without the <code>[hpo]</code> extra, tuning degrades to a plain fit with a warning rather than failing.</div></div>
+  </div>
+  <div class="arrow"><svg viewBox="0 0 16 30"><path d="M8 0 V22 M2 16 L8 24 L14 16" fill="none" stroke="currentColor" stroke-width="1.6"/></svg></div>
+
+  <div class="node t" id="stage-7">
+    <div class="node-head"><span class="step-badge">Stage 7</span><h3>Model selection <span style="font-weight:400;color:var(--ink-faint);font-size:.82rem">(optional)</span></h3><span class="tag tag-train">training</span></div>
+    <p><code>mlf train</code> tunes <b>one</b> model. <code>mlf select</code> compares model <i>families</i> — tuning each on its own space, cross-validating it, and measuring the four things a score does not tell you: latency, size, explainability and stability.</p>
+    <pre># bake off every compatible family, 4 at a time, disqualifying anything slower than 20 ms
+mlf select --config configs/example_selection.yaml --max-latency-ms 20 --max-workers 4
+
+mlf train  --config configs/example_selection.yaml --select   # compare, then train the winner
+
+# the decision, written down — THIS is what stage 12 consumes
+mlf select --config configs/example_selection.yaml --emit-config configs/winner.yaml
+
+# the same run split across machines — two halves of one decision, not two commands:
+# fan-out — evaluate ONE family, write its report, decide nothing
+mlf select -c configs/example_selection.yaml --candidate xgboost --report-dir outputs/reports
+# fan-in  — read every report in that dir, apply the constraints, name the winner
+mlf select -c configs/example_selection.yaml --collect outputs/reports</pre>
+    <div class="runs">
+      <div class="rh">what actually runs</div>
+      <dl>
+        <dt>mlf select</dt>
+        <dd><b>src/ml_framework/cli.py</b><i>:1206</i> → <i>:774</i> <code>_run_select()</code> → <b>src/ml_framework/pipeline/select.py</b><i>:846</i> <code>select()</code></dd>
+        <dt>which families are eligible</dt>
+        <dd><b>pipeline/select.py</b><i>:236</i> <code>candidate_models()</code>, filtered through <b>core/registry.py</b><i>:282</i> <code>models_for()</code></dd>
+        <dt>--candidate (fan-out)</dt>
+        <dd><b>pipeline/select.py</b><i>:316</i> <code>evaluate_candidate()</code> → <i>:399</i> <code>profile_candidate()</code>, <i>:478</i> <code>_run_folds()</code>, <i>:524</i> <code>_measure_latency()</code>, <i>:546</i> <code>_measure_explainability()</code></dd>
+        <dt>--collect (fan-in)</dt>
+        <dd><b>src/ml_framework/cli.py</b><i>:864</i> <code>_load_reports()</code> → <b>pipeline/select.py</b><i>:568</i> <code>apply_constraints()</code> → <i>:639</i> <code>decide()</code> / <i>:653</i> <code>decide_tolerance()</code></dd>
+        <dt>--max-latency-ms · --max-model-mb · --min-explainability · --tolerance · --max-workers</dt>
+        <dd>defined at <b>cli.py</b><i>:312</i> <code>_add_select_args()</code>, applied at <i>:378</i> <code>_apply_select_args()</code>; the profiles they compare live in <b>src/ml_framework/core/profile.py</b></dd>
+        <dt>selection.json · manifest.selection</dt>
+        <dd>written by <b>cli.py</b><i>:786+</i> and by <b>pipeline/train.py</b><i>:439</i> <code>_build_manifest()</code></dd>
+        <dt>make select</dt>
+        <dd><b>Makefile</b><i>:38</i></dd>
+      </dl>
+    </div>
+    <div class="chips"><span class="chip"><b>make select</b></span><span class="chip">off by default</span><span class="chip">--max-model-mb · --min-explainability · --tolerance</span></div>
+    <div class="note"><span class="l">note</span><div>The rule is <i>take the simplest model that is not measurably worse than the best one</i>, and it names the axis that decided. The whole table lands in <code>manifest.selection</code>, so a served model can answer "why this family?" without the training directory. A bake-off costs one tuning budget per candidate — hence off by default.</div></div>
+    <div class="note"><span class="l">handoff</span><div><b><code>selection.json</code> is a record, not an input.</b> It says what won and why; nothing reads it back to configure a run. The file that <i>carries the decision forward</i> is the one <code>--emit-config</code> writes — the winner's <code>model.name</code>, its tuned <code>model.params</code>, and <code>select.enabled:&nbsp;false</code>, because a candidate config is built with the bake-off switched off. Commit it, point <code>TRAIN_CONFIG</code> at it (stage&nbsp;12), and the decision made here is the one that retrains every night. Without <code>--emit-config</code> the winner survives only in <code>outputs/selection.json</code> and <code>bundle/config.json</code>, neither of which is a config you can hand an orchestrator.</div></div>
+  </div>
+  <div class="arrow"><svg viewBox="0 0 16 30"><path d="M8 0 V22 M2 16 L8 24 L14 16" fill="none" stroke="currentColor" stroke-width="1.6"/></svg></div>
+
+  <div class="node t" id="stage-8">
+    <div class="node-head"><span class="step-badge">Stage 8</span><h3>Train</h3><span class="tag tag-train">training</span></div>
+    <p>Zero-config, config-driven, or containerized. All write the same bundle. With no YAML the framework infers the kind, target, task and model — logs the rule behind each — and scores the result <b>beside a trivial baseline</b>.</p>
+    <pre># zero-config: no YAML, no flags — kind, target, task and model all read off the file
+mlf train --data data/raw/sample.csv                        # infer, train, score against a baseline
+mlf init  --data data/raw/sample.csv -o configs/mine.yaml   # write that config, train nothing
+
+# the same zero-config move on a directory of class directories — the census of file
+# suffixes picks the kind, so this reaches audio.cnn / video.r3d / cnn without a YAML
+mlf train --data ./clips/train        # → data.kind=audio, task=binary, model=audio.cnn
+
+# config-driven
+mlf train --config configs/example_tabular.yaml             # tune, fit the winner, write the bundle
+
+# override any config key inline, without editing the YAML
+mlf train -c configs/example_tabular.yaml \
+  --set fit.budget.max_epochs=5 --set fit.params.lr=3e-4
+
+# pick the engine for this run — pandas by default; polars builds the bundle 2.8–3.7× faster
+mlf train -c configs/example_tabular.yaml --data-backend polars   # needs the [fast] extra
+
+mlf train -c configs/example_tabular.yaml --folds 5         # k-fold estimate, then the real fit
+mlf train -c configs/example_tabular.yaml --resume          # continue from model/last.ckpt
+mlf train -c configs/example_tabular.yaml \
+  --emit-config configs/effective.yaml                      # dump the config that actually ran
+
+# MLflow-tracked: params, metrics and the whole bundle land in one run, then get registered
+mlf train -c configs/example_tabular.yaml \
+  --set logging.backend=mlflow \
+  --set logging.mlflow_tracking_uri=http://localhost:5000 \
+  --set logging.registered_model_name=ml-framework
+
+# staged-read controls — only meaningful for a corpus that goes through stage 5b
+--decoder audio.flac      # force one decoder; otherwise resolved from the index
+--on-corrupt substitute   # the default. `raise` is REFUSED under an explicit ddp strategy
+--shuffle block           # block (default) | global | none — see the note below
+--num-workers 4           # -1 = auto (0 on Windows, else 4)
+--prefetch-factor 4       # batches each worker runs ahead. Ignored without workers
+--pin-memory / --no-pin-memory   # page-lock for an async H2D copy. CUDA only
+--no-device-transform     # keep the TRANSFORM stage in the collate, even on CUDA
+
+mlf train -c configs/audio.yaml --resume    # continues MID-EPOCH, not from its start
+
+# containerized — the first `train` is the compose service, the second is the mlf verb
+# (that stage sets ENTRYPOINT ["mlf"]); --rm discards the container when it exits
+docker compose run --rm train train --config configs/example_tabular.yaml
+<span class="new">
+# --- what tells you it worked -------------------------------------------
+cat outputs/metrics.json     # test_acc is the key stage 12's ACCURACY_GATE reads
+cat outputs/stall.json       # gpu_stall_pct — ALWAYS written, on every backend
+cat outputs/faults.json      # the decode fault summary; empty object on clean data
+ls outputs/faults/ 2&gt;/dev/null || echo "no faults dir — that is the pass"
+tail -5 outputs/report.txt   # the baseline comparison, in words</span></pre>
+    <div class="runs">
+      <div class="rh">what actually runs</div>
+      <dl>
+        <dt>mlf train</dt>
+        <dd><b>src/ml_framework/cli.py</b><i>:1209–1225</i> → <b>src/ml_framework/pipeline/train.py</b><i>:70</i> <code>train()</code></dd>
+        <dt>the fit itself</dt>
+        <dd>dispatched by <b>core/registry.py</b><i>:212</i> <code>get_backend()</code> → <b>src/ml_framework/backends/lightning.py</b> · <b>gbdt.py</b> · <b>forecast.py</b> (staged media reads: <b>backends/staged.py</b>)</dd>
+        <dt>--data with no YAML</dt>
+        <dd><b>src/ml_framework/cli.py</b><i>:99</i> <code>_load_config()</code> → <b>src/ml_framework/config/autoconfig.py</b> <code>synthesize()</code>, which sniffs via <b>src/ml_framework/data/sniff.py</b></dd>
+        <dt>mlf init</dt>
+        <dd><b>src/ml_framework/cli.py</b><i>:1088–1115</i> → same <code>synthesize()</code>, then <b>config/autoconfig.py</b> <code>render_config()</code></dd>
+        <dt>--set key=value</dt>
+        <dd><b>cli.py</b><i>:73</i> <code>_parse_override()</code> → merged at <i>:133</i> by <b>config/autoconfig.py</b> <code>merge()</code>; schema in <b>src/ml_framework/config/schema.py</b></dd>
+        <dt>--folds / --resume</dt>
+        <dd><b>pipeline/train.py</b><i>:247</i> <code>_cross_validate()</code> and <i>:214</i> <code>_resolve_resume()</code>; mid-epoch state in <b>data/streaming/state.py</b></dd>
+        <dt>--data-backend</dt>
+        <dd><b>src/ml_framework/data/backends/local.py</b> · <b>polars_backend.py</b> · <b>spark.py</b></dd>
+        <dt>the staged-read flags</dt>
+        <dd>all defined at <b>cli.py</b><i>:203–266</i> <code>_add_config_args()</code>. <code>--shuffle</code> → <b>data/streaming/sampler.py</b><i>:62</i> <code>ShardShuffleSampler</code>; <code>--on-corrupt</code> → <b>data/streaming/substitute.py</b><i>:55</i> <code>SubstitutionPolicy</code>; <code>--num-workers</code>/<code>--prefetch-factor</code>/<code>--pin-memory</code> → <b>data/lightning_adapter.py</b><i>:113–141</i>; <code>--no-device-transform</code> → <b>data/lightning_adapter.py</b> <code>defers_transform</code> / <code>on_after_batch_transfer</code></dd>
+        <dt>logging.backend=mlflow</dt>
+        <dd><b>src/ml_framework/tracking/run_logger.py</b> and <b>tracking/mlflow_utils.py</b>; registration at <b>pipeline/train.py</b><i>:328</i> <code>_register_with_mlflow()</code></dd>
+        <dt>the baseline comparison</dt>
+        <dd><b>src/ml_framework/core/baseline.py</b>, called from <b>pipeline/train.py</b><i>:341</i> <code>_compare_to_baseline()</code></dd>
+        <dt>docker compose run train</dt>
+        <dd><b>docker-compose.yml</b><i>:29</i> (profile <code>tools</code>) → <b>Dockerfile</b><i>:65–68</i>, whose <code>ENTRYPOINT ["mlf"]</code> is why the word <code>train</code> appears twice</dd>
+        <dt>make train</dt>
+        <dd><b>Makefile</b><i>:35</i></dd>
+      </dl>
+    </div>
+    <div class="runs">
+      <div class="rh">what a healthy result looks like</div>
+      <dl>
+        <dt>mlf train (exit 0)</dt>
+        <dd>proves <b>a bundle was written</b>, and nothing more. <i>There is no quality gate here — a model that lost to its own baseline exits 0 exactly like one that won. The gate lives in stage&nbsp;12</i></dd>
+        <dt>metrics.json</dt>
+        <dd><code>test_acc</code> (or <code>test_rmse</code> for regression) — <b>the exact key the Airflow gate reads</b>, against a default threshold of <code>0.6</code>. <i>Read it here and you already know whether tonight's DAG will promote</i></dd>
+        <dt>report.txt, last lines</dt>
+        <dd>the baseline comparison in words. <b>A model that does not beat its baseline is the failure this stage cannot fail on</b> <i>— it is written down, and nothing reads it for you</i></dd>
+        <dt>stall.json</dt>
+        <dd><b><code>gpu_stall_pct</code> in single digits.</b> <i>High means the loader starved the device — raise <code>--num-workers</code>/<code>--prefetch-factor</code>. <code>null</code> means there was no device to stall, which is not the same as <code>0.0</code>, which means there was one and it never waited</i></dd>
+        <dt>faults.json and faults/</dt>
+        <dd><code>faults.json</code> is <b>always written</b>; <code>faults/</code> is <b>absent on a healthy run — that absence is the signal</b>. <i>A faults directory means samples were substituted: the count stayed identical, the epoch completed, and part of your data was silently swapped for other rows</i></dd>
+        <dt>the four DVC-tracked outs</dt>
+        <dd><code>manifest.json</code> · <code>config.json</code> · <code>model/</code> · <code>preprocessor/</code> all present. <i>A missing one means the run died after starting to write — see the last row of the table below</i></dd>
+      </dl>
+    </div>
+    <table class="fmt">
+      <tr><th>symptom</th><th>what it actually is</th><th>the command that confirms it</th></tr>
+      <tr><td>hangs with no error, multi-GPU</td><td>ranks produced different batch counts and the next collective is waiting forever. <b>This is why there is no <code>--on-corrupt skip</code></b></td><td><code>cat outputs/faults.json</code>; then re-run with <code>--on-corrupt substitute</code></td></tr>
+      <tr><td>exit 0, score quietly worse</td><td>lost to the baseline, or trained on substituted samples. <b>Nothing fails on either</b></td><td><code>tail -5 outputs/report.txt</code> · <code>ls outputs/faults/</code></td></tr>
+      <tr><td>slow, GPU mostly idle</td><td>input-bound — the loader, not the model</td><td><code>cat outputs/stall.json</code> → <code>gpu_stall_pct</code></td></tr>
+      <tr><td>refusal naming a pip command</td><td><b>working as intended.</b> An uninstalled family is refused, never silently substituted</td><td>run the pip line it printed; <code>mlf models --show</code></td></tr>
+      <tr><td><code>--tune</code> changed nothing</td><td>the budget expired before the search moved, or the config pinned the params it was meant to search</td><td><code>cat outputs/hpo.json</code>; raise <code>--tune-trials</code>/<code>--tune-budget</code></td></tr>
+      <tr><td>bundle half-written</td><td>the run died mid-write. <b><code>--resume</code> continues MID-EPOCH, not from the epoch's start</b></td><td><code>ls outputs/</code> against the six names above; <code>tail outputs/training.log</code></td></tr>
+    </table>
+    <div class="chips"><span class="chip"><b>make train</b></span><span class="chip">tunes by default</span><span class="chip">no quality gate here</span></div>
+    <div class="note"><span class="l">note</span><div>The precedence chain is <code>plugin defaults &lt; synthesis &lt; YAML &lt; --set &lt; explicit flags</code>, so <code>--data</code> and <code>--config</code> <b>compose</b> rather than being alternatives. An uninstalled family is a <i>refusal</i> with the pip command, never a silent substitution.</div></div>
+    <div class="note"><span class="l">corrupt</span><div><b>There is no <code>--on-corrupt skip</code></b>, and that is not an omission. Under DDP every rank must produce an <i>identical</i> number of batches or the next collective hangs with no error message, and <code>continue</code> is the one response that cannot preserve that. So a bad sample is <b>substituted</b> — a different index from the same shard, chosen deterministically from <code>(seed, epoch, index)</code> — and the count never changes. <code>raise</code> is kept for single-device runs and is <i>refused at config load</i> when <code>runtime.strategy</code> names <code>ddp</code>/<code>fsdp</code>/<code>deepspeed</code>.</div></div>
+    <div class="note"><span class="l">transform</span><div><b>On a CUDA box the transform stage moves to the far side of the H2D copy</b>, and it is the same function either way — the mel filterbank is moved to its input's device, not the other way round, so the collate and the post-copy hook cannot produce different answers. Two things change when it moves: a worker stops spending its time on FFTs, and <i>what crosses the bus gets smaller</i> — a waveform rather than its spectrogram, and for video a <code>uint8</code> clip rather than the <code>float32</code> normalized one, which is 4x. Deferred only when there is a device, the decoder landed on the <b>host</b>, and the preprocessor has declared the work device-agnostic; <code>--no-device-transform</code> pins it back into the collate to compare.</div></div>
+    <div class="note"><span class="l">shuffle</span><div><code>block</code> shuffles the shard order, then within each shard, then concatenates — so every read stays inside one already-open shard, which is the entire reason to shard over object storage. A <code>global</code> permutation is a perfect shuffle and <b>one seek per sample</b>; right on local SSD, ruinous over a network. What <code>block</code> costs you is cross-shard mixing <i>within</i> a batch, which is a property of how the corpus was written — fix it at materialization, not by paying for random access every epoch.</div></div>
+  </div>
+  <div class="arrow"><svg viewBox="0 0 16 30"><path d="M8 0 V22 M2 16 L8 24 L14 16" fill="none" stroke="currentColor" stroke-width="1.6"/></svg></div>
+
+  <div class="node b" id="bundle">
+    <div class="node-head"><h3>&#91;&nbsp;&#93; The model bundle (v2)</h3><span class="tag tag-bundle">handoff</span></div>
+    <p><b>The one coupling point.</b> Training <b>writes</b> it; inference <b>reads</b> it. Everything below is independent of everything above, except through these files.</p>
+    <pre>outputs/
+  manifest.json      ← the only file a loader must understand
+  config.json        ← the effective, post-tuning config
+  model/             ← the artifact manifest.json points at (+ last.ckpt)
+  preprocessor/      ← fitted state: scaler, tokenizer, transforms
+  metrics.json
+
+  # audit trail, deliberately untracked by DVC:
+  report.txt · predictions.csv · hpo.json · cv.json
+  reference_stats.json · training.log
+
+  # data-pipeline health — ALWAYS written, on every run and every backend:
+  stall.json         ← what fraction of wall time went into waiting for batches
+  faults.json        ← how many samples could not be decoded, and were substituted
+  faults/            ← per-worker JSON lines. ABSENT on a healthy run — that is the signal
+
+   (or promoted to the MLflow registry @production)</pre>
+    <div class="runs">
+      <div class="rh">what writes &amp; reads it</div>
+      <dl>
+        <dt>the bundle layout</dt>
+        <dd><b>src/ml_framework/core/bundle.py</b> — the one definition both sides agree on</dd>
+        <dt>manifest.json</dt>
+        <dd>written by <b>src/ml_framework/pipeline/train.py</b><i>:439</i> <code>_build_manifest()</code>; read back by <b>src/ml_framework/core/inference.py</b> <code>Inferencer.from_artifacts()</code></dd>
+        <dt>preprocessor/</dt>
+        <dd><b>pipeline/train.py</b><i>:409</i> <code>_save_preprocessor()</code> → the fitted state of <b>src/ml_framework/data/preprocess/*.py</b></dd>
+        <dt>stall.json · faults.json · faults/</dt>
+        <dd><b>src/ml_framework/core/stall.py</b><i>:254–265</i>, forced to exist on every backend by <b>pipeline/train.py</b><i>:363</i> <code>_write_data_reports()</code></dd>
+        <dt>metrics.json · report.txt · cv.json</dt>
+        <dd><b>src/ml_framework/core/evaluate.py</b> and <b>core/metrics.py</b></dd>
+        <dt>reference_stats.json</dt>
+        <dd><b>src/ml_framework/monitoring/drift.py</b> — the baseline <code>/drift</code> compares against later</dd>
+      </dl>
+    </div>
+    <div class="note"><span class="l">note</span><div><code>manifest.requires</code> is what <code>mlf dockerfile</code> reads to build a minimal image; <code>manifest.selection</code> carries the bake-off that chose this family; <code>manifest.hpo</code> the search that tuned it. A fitted preprocessor is <b>state, not configuration</b> — a model fed the wrong vocabulary or an unscaled matrix produces confident nonsense with no error at all.</div></div>
+    <div class="note"><span class="l">zeros</span><div><code>stall.json</code> and <code>faults.json</code> are written <b>even when they are all zeros</b>, including on a GBDT run with no epoch loop to measure. An absent file would be indistinguishable from a bundle produced before this existed, and <i>"no faults"</i> is a materially different claim from <i>"nobody looked"</i>. For the same reason <code>gpu_stall_pct</code> is <code>null</code> rather than <code>0.0</code> on a CPU box: 0% stall and "no device to stall" must not read the same.</div></div>
+  </div>
+  <div class="arrow"><svg viewBox="0 0 16 30"><path d="M8 0 V22 M2 16 L8 24 L14 16" fill="none" stroke="currentColor" stroke-width="1.6"/></svg></div>
+
+  <!-- PHASE 4 -->
+  <div class="phase" id="phase-4"><span class="pn">PHASE 4</span><span class="pt">Inference path &mdash; read the bundle, ship it</span></div>
+  <div class="arrow short"><svg viewBox="0 0 16 30"><path d="M8 0 V22 M2 16 L8 24 L14 16" fill="none" stroke="currentColor" stroke-width="1.6"/></svg></div>
+
+  <div class="node s" id="stage-9">
+    <div class="node-head"><span class="step-badge">Stage 9</span><h3>Export &amp; package</h3><span class="tag tag-serve">inference</span></div>
+    <p>Convert the bundle for another runtime, or generate the image that serves exactly this bundle and nothing more.</p>
+    <pre># convert the trained model to another runtime's format (refused, never faked — see below)
+mlf export     --artifacts outputs --format onnx -o model.onnx
+
+# write a Dockerfile installing only the extras manifest.requires names, and nothing else
+mlf dockerfile --artifacts outputs -o Dockerfile.serve
+<span class="new">
+# --- what tells you it worked -------------------------------------------
+python -c "import onnx; m=onnx.load('model.onnx'); onnx.checker.check_model(m); \
+print([i.name for i in m.graph.input], [i.name for i in m.graph.output])"
+
+# the differential test — the ONLY honest check that preprocessing was dropped.
+# Same raw row through both paths. They are SUPPOSED to disagree:
+python -c "
+import numpy as np, onnxruntime as ort
+from ml_framework.core.inference import Inferencer
+row = np.array([[5.1, 3.5, 1.4, 0.2, 0.0, 0.0]], dtype=np.float32)
+bundle = Inferencer.from_artifacts('outputs').predict(row.tolist())
+s = ort.InferenceSession('model.onnx')
+raw = s.run(None, {s.get_inputs()[0].name: row})[0]
+print('bundle', bundle, '  onnx-on-raw', raw)"
+
+cat Dockerfile.serve                         # read the extras it chose
+docker build -f Dockerfile.serve -t ml-framework-exported .   # it has to actually build</span></pre>
+    <div class="runs">
+      <div class="rh">what actually runs</div>
+      <dl>
+        <dt>mlf export</dt>
+        <dd><b>src/ml_framework/cli.py</b><i>:1050–1070</i> → <b>src/ml_framework/core/inference.py</b> <code>Inferencer.from_artifacts()</code>, then the backend's own <code>export()</code></dd>
+        <dt>per-backend formats</dt>
+        <dd><b>src/ml_framework/backends/lightning.py</b> (onnx · torchscript) · <b>backends/gbdt.py</b> (native) · <b>backends/forecast.py</b> (pickle); the shared contract in <b>core/export.py</b><i>:53</i> <code>UnsupportedExportError</code> and <i>:72</i> <code>unsupported()</code></dd>
+        <dt>mlf dockerfile</dt>
+        <dd><b>src/ml_framework/cli.py</b><i>:1072–1086</i> → <b>src/ml_framework/deploy.py</b><i>:118</i> <code>render_dockerfile()</code>, whose extras come from <i>:66</i> <code>required_extras()</code> reading <code>manifest.requires</code></dd>
+        <dt>the differential test</dt>
+        <dd>nothing in the repo — it is the check the repo does not make. It reads the bundle through <b>core/inference.py</b> and the graph through <code>onnxruntime</code>, which is the whole point: two paths, one of which has the preprocessor</dd>
+      </dl>
+    </div>
+    <div class="runs">
+      <div class="rh">what a healthy result looks like</div>
+      <dl>
+        <dt>mlf export (exit 0)</dt>
+        <dd>proves <b>a file was written</b>. <i>It does not prove the file scores correctly — nothing in this stage does, except the differential test</i></dd>
+        <dt>onnx.checker + input names</dt>
+        <dd>no exception, and <b>one input whose width is <code>n_features</code></b> — the <i>post</i>-preprocessing width. <i>If that number matches your raw CSV column count, the model was trained on untransformed data and this whole concern is moot; if it does not, the gap below is real</i></dd>
+        <dt>the differential test</dt>
+        <dd><b>the two outputs should NOT match.</b> <i>Disagreement is the expected, healthy result — it is the preprocessor, doing its job, visible. Agreement means either there was no preprocessing to drop, or you fed the ONNX session an already-scaled row and have tested nothing</i></dd>
+        <dt>docker build -f Dockerfile.serve</dt>
+        <dd>completes. <b>The generated file installs only the extras <code>manifest.requires</code> names</b> <i>— a build that fails on a missing import means the manifest under-declares what the bundle actually needs, and the same gap would hit you in the cluster</i></dd>
+      </dl>
+    </div>
+    <table class="fmt">
+      <tr><th>backend</th><th>formats it can produce</th></tr>
+      <tr><td><code>lightning</code></td><td><code>onnx</code> · <code>torchscript</code></td></tr>
+      <tr><td><code>gbdt</code></td><td><code>native</code> — the library's own <code>.json</code>/<code>.cbm</code>/<code>.txt</code></td></tr>
+      <tr><td><code>forecast</code></td><td><code>pickle</code></td></tr>
+    </table>
+    <div class="note"><span class="l">note</span><div><b>Asking for a format a backend cannot produce raises</b>, and the error names what it can — writing <i>some</i> file instead would be discovered at deployment time by a runtime that cannot load it. And <b>a traced graph does not include the preprocessing</b>: the scaler and image transforms stay behind, so an ONNX file fed raw features scores confident nonsense with no error.</div></div>
+  </div>
+  <div class="arrow"><svg viewBox="0 0 16 30"><path d="M8 0 V22 M2 16 L8 24 L14 16" fill="none" stroke="currentColor" stroke-width="1.6"/></svg></div>
+
+  <div class="node s" id="stage-10">
+    <div class="node-head"><span class="step-badge">Stage 10</span><h3>Serve &amp; smoke-test</h3><span class="tag tag-serve">inference</span></div>
+    <p>From a local bundle or straight from the registry. A long-running server, not a job that exits. <code>sample.csv</code> has six features, so an instance is six numbers.</p>
+    <pre>mlf serve --artifacts outputs --host 0.0.0.0 --port 8000   # load the local bundle, run FastAPI
+
+# same server, but pulling the @production model out of the MLflow registry instead
+mlf serve --registry-model ml-framework --registry-stage production \
+          --tracking-uri http://localhost:5000
+
+make docker-serve      # build --target serve, then docker run -p 8000:8000
+
+# production flags: 4 worker processes, 60 req/min per client, 413 above 10k instances
+mlf serve -a outputs --workers 4 --rate-limit 60/minute --max-instances 10000
+#   the API key comes from MLF_API_KEY; --api-key exists but env is preferred
+
+curl localhost:8000/health     # is a model loaded and ready — what the healthcheck hits
+curl -X POST localhost:8000/predict -H 'Content-Type: application/json' \
+     -d '{"instances": [[0.1, 0.2, 0.3, 0.4, 0.5, 0.6]]}'   # one row in, one prediction out
+
+curl -X POST localhost:8000/predict_proba            -d '…'  # per-class probabilities, and
+curl -X POST localhost:8000/predict_with_confidence  -d '…'  # prediction + its confidence.
+#   Both 400 when the manifest says this model produces no probabilities.
+
+# audio / video bundles: the request SHAPE is defined and validated, but nothing
+# decodes the clip yet -- this returns 501. Read the note below before relying on it.
+curl -X POST localhost:8000/predict -H 'Content-Type: application/json' \
+     -d '{"inputs": [{"b64": "…", "media_type": "audio/flac"}]}'   → 501
+
+curl localhost:8000/metrics    # Prometheus text: request rate, latency histogram, per-class counts
+curl localhost:8000/drift      # input drift, PSI per feature — tabular only, 501 on other kinds</pre>
+    <div class="runs">
+      <div class="rh">what actually runs</div>
+      <dl>
+        <dt>mlf serve</dt>
+        <dd><b>src/ml_framework/cli.py</b><i>:1137–1175</i> → <b>src/ml_framework/serving/api.py</b><i>:75</i> <code>create_app()</code></dd>
+        <dt>--workers &gt; 1</dt>
+        <dd>a different path: <b>cli.py</b><i>:1143–1161</i> sets env and hands uvicorn the import string <b>src/ml_framework/serving/asgi.py</b>, which calls the same <code>create_app()</code></dd>
+        <dt>--registry-model / --registry-stage</dt>
+        <dd><b>src/ml_framework/tracking/mlflow_utils.py</b>, via <code>create_app()</code></dd>
+        <dt>GET /health</dt>
+        <dd><b>src/ml_framework/serving/api.py</b><i>:200</i></dd>
+        <dt>POST /predict</dt>
+        <dd><b>serving/api.py</b><i>:288</i> → <b>src/ml_framework/core/inference.py</b>; request bodies validated by <b>serving/schemas.py</b> (<code>TabularRequest</code> <i>:41</i>, <code>ImageItem</code> <i>:130</i>, <code>MediaItem</code> <i>:153</i>)</dd>
+        <dt>POST /predict_proba</dt>
+        <dd><b>serving/api.py</b><i>:328</i></dd>
+        <dt>POST /predict_with_confidence</dt>
+        <dd><b>serving/api.py</b><i>:342</i></dd>
+        <dt>GET /drift</dt>
+        <dd><b>serving/api.py</b><i>:357</i> → <b>src/ml_framework/monitoring/drift.py</b> (the per-feature PSI, and the 501 for non-tabular kinds)</dd>
+        <dt>GET /metrics</dt>
+        <dd><b>src/ml_framework/serving/metrics.py</b><i>:105</i> <code>instrument()</code> — attached at <b>serving/api.py</b><i>:376</i>; the <code>backend</code>/<code>model</code> labels come from <i>:120</i> <code>identity()</code></dd>
+        <dt>MLF_API_KEY / --rate-limit / --max-instances</dt>
+        <dd>read at <b>cli.py</b><i>:1141</i> and enforced inside <code>create_app()</code> in <b>serving/api.py</b></dd>
+        <dt>make serve / docker-serve</dt>
+        <dd><b>Makefile</b><i>:41</i> · <i>:47</i></dd>
+      </dl>
+    </div>
+    <div class="chips"><span class="chip"><b>make serve</b></span><span class="chip"><b>make docker-serve</b></span></div>
+    <div class="note"><span class="l">501</span><div><b>Serving an audio, video or image bundle is not implemented.</b> <code>AudioRequest</code>/<code>VideoRequest</code>/<code>ImageRequest</code> define the request shape and validate it — <code>b64</code> xor <code>url</code>, <code>media_type</code> required — but none of them implements <code>to_model_input</code>, and nothing under <code>serving/</code> imports a decoder at all. So <code>/predict</code> answers <b>501 <i>"serving data kind 'audio' is not implemented yet"</i></b>. The 501 is deliberate rather than a crash — <b>serving/api.py</b><i>:169</i> checks for the method instead of catching an <code>AttributeError</code>, so a genuine bug inside one can never be mislabelled "not implemented" — but it means <b>the staged pipeline exists only on the training side</b>. <code>mlf train</code> decodes a whole corpus; the server cannot decode one clip.</div></div>
+    <div class="note"><span class="l">media_type</span><div><b>Required for audio and video, and absent on the image schema.</b> Not an inconsistency: an image decoder can sniff JFIF or PNG magic from the first bytes, but raw MP3 frames have no container and no reliable header — and guessing wrong picks a decoder whose failure mode is <i>silent</i>. Naming the type costs a field; the alternative is a wrong answer nobody sees. <code>/drift</code> stays tabular-only for the same class of reason: PSI over PCM samples is a number without a meaning.</div></div>
+    <div class="note"><span class="l">note</span><div>Auth is <b>off</b> when <code>MLF_API_KEY</code> is unset — convenient locally, and the thing to check before anything faces traffic. Prometheus series carry <code>backend</code> and <code>model</code> labels, without which two containers scraped into one Prometheus silently <i>add together</i>.</div></div>
+  </div>
+  <div class="arrow"><svg viewBox="0 0 16 30"><path d="M8 0 V22 M2 16 L8 24 L14 16" fill="none" stroke="currentColor" stroke-width="1.6"/></svg></div>
+
+  <div class="node s" id="stage-11">
+    <div class="node-head"><span class="step-badge">Stage 11</span><h3>Load, capacity &amp; the SLO gate</h3><span class="tag tag-serve">inference</span></div>
+    <p>Drive load at a <i>running</i> endpoint, out of band. Two tools, two questions: locust asks <b>what does it do under N users</b>, k6 asks <b>at what rate does it stop meeting the SLO</b> — it ramps the arrival rate and fails the run if p95&nbsp;&gt;&nbsp;200&nbsp;ms or errors&nbsp;&gt;&nbsp;1%.</p>
+    <pre><span class="new"># --- one request first. Three of the five ways this lies are visible here ---
+curl -i -X POST localhost:8000/predict -H 'Content-Type: application/json' \
+  -H "X-API-Key: $MLF_API_KEY" -d '{"instances": [[0,0,0,0,0,0]]}'
+#   read the status line, then the table below, THEN start the ramp
+</span>
+# interactive: set the user count and ramp in the browser. Traffic is weighted 5:1:1
+# across single /predict, 16-row batch /predict and /health, 0.1–0.5 s think time.
+locust -f tests/load/locustfile.py --host http://localhost:8000   # UI :8089
+
+# the same file headless, as a pass/fail gate: 100 users, spawned 10/s, for 2 minutes
+locust -f tests/load/locustfile.py --host http://localhost:8000 \
+       --headless -u 100 -r 10 -t 2m --only-summary
+
+# the capacity ramp — arrival rate 10 → 50/s over 1m → 200/s over 2m → 0 over 30s,
+# 50 VUs preallocated, 200 max. Exits non-zero the moment a threshold breaks.
+k6 run -e HOST=http://localhost:8000 -e API_KEY=$MLF_API_KEY tests/load/k6-script.js
+
+# wider bundles: BOTH scripts synthesize the request body and default to 6 features
+MLF_N_FEATURES=20 locust -f tests/load/locustfile.py --host http://localhost:8000
+k6 run -e HOST=http://localhost:8000 -e N_FEATURES=20 tests/load/k6-script.js</pre>
+    <div class="runs">
+      <div class="rh">what actually runs</div>
+      <dl>
+        <dt>locust -f …</dt>
+        <dd><b>tests/load/locustfile.py</b> — the 5:1:1 task weights, the think time and <code>MLF_N_FEATURES</code> are all in this one file</dd>
+        <dt>k6 run …</dt>
+        <dd><b>tests/load/k6-script.js</b> — the ramp stages, the p95/error thresholds and <code>HOST</code>/<code>API_KEY</code>/<code>N_FEATURES</code> are all in this one file</dd>
+        <dt>both, in context</dt>
+        <dd><b>tests/load/README.md</b>; excluded from the suite by <b>pyproject.toml</b><i>:198</i> <code>addopts = "-q --ignore=tests/load"</code></dd>
+        <dt>the endpoint they hit</dt>
+        <dd><b>src/ml_framework/serving/api.py</b> — nothing here runs project code directly</dd>
+        <dt>the HPA in the k8s note</dt>
+        <dd><b>deploy/k8s/api.yaml</b><i>:126</i> <code>HorizontalPodAutoscaler</code></dd>
+      </dl>
+    </div>
+    <table class="fmt">
+      <tr><th>send one request first</th><th>what that status means</th><th>the fix</th></tr>
+      <tr><td><code>200</code></td><td>you are measuring the model. Start the ramp</td><td>&mdash;</td></tr>
+      <tr><td><code>422</code></td><td><b>feature width mismatch</b> — the default is 6, matching <code>sample.csv</code>. Every request will 422, which reads exactly like a load failure and is not one</td><td><code>-e N_FEATURES=</code> (k6) · <code>MLF_N_FEATURES=</code> (Locust)</td></tr>
+      <tr><td><code>429</code></td><td><b>the rate limiter, and both scripts score this as a pass</b> — a server on <code>--rate-limit 60/minute</code> sails through the gate having served almost nothing</td><td>raise or drop <code>--rate-limit</code> before measuring</td></tr>
+      <tr><td><code>401</code></td><td>the server has an <code>MLF_API_KEY</code> and the script does not</td><td><code>-e API_KEY=$MLF_API_KEY</code> · <code>MLF_API_KEY=</code></td></tr>
+      <tr><td><code>501</code></td><td>an audio/video/image bundle — <code>/predict</code> takes tabular rows only, so there is nothing here to load-test</td><td>load-test a tabular bundle, or the decode path separately</td></tr>
+      <tr><td>200, but <b>p95 flat under load</b></td><td>you are against localhost and measuring <b>one process</b>. No autoscaler is in the loop</td><td>point it at the cluster; see the <i>k8s</i> note below</td></tr>
+    </table>
+    <div class="chips"><span class="chip">no make target</span><span class="chip">excluded from pytest</span><span class="chip">needs a live endpoint</span></div>
+    <div class="note"><span class="l">capacity</span><div><b>The number you want is the rate at which p95 crosses 200&nbsp;ms</b>, and that is what the ramp is for — a flat load only tells you whether one chosen rate passed. Read it off the k6 output, or off the latency panel in the Grafana <i>ML Framework — Serving</i> dashboard while the ramp climbs.</div></div>
+    <div class="note"><span class="l">trap</span><div>Two ways this measures something other than the model. <b>Feature width:</b> the default is <b>6</b>, matching <code>sample.csv</code> — aim either script at a bundle of any other width without setting <code>MLF_N_FEATURES</code> / <code>-e N_FEATURES=</code> and <i>every</i> request comes back 422, which reads exactly like a load failure and is not one. <b>The rate limiter:</b> a 429 is deliberately scored as a <i>pass</i> in both scripts, so a server started with <code>--rate-limit 60/minute</code> (stage&nbsp;10) will sail through the gate having served almost nothing. Raise or drop the limit to measure the model.</div></div>
+    <div class="note"><span class="l">k8s</span><div>Against localhost you are measuring <b>one process</b>. Real capacity is measured with the autoscaler in the loop: <code>deploy/k8s/api.yaml</code> runs the HPA at <b>min 2 / max 10 replicas, 70% CPU</b>, so point the ramp at the cluster and confirm pods scale <i>up</i> under load <b>and back down after</b> — an HPA that never scales down is a capacity result you pay for permanently.</div></div>
+    <div class="note"><span class="l">chaos</span><div>Stage&nbsp;14's pod-kill and this ramp are <b>one experiment, not two</b>: disrupt a pod <i>while</i> k6 is climbing, or you have only proven that recovery works on an idle cluster. Note which disruption you are running — a <code>delete pod</code> exercises the ReplicaSet, a <code>drain</code> exercises the PodDisruptionBudget, and only the second one tests the budget at all. For structured stress — CPU pressure, injected network latency, scheduled kills — drive it with LitmusChaos or Chaos Mesh and let this same k6 gate be the assertion.</div></div>
+    <div class="note"><span class="l">note</span><div>None of this runs in CI. <code>pyproject.toml</code> sets <code>addopts = "-q --ignore=tests/load"</code>, there is no <code>make</code> target, and k6 reads its target from <b><code>-e HOST=</code> / <code>-e API_KEY=</code></b> env flags rather than a bare script path — without them it hits no host.</div></div>
+  </div>
+  <div class="arrow"><svg viewBox="0 0 16 30"><path d="M8 0 V22 M2 16 L8 24 L14 16" fill="none" stroke="currentColor" stroke-width="1.6"/></svg></div>
+
+  <!-- PHASE 5 -->
+  <div class="phase" id="phase-5"><span class="pn">PHASE 5</span><span class="pt">Automation &amp; infra &mdash; each fires on its own trigger</span></div>
+  <div class="arrow short"><svg viewBox="0 0 16 30"><path d="M8 0 V22 M2 16 L8 24 L14 16" fill="none" stroke="currentColor" stroke-width="1.6"/></svg></div>
+
+  <div class="node t" id="stage-12">
+    <div class="node-head"><span class="step-badge">Stage 12</span><h3>Airflow orchestration</h3><span class="tag tag-train">daily timer</span></div>
+    <p>A <b>separate compose file</b> from the main stack, with a mandatory one-time DB init pass before the first <code>up</code>.</p>
+    <pre>cd orchestration/airflow    # its own compose file — nothing to do with the main stack
+docker compose -f docker-compose.airflow.yml up airflow-init   # metadata DB + admin user, once
+docker compose -f docker-compose.airflow.yml up                # scheduler + webserver
+# UI :8080 (airflow/airflow)
+
+# dag: ml_framework_pipeline    schedule="@daily"
+assert_pinned_config → dvc_pull → spark_preprocess → validate_data →
+train → evaluate_gate → promote_model → trigger_deploy
+
+TRAIN_CONFIG=configs/winner.yaml   # the pinned winner. Never a bake-off config
+<span class="new">
+# --- what tells you it worked -------------------------------------------
+docker compose -f docker-compose.airflow.yml ps    # scheduler AND webserver both up
+docker compose -f docker-compose.airflow.yml exec airflow-scheduler \
+  airflow dags list | grep ml_framework_pipeline   # parsed, and not paused
+
+# run the guard on its own, before you trust a scheduled run — no side effects:
+docker compose -f docker-compose.airflow.yml exec airflow-scheduler \
+  airflow tasks test ml_framework_pipeline assert_pinned_config 2026-01-01
+
+# --- why it failed, if it did -------------------------------------------
+docker compose -f docker-compose.airflow.yml logs --tail=50 airflow-scheduler
+#   a DAG that never appears in `dags list` is an import error, not a schedule problem</span></pre>
+    <div class="runs">
+      <div class="rh">what actually runs</div>
+      <dl>
+        <dt>docker compose -f … up</dt>
+        <dd><b>orchestration/airflow/docker-compose.airflow.yml</b> — <code>airflow-init</code> is a service in that file, not a subcommand</dd>
+        <dt>the DAG</dt>
+        <dd><b>orchestration/airflow/dags/ml_pipeline.py</b><i>:134</i> — <code>schedule="@daily"</code>; the chain is built at <i>:208</i></dd>
+        <dt>assert_pinned_config</dt>
+        <dd><b>dags/ml_pipeline.py</b><i>:142</i>, callable at <i>:84</i> — reads <code>TRAIN_CONFIG</code> (<i>:56</i>), <code>retries=0</code></dd>
+        <dt>dvc_pull</dt>
+        <dd><b>dags/ml_pipeline.py</b><i>:148</i> — a <code>BashOperator</code>, so <b>dvc.yaml</b> / <b>.dvc/config</b></dd>
+        <dt>spark_preprocess</dt>
+        <dd><b>dags/ml_pipeline.py</b><i>:153</i> → <b>src/ml_framework/pipeline/spark_preprocess.py</b></dd>
+        <dt>validate_data</dt>
+        <dd><b>dags/ml_pipeline.py</b><i>:163</i> → <b>src/ml_framework/pipeline/contracts.py</b></dd>
+        <dt>train</dt>
+        <dd><b>dags/ml_pipeline.py</b><i>:176</i> → <code>mlf train --config $TRAIN_CONFIG</code> → <b>src/ml_framework/pipeline/train.py</b></dd>
+        <dt>evaluate_gate · promote_model</dt>
+        <dd><b>dags/ml_pipeline.py</b><i>:185 · :186</i> — Python callables in the same file; promotion goes through <b>src/ml_framework/tracking/mlflow_utils.py</b></dd>
+        <dt>trigger_deploy</dt>
+        <dd><b>dags/ml_pipeline.py</b><i>:188</i></dd>
+        <dt>make airflow-up</dt>
+        <dd><b>Makefile</b><i>:67</i></dd>
+      </dl>
+    </div>
+    <table class="fmt">
+      <tr><th>which task is red</th><th>what it means</th><th>where to look</th></tr>
+      <tr><td><code>assert_pinned_config</code></td><td><code>TRAIN_CONFIG</code> has <code>select.enabled: true</code> or no <code>model.name</code> — a bake-off config reached the daily timer. <b><code>retries=0</code>, so it fails once and stops the DAG</b>, which is the point</td><td>the task log names the file and the fix</td></tr>
+      <tr><td><code>spark_preprocess</code></td><td>no JVM in the scheduler image, or the input path in <code>params.yaml</code> does not exist inside the container</td><td><code>docker compose … logs airflow-scheduler</code></td></tr>
+      <tr><td><code>validate_data</code></td><td>a contract broke — schema, nulls or target column. <b>The data changed; the code did not</b></td><td>the task log; then <code>python -m ml_framework.pipeline.contracts</code> by hand</td></tr>
+      <tr><td><code>train</code></td><td>ordinary training failure — see stage&nbsp;8's table. The bundle may be half-written</td><td><code>outputs/training.log</code> in <code>PROJECT_DIR</code></td></tr>
+      <tr><td><code>evaluate_gate</code></td><td><b>the retrain was worse than <code>ACCURACY_GATE</code> (default 0.6)</b> and <code>promote_model</code> never ran. <i>This is a success of the gate, not a bug</i> — the old model is still live</td><td><code>outputs/metrics.json</code> → <code>test_acc</code></td></tr>
+      <tr><td><code>dvc_pull</code> · <code>trigger_deploy</code></td><td><b>Neither of these can ever turn red.</b> <code>dvc_pull</code> ends in <code>|| true</code> and <code>trigger_deploy</code> in <code>|| echo 'kubectl not available…'</code>, so a failed pull trains on stale data and a failed rollout leaves old pods serving — both green</td><td>read the task <i>log</i>, not its colour</td></tr>
+    </table>
+    <div class="chips"><span class="chip"><b>make airflow-up</b></span><span class="chip">retrains only</span><span class="chip">2 tasks cannot fail</span></div>
+    <div class="note"><span class="l">retrains</span><div><b>This DAG does not choose a model.</b> <code>train</code> fits whatever <code>TRAIN_CONFIG</code> names — no <code>--select</code>, no <code>model.name</code> override. Choosing a family is a <i>decision</i>; retraining it on fresh data is a <i>routine</i>, and they belong on different clocks. The bake-off runs out of band (stage&nbsp;7) and hands its answer over as a file:
+    <pre style="margin-top:.4rem">mlf select -c configs/example_selection.yaml \
+           --emit-config configs/winner.yaml     ← commit this
+
+# winner.yaml carries:  model.name · tuned model.params · select.enabled: false</pre>
+    A candidate config is built with the comparison switched <b>off</b>, so the emitted file cannot start another one. That is the whole handoff.</div></div>
+    <div class="note"><span class="l">why not daily</span><div>Re-running the bake-off nightly does not just spend one tuning budget per candidate on a decision nobody will revisit. When two families sit within noise of each other the winner <b>flips on cross-validation variance</b> — so the family in production changes with <i>no one having chosen it</i>, and the latency budget the HPA was sized for, the explainability story, and on-call's mental model of what is running all change with it.</div></div>
+    <div class="note"><span class="l">guard</span><div><code>assert_pinned_config</code> is what makes that structural rather than conventional, and it is <b>not redundant with having no selection stage</b>: <code>mlf train</code> reads <code>select.enabled</code> from the YAML, so a config with the comparison switched on would bake off <i>inside</i> the <code>train</code> task — daily, under one task id, invisible in the graph. The guard runs first, before <code>dvc pull</code>, with <code>retries=0</code>, and names the file and the fix.</div></div>
+    <div class="note"><span class="l">fan-out</span><div>To distribute a bake-off you <i>do</i> want, <code>mlf select --candidate</code> / <code>--collect</code> fan out across <b>dynamic task mapping</b> — in a <b>separate</b>, occasionally-triggered DAG that ends at <code>collect_winner</code>:
+    <pre style="margin-top:.4rem">tune_candidate.expand([xgboost, lightgbm, catboost, mlp])   ← concurrent
+    → collect_winner        → selection.json + a proposed winner.yaml</pre>
+    Its output is a <b>pull request, not a deployment</b>: a model-family change deserves a diff and a reviewer, and the retraining DAG picks it up on its next run once merged. Needs Airflow ≥ 2.3 for <code>.expand()</code>.</div></div>
+    <div class="note"><span class="l">note</span><div>The gate fails the run if accuracy is below <code>ACCURACY_GATE</code>; promotion sets the <code>@production</code> alias in MLflow. It runs on a <b>timer</b>, never on an accuracy signal.</div></div>
+  </div>
+  <div class="arrow"><svg viewBox="0 0 16 30"><path d="M8 0 V22 M2 16 L8 24 L14 16" fill="none" stroke="currentColor" stroke-width="1.6"/></svg></div>
+
+  <div class="node" id="stage-13">
+    <div class="node-head"><span class="step-badge">Stage 13</span><h3>CI / CD security gates</h3><span class="tag tag-shared">on push / tag</span></div>
+    <p>Not something you run — something your git command triggers. Independent of any load test.</p>
+    <pre>git push                             # → ci.yml, on every branch — never run by hand
+  ruff check · black --check · mypy · pytest   (py 3.10 → 3.14, 80% coverage floor)
+  + gbdt-no-torch:   a tree bundle trains and serves with no DL stack present
+  + spark-contract:  the Spark engine against a real JVM, refusing to pass by skipping
+  + mlops-validate:  manifests render, every YAML parses, dashboard JSON is valid
+
+git tag v1.0.0 &amp;&amp; git push --tags    # → cd.yml — the tag ships it, the push alone does not
+  buildx (target serve) → Trivy HIGH/CRITICAL → Syft SBOM →
+<span class="new">  cosign sign (keyless) → push GHCR → deploy job (manual approval, and see below)
+
+# --- what tells you it worked -------------------------------------------
+gh run list --limit 5                      # queued / in_progress / completed
+gh run watch                               # blocks until the latest run finishes
+gh run view --log-failed                   # only the steps that failed
+gh run download &lt;run-id&gt; -n sbom           # the Syft SBOM, as an artifact
+
+# the signature the chain above claims to have made. Nothing else checks it:
+cosign verify ghcr.io/&lt;owner&gt;/&lt;repo&gt;/serve:&lt;sha&gt; \
+  --certificate-identity-regexp '^https://github.com/&lt;owner&gt;/&lt;repo&gt;/' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com</span></pre>
+    <div class="runs">
+      <div class="rh">what actually runs</div>
+      <dl>
+        <dt>git push</dt>
+        <dd><b>.github/workflows/ci.yml</b> — jobs <code>test</code> <i>:9</i> · <code>gbdt-no-torch</code> <i>:58</i> · <code>spark-contract</code> <i>:155</i> · <code>mlops-validate</code> <i>:224</i></dd>
+        <dt>gbdt-no-torch</dt>
+        <dd><b>ci.yml</b><i>:58–154</i> — installs without <code>[lightning]</code>, then trains and serves a tree bundle through <b>src/ml_framework/cli.py</b></dd>
+        <dt>spark-contract</dt>
+        <dd><b>ci.yml</b><i>:155–223</i> — runs <b>src/ml_framework/data/backends/spark.py</b> and <b>pipeline/spark_preprocess.py</b> against a real JVM</dd>
+        <dt>mlops-validate</dt>
+        <dd><b>ci.yml</b><i>:224+</i> — compiles <b>orchestration/airflow/dags/ml_pipeline.py</b>, parses every YAML, runs <code>kustomize build deploy</code> and validates <b>deploy/monitoring/grafana/dashboards/ml-framework.json</b></dd>
+        <dt>git push --tags</dt>
+        <dd><b>.github/workflows/cd.yml</b> — trigger at <i>:5–6</i> (<code>tags: ["v*"]</code>), jobs <code>build-scan-sign</code> <i>:18</i> and <code>deploy</code> <i>:75</i>; the image it builds is <b>Dockerfile</b> <code>--target serve</code></dd>
+        <dt>cosign verify</dt>
+        <dd>mirrors <b>cd.yml</b><i>:65–67</i> <code>cosign sign --yes</code>. Keyless signing writes no key anywhere — the identity <i>is</i> the workflow, so verification has to name the expected identity and issuer or it proves nothing</dd>
+      </dl>
+    </div>
+    <div class="note"><span class="l">stub</span><div><b>The <code>deploy</code> job does not deploy.</b> <code>cd.yml</code><i>:83–85</i> is two <code>echo</code> statements — <code>"kubectl set image deployment/ml-framework-api api=$IMAGE:$GITHUB_SHA -n ml-framework"</code> and <code>"(wire up KUBE_CONFIG secret + real kubectl here)"</code> — and then it exits 0. The <code>environment: production</code> approval gate is real and gates nothing but those echoes. So a green CD run means <b>built, scanned, signed and pushed</b>, and it means nothing at all about what is running in the cluster. The actual rollout is stage&nbsp;14's <code>rollout restart</code>, or Airflow's <code>trigger_deploy</code>, both run outside this workflow.</div></div>
+    <div class="note"><span class="l">verify</span><div>Two of these gates are only ever proven <i>here</i>, never locally: Trivy runs with <code>exit-code: "1"</code> on <b>HIGH,CRITICAL</b> and <code>ignore-unfixed: true</code>, so a new CVE with a published fix turns the build red without a line of your code changing — and the signature exists only against the registry copy, so <code>cosign verify</code> needs the pushed image, not a local one. There is no local <code>act</code> path that reproduces either.</div></div>
+  </div>
+  <div class="arrow"><svg viewBox="0 0 16 30"><path d="M8 0 V22 M2 16 L8 24 L14 16" fill="none" stroke="currentColor" stroke-width="1.6"/></svg></div>
+
+  <div class="node s" id="stage-13b">
+    <div class="node-head"><span class="step-badge">Stage 13b</span><h3>First-time cluster bring-up <span style="font-weight:400;color:var(--ink-faint);font-size:.82rem">(once per cluster)</span></h3><span class="tag tag-serve">inference</span></div>
+    <p><b><code>kubectl apply -k deploy</code> on its own leaves every pod unable to start.</b> api, mlflow and minio all mount the Secret <code>ml-framework-secrets</code>, and <code>secrets.example.yaml</code> is deliberately <i>not</i> in the kustomization — so the Secret has to exist before the apply, and nothing on the happy path tells you it doesn't.</p>
+    <pre><span class="new">cp deploy/k8s/secrets.example.yaml deploy/k8s/secrets.yaml   # gitignored; set real values
+kubectl create namespace ml-framework        # the Secret needs it first; apply -k creates it too
+kubectl apply -f deploy/k8s/secrets.yaml     # MUST land before the apply below
+
+make k8s-validate                            # renders locally: "kustomize OK". No cluster needed
+kubectl apply -k deploy
+
+# --- what tells you it worked -------------------------------------------
+kubectl -n ml-framework get secret ml-framework-secrets    # 5 keys, or nothing starts
+kubectl -n ml-framework get pods -w                        # every pod → Running, READY 1/1
+kubectl -n ml-framework rollout status deployment/ml-framework-api --timeout=180s
+kubectl -n ml-framework get pdb,hpa,networkpolicy,resourcequota   # the policies.yaml objects
+
+# the API sits behind default-deny-ingress and there is no Ingress; port-forward
+# goes through the kubelet, not the pod network, so NetworkPolicy does not apply
+kubectl -n ml-framework port-forward svc/ml-framework-api 8000:8000 &amp;
+curl -s localhost:8000/health      # unauthenticated — status · task · model · backend · n_features</span></pre>
+    <div class="runs">
+      <div class="rh">what actually runs</div>
+      <dl>
+        <dt>secrets.example.yaml</dt>
+        <dd><b>deploy/k8s/secrets.example.yaml</b> — a template, five keys: <code>MINIO_ROOT_USER</code> · <code>MINIO_ROOT_PASSWORD</code> · <code>AWS_ACCESS_KEY_ID</code> · <code>AWS_SECRET_ACCESS_KEY</code> · <code>MLF_API_KEY</code></dd>
+        <dt>who mounts it</dt>
+        <dd><b>deploy/k8s/api.yaml</b><i>:67</i> <code>secretKeyRef: ml-framework-secrets</code>, and the same reference in <b>minio.yaml</b><i>:38,41</i> and <b>mlflow.yaml</b><i>:47,50</i></dd>
+        <dt>why it is not applied for you</dt>
+        <dd><b>deploy/kustomization.yaml</b> <code>resources:</code> names six files and this is not one — committing real credentials is the failure it is avoiding</dd>
+        <dt>port-forward vs the policy</dt>
+        <dd><b>deploy/k8s/policies.yaml</b><i>:46</i> <code>default-deny-ingress</code> and <i>:56</i> <code>allow-api-ingress</code>, which admits the ingress controller and Prometheus only. <code>port-forward</code> is subject to neither</dd>
+      </dl>
+    </div>
+    <table class="fmt">
+      <tr><th>what <code>get pods</code> says</th><th>what it means</th><th>the command that confirms it</th></tr>
+      <tr><td><code>CreateContainerConfigError</code></td><td><b>the Secret is missing</b> — this is exactly what skipping the step above looks like</td><td><code>kubectl -n ml-framework describe pod &lt;pod&gt;</code></td></tr>
+      <tr><td><code>ImagePullBackOff</code></td><td><code>ml-framework-serve:latest</code> is not on the node, and a <code>:latest</code> tag will not be re-fetched once a stale copy exists</td><td><code>kubectl -n ml-framework describe pod &lt;pod&gt; | tail -20</code></td></tr>
+      <tr><td><code>CrashLoopBackOff</code></td><td>it starts and dies — usually no <code>@production</code> alias in MLflow yet, so <code>mlf serve --registry-stage</code> finds nothing to load</td><td><code>kubectl -n ml-framework logs &lt;pod&gt; --previous</code></td></tr>
+      <tr><td><code>Pending</code></td><td>unschedulable, or the <code>ResourceQuota</code> in <code>policies.yaml</code> refused the request</td><td><code>kubectl -n ml-framework get events --sort-by=.lastTimestamp</code></td></tr>
+      <tr><td><code>Running</code>, <code>READY 0/1</code></td><td>the readiness probe on <code>/health</code> is failing — the process is up, the model is not loaded</td><td><code>kubectl -n ml-framework logs &lt;pod&gt; --tail=40</code></td></tr>
+    </table>
+    <div class="chips"><span class="chip"><b>make k8s-validate</b></span><span class="chip"><b>make k8s-deploy</b></span><span class="chip">once per cluster</span></div>
+    <div class="note"><span class="l">order</span><div><b>The Secret before the apply, not after.</b> A pod that starts without it does not retry into health — it sits in <code>CreateContainerConfigError</code> until something recreates it, so applying the Secret second costs you a <code>rollout restart</code> as well. And <code>make k8s-validate</code> cannot catch this: it renders the kustomization, and the kustomization is <i>correct</i> — the missing object is the one deliberately outside it.</div></div>
+    <div class="note"><span class="l">gap</span><div><b><code>deploy/monitoring/alerts.yml</code> is not loaded by the in-cluster Prometheus.</b> Its five rules — HighErrorRate, HighLatencyP95, FeatureDrift (<code>max(mlf_feature_psi) &gt; 0.2</code>), NoPredictions, ApiDown — exist as a file, but <b>deploy/k8s/monitoring.yaml</b> embeds its own scrape config and never references them. Until that file is mounted as a ConfigMap and added to <code>rule_files</code>, <b>nothing alerts</b>: the Grafana dashboard is the only thing watching, and only while someone is looking at it.</div></div>
+    <div class="note"><span class="l">not applied</span><div>Three manifests ship and are <i>not</i> in <code>resources:</code> — <code>secrets.example.yaml</code> (above), <code>ingress-tls.yaml</code> (wants cert-manager and a real hostname) and <code>kserve-inferenceservice.yaml</code> (wants KServe installed, and replaces api.yaml's Deployment/Service/HPA rather than adding to them). Without the first the namespace does not start; without the second there is no TLS and <b>no external route at all</b>, which is why <code>port-forward</code> is the only way in above.</div></div>
+  </div>
+  <div class="arrow"><svg viewBox="0 0 16 30"><path d="M8 0 V22 M2 16 L8 24 L14 16" fill="none" stroke="currentColor" stroke-width="1.6"/></svg></div>
+
+  <div class="node s" id="stage-14">
+    <div class="node-head"><span class="step-badge">Stage 14</span><h3>Kubernetes rollout &amp; chaos</h3><span class="tag tag-serve">inference</span></div>
+    <p>Render first, then apply. Restart to pick up a newly promoted model, then disrupt it — and watch, because every claim below is a state you have to observe, not one the command prints.</p>
+    <pre>make k8s-validate      # render every manifest locally — catches YAML errors with no cluster
+kubectl apply -k deploy      # create or update the whole namespace: api, mlflow, minio, monitoring
+
+<span class="new"># --- promote → restart → serve -------------------------------------------</span>
+kubectl rollout restart deployment/ml-framework-api -n ml-framework        # re-pull @production
+<span class="new">kubectl rollout status  deployment/ml-framework-api -n ml-framework --timeout=180s
+kubectl -n ml-framework get pods -l app=ml-framework-api -w                # second shell: old → new
+kubectl -n ml-framework logs -l app=ml-framework-api --tail=20 | grep -i 'model\|version'</span>
+
+<span class="new"># --- chaos A: hard kill. Exercises the ReplicaSet, NOT the PDB. ----------
+kubectl -n ml-framework get pods -l app=ml-framework-api -w &amp;             # watch first, then kill
+kubectl -n ml-framework delete pod &lt;one-pod&gt; --grace-period=0 --force
+#  desired 2 / actual 1 → ReplicaSet creates a replacement. A direct delete
+#  never calls the Eviction API, so the PodDisruptionBudget is not consulted.</span>
+
+<span class="new"># --- chaos B: eviction. THIS is what the PDB gates. ----------------------
+kubectl -n ml-framework get pdb ml-framework-api      # ALLOWED DISRUPTIONS — read this before and after
+kubectl drain &lt;node&gt; --ignore-daemonsets --delete-emptydir-data --dry-run=server   # node-scoped, no -n
+kubectl drain &lt;node&gt; --ignore-daemonsets --delete-emptydir-data
+#  minAvailable:1 against 2 replicas ⇒ the first evict succeeds, the second
+#  blocks with "Cannot evict pod as it would violate the budget" until the
+#  replacement is Ready. That block IS the passing result.
+kubectl uncordon &lt;node&gt;</span>
+
+<span class="new"># --- why it failed, if it did --------------------------------------------
+kubectl -n ml-framework describe deployment ml-framework-api   # Events at the bottom
+kubectl -n ml-framework get events --sort-by=.lastTimestamp | tail -20
+kubectl -n ml-framework logs &lt;pod&gt; --previous                  # the crashed container, not the new one</span></pre>
+    <div class="runs">
+      <div class="rh">what actually runs</div>
+      <dl>
+        <dt>make k8s-validate</dt>
+        <dd><b>Makefile</b><i>:61</i> → <code>kubectl kustomize deploy</code> → <b>deploy/kustomization.yaml</b></dd>
+        <dt>kubectl apply -k deploy</dt>
+        <dd><b>deploy/kustomization.yaml</b> → <b>deploy/k8s/namespace.yaml</b> · <b>minio.yaml</b> · <b>mlflow.yaml</b> · <b>api.yaml</b> · <b>monitoring.yaml</b> · <b>policies.yaml</b>, plus a ConfigMap generated from <b>deploy/monitoring/grafana/dashboards/ml-framework.json</b></dd>
+        <dt>rollout restart deployment/…-api</dt>
+        <dd><b>deploy/k8s/api.yaml</b><i>:12</i> <code>Deployment</code> — the container runs <b>src/ml_framework/serving/asgi.py</b></dd>
+        <dt>rollout status / get pods -w</dt>
+        <dd>nothing in the repo — these read cluster state. <code>rollout status</code> returns only when the <code>Deployment</code>'s <code>readinessProbe</code> (<b>deploy/k8s/api.yaml</b>) passes on every new pod, so it is the honest definition of "the new model is serving"</dd>
+        <dt>delete pod (chaos A)</dt>
+        <dd>asserts the <code>replicas: 2</code> of <b>deploy/k8s/api.yaml</b><i>:19</i> — the ReplicaSet reconciles desired against actual. It does <i>not</i> touch <b>policies.yaml</b>; a direct delete bypasses the Eviction API entirely</dd>
+        <dt>drain / get pdb (chaos B)</dt>
+        <dd>asserts <b>deploy/k8s/policies.yaml</b><i>:37</i> <code>minAvailable: 1</code> — the only command here that consults the <code>PodDisruptionBudget</code>. Scale-out under load is separately driven by <b>deploy/k8s/api.yaml</b><i>:126</i> <code>HorizontalPodAutoscaler</code> (min&nbsp;2 / max&nbsp;10)</dd>
+        <dt>make k8s-deploy</dt>
+        <dd><b>Makefile</b><i>:64</i></dd>
+        <dt>not in the default apply</dt>
+        <dd><b>deploy/k8s/ingress-tls.yaml</b> · <b>kserve-inferenceservice.yaml</b> · <b>secrets.example.yaml</b> — present, but absent from <code>resources:</code></dd>
+      </dl>
+    </div>
+    <div class="chips"><span class="chip"><b>make k8s-validate</b></span><span class="chip"><b>make k8s-deploy</b></span></div>
+    <div class="note"><span class="l">paths</span><div>The kustomization root is <b><code>deploy/</code></b>, not <code>deploy/k8s/</code> — it generates the Grafana dashboard ConfigMap from <code>deploy/monitoring/</code>, and kustomize will not read a file outside its root. The manifests themselves still live in <code>deploy/k8s/</code>.</div></div>
+    <div class="note"><span class="l">trap</span><div><b>Deleting a pod does not test the PodDisruptionBudget.</b> A PDB is enforced by the <b>Eviction API</b>, and only <i>voluntary</i> disruptions go through it — <code>kubectl drain</code>, a cluster-autoscaler scale-down, a node upgrade. <code>kubectl delete pod</code> writes straight to the API server, so the budget is never consulted and the pod always dies. The delete is still a worthwhile check, but what it proves is that the <b>ReplicaSet</b> notices <code>actual &lt; replicas</code> and makes a replacement. If you want to see <code>minAvailable: 1</code> actually refuse something, you have to evict.</div></div>
+    <div class="note"><span class="l">budget</span><div>With <code>replicas: 2</code> and <code>minAvailable: 1</code>, <b>ALLOWED DISRUPTIONS is 1</b> — and it drops to <b>0</b> the moment one pod goes away, which is what blocks a drain mid-flight. That is a thin margin: a two-replica deployment can only ever lose one pod voluntarily at a time, so a node drain that holds both replicas serializes, and a rolling restart plus a drain at once can deadlock until the HPA's replacement reports Ready. If drains routinely stall, the fix is a third replica, not a looser budget.</div></div>
+  </div>
+  <div class="arrow"><svg viewBox="0 0 16 30"><path d="M8 0 V22 M2 16 L8 24 L14 16" fill="none" stroke="currentColor" stroke-width="1.6"/></svg></div>
+
+  <div class="node s" id="stage-14b">
+    <div class="node-head"><span class="step-badge">Stage 14b</span><h3>Rollback &mdash; and &ldquo;which model is actually live?&rdquo;</h3><span class="tag tag-serve">inference</span></div>
+    <p>A promotion is <b>two independent writes</b> — an MLflow alias and a Kubernetes rollout — so an undo is two writes as well, and doing one without the other puts you back where you started on the next restart. Answer the identity question first, because <b>nothing the API serves will tell you.</b></p>
+    <pre><span class="new"># --- which version is live ----------------------------------------------
+python -c "from mlflow.tracking import MlflowClient; \
+c=MlflowClient(tracking_uri='http://localhost:5000'); \
+v=c.get_model_version_by_alias('ml-framework','production'); \
+print(v.version, v.run_id, v.status)"
+
+kubectl -n ml-framework logs -l app=ml-framework-api --tail=50 | grep -i 'version\|alias'
+#   the DAG prints `promoted ml-framework v&lt;N&gt; → @production` each time it moves the alias
+
+curl -s localhost:8000/health     # task · model · backend · data_kind · n_features …
+#   …but bundle_version here is the bundle SCHEMA, not the registry version. See below.
+
+# --- roll the pods back (fast, and undoes nothing in MLflow) -------------
+kubectl -n ml-framework rollout history deployment/ml-framework-api
+kubectl -n ml-framework rollout undo    deployment/ml-framework-api
+kubectl -n ml-framework rollout status  deployment/ml-framework-api --timeout=180s
+
+# --- move the alias back (this is the half that survives a restart) ------
+python -c "from mlflow.tracking import MlflowClient; \
+c=MlflowClient(tracking_uri='http://localhost:5000'); \
+c.set_registered_model_alias('ml-framework','production','&lt;GOOD_VERSION&gt;')"
+kubectl -n ml-framework rollout restart deployment/ml-framework-api
+kubectl -n ml-framework rollout status  deployment/ml-framework-api --timeout=180s</span></pre>
+    <div class="runs">
+      <div class="rh">what actually runs</div>
+      <dl>
+        <dt>get_model_version_by_alias</dt>
+        <dd><b>the only authoritative answer.</b> The same client call <b>orchestration/airflow/dags/ml_pipeline.py</b><i>:147–160</i> writes with <code>set_registered_model_alias</code></dd>
+        <dt>what the pods read</dt>
+        <dd><b>deploy/k8s/api.yaml</b> <code>command: ["mlf","serve"]</code> with <code>--registry-model $(MODEL_NAME) --registry-stage $(REGISTRY_STAGE)</code> → <b>src/ml_framework/tracking/mlflow_utils.py</b><i>:119</i> <code>models:/{name}/{stage}</code>. The pod spec names an <i>alias</i>, never a version — which is why moving the alias is the real deploy</dd>
+        <dt>rollout undo</dt>
+        <dd>reads the Deployment's own revision history in the cluster; nothing in the repo. <i>It restores the pod template — image, args, env — and touches MLflow not at all</i></dd>
+        <dt>/health's bundle_version</dt>
+        <dd><b>src/ml_framework/serving/api.py</b><i>:200–213</i> → <code>inf.manifest.bundle_version</code>, written when the bundle is built</dd>
+      </dl>
+    </div>
+    <div class="runs">
+      <div class="rh">what a healthy result looks like</div>
+      <dl>
+        <dt>the alias lookup</dt>
+        <dd>one integer <code>version</code> and a <code>run_id</code>. <b>Write the version down before you change anything</b> <i>— this is the number you will want in five minutes</i></dd>
+        <dt>rollout status (exit 0)</dt>
+        <dd>every new pod passed the <code>/health</code> readiness probe. <b>This is the honest definition of &ldquo;serving&rdquo;</b>, and the only one — see stage&nbsp;14</dd>
+        <dt>set_registered_model_alias</dt>
+        <dd>returns <b>nothing</b>. <i>It overwrites silently and reports no previous value, so re-read the alias afterwards or you have not checked anything</i></dd>
+        <dt>/health after the restart</dt>
+        <dd><code>model</code> and <code>backend</code> change if you rolled back to a different family. <b>They do not change when you roll back a retrain of the same family</b> <i>— which is the common case, so this is not the check</i></dd>
+      </dl>
+    </div>
+    <div class="chips"><span class="chip">no make target</span><span class="chip">two writes, no transaction</span><span class="chip">needs a live cluster</span></div>
+    <div class="note"><span class="l">gap</span><div><b>No endpoint exposes the live registry version.</b> <code>/health</code>'s <code>bundle_version</code> is <code>manifest.bundle_version</code> — a schema number for the bundle <i>layout</i>, constant across every model you will ever train. <code>/metrics</code>' <code>model</code> and <code>backend</code> labels name the family, not the version. Until the registry version is added to <code>/health</code>, the answer lives in MLflow and in the DAG's own log line, and <b>nowhere on the serving side at all</b> — so during an incident the fastest honest answer is the alias lookup above, not a curl.</div></div>
+    <div class="note"><span class="l">two writes</span><div>Stage&nbsp;12's promote task moves the alias and <code>trigger_deploy</code> restarts the deployment — <b>two writes, no transaction</b> — and <code>trigger_deploy</code> ends in <code>|| echo 'kubectl not available…'</code>, so it <i>cannot fail</i>. An alias that moved with a restart that did not leaves the old pods serving the old model; the reverse leaves new pods pulling a model you meant to abandon. Both are silent, and both look identical from <code>/health</code>. A <code>rollout status</code> after every alias move is what closes the gap.</div></div>
+    <div class="note"><span class="l">scope</span><div><b><code>rollout undo</code> is the fast lever, not the fix.</b> It restores the previous pod template — and since <code>api.yaml</code> pins <code>image: ml-framework-serve:latest</code> and passes the model by <i>alias</i>, the previous template is usually byte-identical to the current one. Against a bad <b>model</b> it buys you nothing and the alias move is the whole answer; against a bad <b>image</b> (a stage&nbsp;13 tag push) it <i>is</i> the whole answer. Know which one you are rolling back before you reach for it.</div></div>
+  </div>
+  <div class="arrow"><svg viewBox="0 0 16 30"><path d="M8 0 V22 M2 16 L8 24 L14 16" fill="none" stroke="currentColor" stroke-width="1.6"/></svg></div>
+
+  <!-- PHASE 6 -->
+  <div class="phase" id="phase-6"><span class="pn">PHASE 6</span><span class="pt">Live monitoring loop</span></div>
+  <div class="arrow short"><svg viewBox="0 0 16 30"><path d="M8 0 V22 M2 16 L8 24 L14 16" fill="none" stroke="currentColor" stroke-width="1.6"/></svg></div>
+
+  <div class="node s" id="stage-15">
+    <div class="node-head"><span class="step-badge">Stage 15</span><h3>Accuracy auditing</h3><span class="tag tag-serve">inference</span></div>
+    <p>When ground-truth labels arrive, join them to logged predictions on an <code>id</code> key &rarr; live accuracy &rarr; MLflow.</p>
+    <pre># join predictions to the labels that arrived later, score live accuracy, log it to MLflow
+python -m ml_framework.monitoring.model_quality \
+  --predictions preds.csv --labels labels.csv \
+  --task multiclass \
+  --tracking-uri http://localhost:5000 \
+  --experiment ml-framework-monitoring
+
+# predictions.csv → id,prediction     labels.csv → id,label
+<span class="new">
+# --- before you run it: zero overlapping ids raises, it does not warn ----
+python -c "import pandas as pd; p=pd.read_csv('preds.csv'); l=pd.read_csv('labels.csv'); \
+print('preds',len(p),'labels',len(l),'overlap',len(set(p.id)&amp;set(l.id)))"
+
+# --- what tells you it worked -------------------------------------------
+# `mlflow runs list` takes --experiment-id, not a name, so resolve the name first:
+python -c "from mlflow.tracking import MlflowClient; \
+c=MlflowClient(tracking_uri='http://localhost:5000'); \
+e=c.get_experiment_by_name('ml-framework-monitoring'); \
+print(e.experiment_id if e else 'MISSING — the scores went nowhere')"
+
+mlflow runs list --experiment-id &lt;ID&gt;
+#   or just open http://localhost:5000 and pick the experiment</span></pre>
+    <div class="runs">
+      <div class="rh">what actually runs</div>
+      <dl>
+        <dt>python -m …model_quality</dt>
+        <dd><b>src/ml_framework/monitoring/model_quality.py</b><i>:53</i> <code>main()</code> → <i>:26</i> <code>evaluate_against_labels()</code>; the <code>__main__</code> guard at <i>:80</i></dd>
+        <dt>the scores it computes</dt>
+        <dd><b>src/ml_framework/core/metrics.py</b>, picked by <code>--task</code></dd>
+        <dt>where it logs them</dt>
+        <dd><b>src/ml_framework/tracking/mlflow_utils.py</b>, under the experiment <code>--experiment</code> names</dd>
+        <dt>the predictions side</dt>
+        <dd><code>predictions.csv</code> comes out of <b>src/ml_framework/pipeline/train.py</b>, or out of request logging in <b>src/ml_framework/serving/api.py</b></dd>
+      </dl>
+    </div>
+    <div class="runs">
+      <div class="rh">what a healthy result looks like</div>
+      <dl>
+        <dt>the overlap pre-check</dt>
+        <dd><b>overlap &gt; 0, and close to the smaller of the two counts.</b> <i>An overlap of 0 raises <code>ValueError</code>; an overlap that is a small fraction of both scores a real number over a biased slice, which is worse — it reports fine and means nothing</i></dd>
+        <dt>the command itself</dt>
+        <dd>prints the scores it computed and <b>exits 0</b>. <i>There is no gate here — this stage measures, it does not decide. A collapsed accuracy exits 0 exactly like a healthy one</i></dd>
+        <dt>mlflow runs list</dt>
+        <dd>a run under <code>ml-framework-monitoring</code> with <b>today's timestamp</b>. <i>If the experiment does not exist at all, the tracking URI was wrong and the scores went nowhere — the command still exited 0</i></dd>
+        <dt>what to compare it against</dt>
+        <dd>the <code>test_*</code> metrics in <b><code>outputs/metrics.json</code></b> from the run that produced the live model. <b>Live accuracy below training accuracy is the signal</b> <i>— and this is the number stage&nbsp;12's <code>ACCURACY_GATE</code> never sees, because that gate scores the fresh model against held-out data, not against production</i></dd>
+      </dl>
+    </div>
+    <div class="note"><span class="l">note</span><div><b>Both files are CSV</b> (read with <code>pd.read_csv</code>) and are inner-joined on <code>id</code>. <b><code>--task</code> is required</b> (<code>binary</code> | <code>multiclass</code> | <code>regression</code>), and zero overlapping ids raises <code>ValueError</code> rather than reporting a score over nothing.</div></div>
+  </div>
+  <div class="arrow"><svg viewBox="0 0 16 30"><path d="M8 0 V22 M2 16 L8 24 L14 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-dasharray="3 3"/></svg></div>
+
+  <div class="node loop" id="retrain">
+    <div class="node-head"><h3>&#8635; Retrain decision</h3><span class="tag tag-manual">manual — not auto-wired</span></div>
+    <p><b>Monitoring only reports.</b> Its docstring says a person can "watch quality decay and trigger retraining" — and that is the whole mechanism. There is <b>no SLA check and no monitoring&rarr;Airflow trigger</b>. A human sees the decay and re-runs stage&nbsp;8.</p>
+    <div class="note"><span class="l">dashed</span><div>Aspirational, not implemented. Airflow retrains on a <b>daily timer</b>, not because accuracy dropped.</div></div>
+  </div>
+  <div class="arrow"><svg viewBox="0 0 16 30"><path d="M8 0 V22 M2 16 L8 24 L14 16" fill="none" stroke="currentColor" stroke-width="1.6"/></svg></div>
+
+  <div class="node" id="reset">
+    <div class="node-head"><span class="step-badge">Reset</span><h3>Clean the workspace</h3><span class="tag tag-shared">shared</span></div>
+    <pre><span class="new"># --- before you run it, because nothing here is reversible --------------
+git status --short                  # anything untracked below is about to go
+ls -la outputs/                     # the bundle you are deleting
+du -sh outputs wandb lightning_logs 2&gt;/dev/null
+dvc status                          # is the bundle actually pushed? see the note
+</span>
+make clean   # delete every generated directory — bundles, caches and build artifacts:
+             #   outputs wandb lightning_logs .pytest_cache .mypy_cache
+             #   .ruff_cache .coverage coverage.xml build dist
+             #   *.egg-info src/*.egg-info
+<span class="new">
+# --- what tells you it worked -------------------------------------------
+ls outputs 2&gt;/dev/null || echo "outputs gone"     # the only one that matters
+git status --short                  # should be unchanged — clean touches no tracked file</span></pre>
+    <div class="runs">
+      <div class="rh">what actually runs</div>
+      <dl>
+        <dt>make clean</dt>
+        <dd><b>Makefile</b><i>:70</i> — one <code>rm -rf</code>, no project code</dd>
+        <dt>git status --short</dt>
+        <dd>nothing in the repo — it is the pre-flight. Every path <code>clean</code> removes is gitignored, so a tracked file appearing in this diff afterwards means something other than <code>clean</code> ran</dd>
+      </dl>
+    </div>
+    <div class="note"><span class="l">not reversible</span><div><b><code>dvc pull</code> brings back the bundle and brings back none of the rest.</b> DVC tracks the four <code>outs</code> that <code>dvc.yaml</code> declares — <code>manifest.json</code>, <code>config.json</code>, <code>model/</code>, <code>preprocessor/</code> — plus <code>metrics.json</code> as a metric. Everything else in <code>outputs/</code> is <i>deliberately untracked</i>: <code>report.txt</code>, <code>predictions.csv</code>, <code>hpo.json</code>, <code>cv.json</code>, <code>reference_stats.json</code>, <code>training.log</code>, <code>stall.json</code>, <code>faults.json</code> and the <code>faults/</code> directory. Those are gone for good, and <code>stall.json</code> and <code>faults.json</code> are the two files that tell you whether the run was healthy — so clean a bundle you have not yet read and you cannot go back and read it.</div></div>
+  </div>
+
+  <div class="footnote">
+    <p><b>How to read this:</b> Stages 0&ndash;2 are shared setup. Stages 5&ndash;8 are the <span style="color:var(--train)">training path</span> and produce the bundle; stages 9&ndash;11 and 15 are the <span style="color:var(--serve)">inference path</span> and consume it. They are independent — connected <b>only</b> through the <span style="color:var(--bundle)">bundle</span>.</p>
+    <p><b>Stage 5b is the one branch.</b> Tabular data goes 5&nbsp;&rarr;&nbsp;8 and never touches it. Anything that has to be <i>decoded</i> — audio, video, images, token shards — goes through <code>mlf materialize</code> first, once per corpus, and every run over that corpus then shares the index. It is numbered <code>5b</code> rather than <code>6</code> precisely because it is a fork rather than a step everyone takes.</p>
+    <p><b>Ascending &ne; sequential.</b> Stages 12&ndash;14 are numbered in the order you'd first set them up, but they fire on their own triggers afterward: Airflow on a daily timer, CI on push, CD on tag, K8s on a deploy. Only stages 0&ndash;11 are a line you type top to bottom.</p>
+    <p><b>Where to start reading the code.</b> Every <code>mlf</code> verb enters at <code>src/ml_framework/cli.py</code> — <code>build_parser()</code> (line 544) declares them, <code>main()</code> (line 951) dispatches them, and each branch imports its stage lazily so a torch-free install still starts. Everything else on this page is either a <i>config file</i> some external tool reads (Dockerfile, docker-compose.yml, dvc.yaml, the workflows, the kustomization) or a module with its own <code>__main__</code> guard (<code>spark_preprocess</code>, <code>contracts</code>, <code>model_quality</code>). Line numbers are from <code>v2.0.0</code> and drift with edits; the file paths and function names do not.</p>
+    <p><b>Two stages are lettered, not numbered, and both are things you do once.</b> <code>13b</code> is the first cluster bring-up — the Secret that has to exist before <code>kubectl apply -k deploy</code>, which the apply will not create and will not warn you about. <code>14b</code> is the way back: a promotion is an MLflow alias <i>and</i> a Kubernetes rollout, so an undo is both, and the question of which model is live has no answer on the serving side at all. Neither is on the daily path, which is exactly why they are worth reading before you need them.</p>
+    <p><b>Every stage above is shaped the same way:</b> pre-flight where something is about to become irreversible, the command itself, then <code>what tells you it worked</code> — and, where a stage has more than one way to go wrong, a table you enter from the symptom rather than from the top. Anchors are stable: <code>#stage-8</code>, <code>#stage-13b</code>, <code>#reset</code>, one per node, so a link into this page lands on the stage rather than the page.</p>
+    <p><b>Shortest possible path:</b> <code>pip install -e ".[dev]"</code> → <code>mlf train --data data/raw/sample.csv</code> → <code>mlf serve -a outputs</code>. Everything else on this page is what you add when one of those three stops being enough.</p>
+  </div>
+</div>

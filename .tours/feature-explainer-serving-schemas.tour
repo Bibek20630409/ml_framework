@@ -1,0 +1,92 @@
+{
+  "$schema": "https://aka.ms/codetour-schema",
+  "title": "1. serving/schemas.py — the table that shapes /predict",
+  "description": "354 lines that are really about 90. Read in dependency order — tables first, classes last — instead of top to bottom.",
+  "ref": "feat/p3-gbdt-backend",
+  "steps": [
+    {
+      "directory": "src/ml_framework/serving",
+      "title": "Where you are",
+      "description": "The serving package: `api.py` builds the FastAPI app, `schemas.py` decides what its endpoints accept and return.\n\nThe thing to hold onto for this whole tour: **schemas.py contains almost no logic.** It is a set of small declarations plus four lookup tables. That is why reading it top-to-bottom feels endless — you are reading a catalogue as if it were a story."
+    },
+    {
+      "file": "src/ml_framework/serving/schemas.py",
+      "selection": {
+        "start": { "line": 4, "character": 1 },
+        "end": { "line": 23, "character": 1 }
+      },
+      "title": "The thesis (read this, then skip ahead)",
+      "description": "The whole file in one sentence: request/response models are **selected from a table keyed by `data.kind`**, instead of one hardcoded pair for every model the framework can serve.\n\nWhy it matters: it is what makes `/docs` describe *this deployed model* rather than the framework in general. A self-documenting endpoint is a feature, not tidiness.\n\n**Gotcha:** the paragraph at line 13 is the one people skip. Two tabular request shapes exist — positional `instances` (the v1 contract, kept for existing clients) and named `inputs` (recommended). The named one exists so the server can reorder columns to training order. Silent column reordering is the most common serving defect there is."
+    },
+    {
+      "file": "src/ml_framework/serving/schemas.py",
+      "selection": {
+        "start": { "line": 263, "character": 1 },
+        "end": { "line": 291, "character": 1 }
+      },
+      "title": "The tables — jump here before reading any class",
+      "description": "**These three dicts ARE the file.** Everything above them is just the classes they point at.\n\n`REQUEST_MODELS` maps a data kind to what `/predict` accepts. `RESPONSE_MODELS` maps it to what comes back. `RESPONSE_BY_OUTPUT_KIND` overrides that.\n\n**Gotcha — the third table is the subtle one.** `text` covers three tasks (classification, token tagging, generation) whose *outputs* have nothing in common: one class, one class per token, or a string. So the response cannot be chosen by data kind alone. It is keyed on `signature.output.kind` instead — the field that actually describes what the model emits.\n\nNotice audio and video both map to `LabelledPredictResponse` with a one-line comment saying why: both are classifiers, one label per clip, same as image."
+    },
+    {
+      "file": "src/ml_framework/serving/schemas.py",
+      "line": 300,
+      "title": "The fourth table, and a deliberate refusal",
+      "description": "`DRIFT_CAPABLE_KINDS` is a frozenset containing exactly one thing: `tabular`.\n\nDrift is a distributional comparison over *named numeric features*. PSI over token ids or pixel bytes produces a number with no meaning — so `/drift` answers 501 for those kinds rather than a confident wrong answer.\n\n**Gotcha:** read the P13 note at line 297. Audio and video were added as data kinds and this set deliberately did **not** grow. PSI over PCM samples is the same category of nonsense as PSI over pixels. Audio/video drift is a real problem, but it wants embedding-space distance, not per-feature histograms over a waveform."
+    },
+    {
+      "file": "src/ml_framework/serving/schemas.py",
+      "selection": {
+        "start": { "line": 303, "character": 1 },
+        "end": { "line": 330, "character": 1 }
+      },
+      "title": "The entire public API — 28 lines",
+      "description": "Three functions. That is everything the rest of the codebase calls.\n\n`request_model(kind)` and `response_model(kind, output_kind)` are table lookups that raise `PayloadError` with the known keys listed, rather than a bare `KeyError`. `supports_drift` is a one-line set membership test.\n\nNote the precedence in `response_model`: `output_kind` wins when known, because what a model *emits* is a sharper question than what it *consumes*.\n\n**You have now understood the file's contract.** Everything remaining is the shape of the individual models."
+    },
+    {
+      "file": "src/ml_framework/serving/schemas.py",
+      "selection": {
+        "start": { "line": 41, "character": 1 },
+        "end": { "line": 65, "character": 1 }
+      },
+      "title": "TabularRequest — the only class with real logic",
+      "description": "`instances` (positional) and `inputs` (named) are both optional, and `_exactly_one` enforces that precisely one arrived.\n\n**Gotcha — the XOR idiom.** `(self.instances is None) == (self.inputs is None)` is true when *both* are None and when *neither* is. One comparison rejects both failure modes. It reads strangely the first time and then you see it three more times in this file (`ImageItem`, `MediaItem`) — once you recognize it, those classes cost you no reading at all.\n\nThe second check catches an empty list, which passes the first test but has no rows to score."
+    },
+    {
+      "file": "src/ml_framework/serving/schemas.py",
+      "selection": {
+        "start": { "line": 67, "character": 1 },
+        "end": { "line": 96, "character": 1 }
+      },
+      "title": "to_array — the 30 lines that justify the whole design",
+      "description": "This is the densest code in the file, and the only place worth reading character by character.\n\nThe positional path (line 74) is three lines: coerce to float32, check it is 2D, return. It can only ever verify the *count* of columns.\n\nThe named path is longer because it can fail **usefully**. For each row it computes `expected - set(row)` (missing features) and `set(row) - expected` (unknown features) and raises a `PayloadError` naming the exact columns and row index. Then line 95 builds the row in `feature_names` order — that is the reordering the module docstring promised.\n\n**Gotcha:** line 81. If the bundle recorded no feature names, named `inputs` cannot be ordered at all, and the error tells the caller to send positional `instances` instead. A bundle with no signature degrades to the v1 contract rather than failing opaquely."
+    },
+    {
+      "file": "src/ml_framework/serving/schemas.py",
+      "selection": {
+        "start": { "line": 103, "character": 1 },
+        "end": { "line": 127, "character": 1 }
+      },
+      "title": "TextRequest — and the shape every remaining class repeats",
+      "description": "Learn this five-line skeleton once: a `model_config` forbidding extras, an `inputs` field with `min_length=1`, an `n_rows` property, sometimes a `to_model_input`.\n\n`ImageRequest` (143), `AudioRequest` (177) and `VideoRequest` (187) are **the same shape with a different item type**. Roughly 60 lines you can legitimately skim in thirty seconds, having read this one.\n\n**Gotcha — line 120.** `to_model_input` accepts `feature_names` and ignores it. That is not sloppiness: it gives the hook one signature across every kind, so `/predict` calls it without branching. A text bundle records no feature names because a token sequence has no columns.\n\nThe docstring also explains why clients send raw strings, not token ids: making every client responsible for the right vocabulary is exactly the train/serve skew that bundling the tokenizer exists to prevent."
+    },
+    {
+      "file": "src/ml_framework/serving/schemas.py",
+      "selection": {
+        "start": { "line": 153, "character": 1 },
+        "end": { "line": 174, "character": 1 }
+      },
+      "title": "MediaItem — an asymmetry that looks like a bug and isn't",
+      "description": "`MediaItem` requires `media_type`. `ImageItem` (line 130) has no such field. If you read this file top-to-bottom that difference looks like an oversight, and this is the one place where scanning actively misleads you.\n\nThe docstring answers it: an image decoder can sniff JFIF or PNG magic from the first bytes. Audio cannot — raw MP3 frames have no container and no reliable header — and guessing wrong selects a decoder **whose failure mode is silent**. Naming the type costs the caller one field; the alternative is a wrong answer nobody sees.\n\nThis is the pattern to watch for across the repo: where two sibling types differ, there is usually a comment explaining the difference. Those comments are worth more per line than the code."
+    },
+    {
+      "file": "src/ml_framework/serving/api.py",
+      "line": 155,
+      "title": "Where the table is actually consumed",
+      "description": "`request_model(inf.data_kind).model_validate(body)` — one line in `/predict`. The bundle manifest says what kind it is, the table produces the matching Pydantic model, Pydantic validates the body.\n\nLine 169 then reaches for `to_model_input` via `getattr`, and treats a **missing** hook as a bug rather than a 501 — read the comment above it. Line 309 picks the response model using both the data kind and `signature.output.kind`, which is the override table from step 3 doing its job.\n\nSeeing the consumer is what makes the declarations stop looking arbitrary."
+    },
+    {
+      "title": "You can now...",
+      "description": "Add a data kind end to end: define a request model with the five-line skeleton, add one row to `REQUEST_MODELS` and one to `RESPONSE_MODELS`, and decide whether it belongs in `DRIFT_CAPABLE_KINDS` (it probably doesn't).\n\nThe fastest way to confirm you've got it: run the server and open `/docs`. The schema FastAPI renders is literally the class the table selected.\n\nNext, take tour **2. cli.py** — same problem, a file four times longer, and a completely different reading strategy."
+    }
+  ]
+}

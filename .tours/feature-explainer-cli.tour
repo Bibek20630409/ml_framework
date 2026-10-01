@@ -1,0 +1,93 @@
+{
+  "$schema": "https://aka.ms/codetour-schema",
+  "title": "2. cli.py — one shape, twelve times",
+  "description": "1230 lines that are one pattern repeated per subcommand. Trace a single command end to end instead of reading the file.",
+  "ref": "feat/p3-gbdt-backend",
+  "steps": [
+    {
+      "file": "src/ml_framework/cli.py",
+      "selection": {
+        "start": { "line": 7, "character": 1 },
+        "end": { "line": 21, "character": 1 }
+      },
+      "title": "The map is at the top",
+      "description": "Fifteen lines listing every command the file implements. This is the table of contents — the remaining 1200 lines are these commands, one at a time.\n\n**The structure to hold in your head:**\n\n- lines 73–543: `_helper` functions\n- lines 544–772: `build_parser()`, a catalogue of flags\n- lines 774–950: a few big helpers (`_run_select`, report loading)\n- lines 951–1230: `main()`, a chain of independent `if args.command == ...` branches\n\nBranches do not talk to each other. `export` knows nothing about `materialize`. That independence is why you never need to hold the whole file in your head at once."
+    },
+    {
+      "file": "src/ml_framework/cli.py",
+      "selection": {
+        "start": { "line": 23, "character": 1 },
+        "end": { "line": 45, "character": 1 }
+      },
+      "title": "The three design decisions worth knowing first",
+      "description": "**`train` tunes by default** under a per-backend budget (300s trees / 900s nets). `--no-tune` opts out.\n\n**`select` does NOT run by default**, and the asymmetry is deliberate: a bake-off costs one tuning budget *per candidate family*, so it is a decision to make rather than one to inherit.\n\n**The precedence chain at line 40** is the single most useful line in the docstring:\n\n`plugin defaults < synthesis < YAML file < --set < explicit CLI flags`\n\nEverything confusing in `_load_config` is an implementation of that one line. You will see it again in step 6."
+    },
+    {
+      "file": "src/ml_framework/cli.py",
+      "line": 951,
+      "title": "main() — start here, not at the top of the file",
+      "description": "Three lines: build the parser, parse, set up logging. Then a chain of branches.\n\n`build_parser()` is called but you are **not** going to read it yet. Treat it as a black box that turns `sys.argv` into `args`. Step 5 explains why.\n\nThe first branch (955–971) handles `models` / `backends` / `data-backends` / `decoders` together: they import the plugin package — which is what *populates* the registry — then render it. Note they all return before reaching any config loading. That early-return property turns out to be the file's real structure."
+    },
+    {
+      "file": "src/ml_framework/cli.py",
+      "line": 1177,
+      "title": "THE hinge — the one line that organizes main()",
+      "description": "`cfg = _load_config(args)`.\n\n**Everything above this line is a command that needs no config and returns early.** `models`, `backends`, `decoders`, `materialize`, `export`, `dockerfile`, `init`, `migrate-config`, `serve` — all of them `return` before reaching 1177.\n\n**Everything below it is config-driven:** `lr`, `tune`/`hpo`, `select`, `train`.\n\nThat is the whole 280-line function in one sentence. Once you see this split, `main()` stops being a wall and becomes two short lists.\n\n**Gotcha:** `serve` sits just above the line (1137) and deliberately so — it loads a *bundle* from `--artifacts`, not an experiment config. A trained model carries its own settings; re-supplying the training YAML at serve time would be a way to serve something the bundle never agreed to."
+    },
+    {
+      "file": "src/ml_framework/cli.py",
+      "selection": {
+        "start": { "line": 1050, "character": 1 },
+        "end": { "line": 1070, "character": 1 }
+      },
+      "title": "Read ONE command end to end — `export`",
+      "description": "Twenty-one lines, and it is the canonical branch shape. Every other branch is this:\n\n1. **imports inside the branch** (1051–1053) — heavy modules are imported lazily so `mlf --help` stays fast. Those lines are noise for comprehension; skip them everywhere.\n2. **do the work** — load the bundle, get its backend, call `export`.\n3. **catch `FrameworkError` and friends, `log.error`, `return 1`** — the uniform failure contract.\n4. **print, `return 0`.**\n\n**Gotcha at 1066:** `if result.notes` is not decoration. The note says \"preprocessing is NOT included\" — the difference between an exported artifact that works and one that silently scores nonsense.\n\n**You now understand eleven more commands**, because they are all this shape. Compare `materialize` at 973 — longer, but the same skeleton with more validation in the middle."
+    },
+    {
+      "file": "src/ml_framework/cli.py",
+      "line": 544,
+      "title": "build_parser() — consult it, never read it",
+      "description": "About 230 lines, and almost none of it is logic. It is a flat sequence of `sub.add_parser(...)` followed by `add_argument(...)` calls.\n\n**Use it as a reference, not a chapter.** When you want to know what `--tune-budget` is named or what `--shuffle` accepts, `Ctrl+F` here. Do not read it start to finish; there is nothing to understand, only things to look up.\n\nThe payoff for skimming: the *comments between* the parsers. Line 548 on why `models` takes no config. Line 565 on why `data-backends` is its own verb rather than a flag. Line 589 on why `materialize` exists at all — two of the four integrity classes are invisible at training time, because an MP3 resyncs past damage and a hardware decoder emits green frames, both producing correctly-shaped tensors nothing will ever flag.\n\nThose comments carry the design. The `add_argument` calls between them carry nothing."
+    },
+    {
+      "file": "src/ml_framework/cli.py",
+      "selection": {
+        "start": { "line": 99, "character": 1 },
+        "end": { "line": 141, "character": 1 }
+      },
+      "title": "_load_config — the precedence chain, made real",
+      "description": "Here is `plugin defaults < synthesis < YAML < --set < flags` as code.\n\n`layers` is a list of plain dicts. `--data` runs `synthesize()` and appends its dict (112–125). `--config` appends the parsed YAML *after* it (127–129). Then 136–137 folds them left to right with `merge`, so the YAML wins on exactly the keys it sets, and synthesis survives everywhere else. `--set` overrides are applied last, at 140.\n\n**This is the whole zero-config mechanism**, and the docstring makes the key point: nothing below here can tell which layer a value came from. That is precisely what lets `--data` and `--config` *compose* rather than being alternatives.\n\n**Gotcha at 130:** `elif not layers` — with neither flag there is nothing to load, and it exits with a message instead of validating an empty dict into a confusing schema error."
+    },
+    {
+      "file": "src/ml_framework/cli.py",
+      "selection": {
+        "start": { "line": 149, "character": 1 },
+        "end": { "line": 167, "character": 1 }
+      },
+      "title": "The table-driven trick — worth stealing",
+      "description": "Seven CLI flags need folding into seven config paths. Instead of seven `if` blocks, the pairs are a tuple of tuples and the dict comprehension keeps only the flags that are not `None`.\n\nRead the comment at 149: *the mapping IS the information*. A flag added without a config path becomes a visibly missing row rather than a silently absent branch.\n\n**Gotcha — `None` is load-bearing throughout this file.** Every one of these flags defaults to `None`, never to the schema's value, so \"the user asked for this\" stays distinguishable from \"nobody said\". That is what makes the per-backend tuning budgets possible. You will see the same discipline in `_apply_tune_args` (293) and in the paired `--pin-memory` / `--no-pin-memory` flags at 241–253, where a plain `store_true` default would have destroyed the distinction."
+    },
+    {
+      "file": "src/ml_framework/cli.py",
+      "selection": {
+        "start": { "line": 169, "character": 1 },
+        "end": { "line": 177, "character": 1 }
+      },
+      "title": "The subtlest eight lines in the file",
+      "description": "`args.auto_selected` records whether the **framework** chose the model, which decides whether the trivial baseline gets scored.\n\nRead the condition carefully: it is not set when synthesis runs. It compares `cfg.model.name` against the value synthesis chose, *after every layer has been applied*. A YAML, a `--set`, or an explicit `--model` may have overridden the choice — and then the user has their own frame of reference and the baseline is not the point.\n\n**Gotcha:** it is stored on `args`, not in the config, because it is a fact about *this invocation*, not about the experiment. Putting it in the config would make it serialize into the emitted YAML, where it would be a lie on the next run.\n\nIt is consumed exactly once, at line 1224."
+    },
+    {
+      "file": "src/ml_framework/cli.py",
+      "selection": {
+        "start": { "line": 1209, "character": 1 },
+        "end": { "line": 1226, "character": 1 }
+      },
+      "title": "The train branch — where every thread lands",
+      "description": "The terminal branch, and the payoff for the tour. Every mechanism you have seen shows up in eighteen lines.\n\n`_apply_select_args` folds the bake-off flags in. `--select` flips `select.enabled`. `--folds` overrides the split. Then `train()` is called with `emit_config`, `resume`, and `baseline=args.auto_selected` — the flag computed 1000 lines earlier, in step 9.\n\nNote `_apply_tune_args` already ran at 1184, *above* the `tune`/`hpo` branch, so `train` and `tune` share one interpretation of the tuning flags rather than each having their own.\n\n**Gotcha:** unlike every other branch, this one does not `return` inside the `if` — it falls through to the shared `return 0` at 1226."
+    },
+    {
+      "title": "You can now...",
+      "description": "**Trace any command in about five minutes:** find its `sub.add_parser` in `build_parser`, find its `if args.command ==` branch in `main`, and read that branch. Nothing else in the file is relevant to it.\n\n**The active version, which beats reading:**\n\n```\npython -m pdb -m ml_framework.cli export --artifacts outputs --format onnx -o model.onnx\n```\n\nBreak at the top of `main()` and step. You will watch it fall through ten branches it does not care about and execute maybe forty lines. Seeing how little of a 1230-line file actually runs for one command is the thing that permanently changes how large files feel.\n\n**Add a command** by copying the shape: a parser block, a branch, lazy imports, `log.error`/`return 1` on `FrameworkError`, `print`/`return 0` on success. Decide whether it goes above line 1177 (no config) or below it (config-driven) — that placement is the design decision, and the rest is mechanical."
+    }
+  ]
+}
