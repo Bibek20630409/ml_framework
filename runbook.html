@@ -432,13 +432,13 @@ dvc metrics show     # the scores DVC tracks, read from outputs/metrics.json</pr
         <dt>dvc remote add / modify</dt>
         <dd>writes <b>.dvc/config</b> — no project code involved</dd>
         <dt>spark_preprocess</dt>
-        <dd><b>src/ml_framework/pipeline/spark_preprocess.py</b><i>:84</i> <code>main()</code> → <i>:38</i> <code>preprocess()</code></dd>
+        <dd><b>src/ml_framework/pipeline/spark_preprocess.py</b><i>:91</i> <code>main()</code> → <i>:45</i> <code>preprocess()</code></dd>
         <dt>--data-backend, on any of them</dt>
         <dd><b>src/ml_framework/core/registry.py</b><i>:169</i> <code>get_data_backend()</code> → <b>src/ml_framework/data/backends/local.py</b> · <b>polars_backend.py</b> · <b>spark.py</b></dd>
         <dt>contracts</dt>
-        <dd><b>src/ml_framework/pipeline/contracts.py</b><i>:70</i> <code>main()</code> → <i>:53</i> <code>validate_file()</code> → <i>:41</i> <code>validate_dataframe()</code></dd>
+        <dd><b>src/ml_framework/pipeline/contracts.py</b><i>:76</i> <code>main()</code> → <i>:59</i> <code>validate_file()</code> → <i>:47</i> <code>validate_dataframe()</code></dd>
         <dt>dvc repro / dag / status</dt>
-        <dd><b>dvc.yaml</b> — stage <code>preprocess</code> shells the module above, stage <code>train</code> shells <code>mlf train</code>; its <code>${…}</code> come from <b>params.yaml</b></dd>
+        <dd><b>dvc.yaml</b> — stage <code>preprocess</code> shells the module above, stage <code>train</code> shells <code>mlf train</code>; its <code>${…}</code> come from <b>params.yaml</b> and, for <code>data.target</code>/<code>data.path</code>, from the train config it loads as <code>vars</code> (<b>configs/dvc_tabular.yaml</b>)</dd>
         <dt>dvc metrics show</dt>
         <dd><b>dvc.yaml</b> <code>metrics:</code> → <code>outputs/metrics.json</code>, written by <b>src/ml_framework/pipeline/train.py</b></dd>
         <dt>make dvc-repro / benchmark</dt>
@@ -1000,21 +1000,21 @@ docker compose -f docker-compose.airflow.yml logs --tail=50 airflow-scheduler
         <dt>docker compose -f … up</dt>
         <dd><b>orchestration/airflow/docker-compose.airflow.yml</b> — <code>airflow-init</code> is a service in that file, not a subcommand</dd>
         <dt>the DAG</dt>
-        <dd><b>orchestration/airflow/dags/ml_pipeline.py</b><i>:134</i> — <code>schedule="@daily"</code>; the chain is built at <i>:208</i></dd>
+        <dd><b>orchestration/airflow/dags/ml_pipeline.py</b><i>:166</i> — <code>schedule="@daily"</code>; the chain is built at <i>:233</i></dd>
         <dt>assert_pinned_config</dt>
-        <dd><b>dags/ml_pipeline.py</b><i>:142</i>, callable at <i>:84</i> — reads <code>TRAIN_CONFIG</code> (<i>:56</i>), <code>retries=0</code></dd>
+        <dd><b>dags/ml_pipeline.py</b><i>:174</i>, callable at <i>:115</i> — reads <code>TRAIN_CONFIG</code> (<i>:56</i>), <code>retries=0 (:177)</code></dd>
         <dt>dvc_pull</dt>
-        <dd><b>dags/ml_pipeline.py</b><i>:148</i> — a <code>BashOperator</code>, so <b>dvc.yaml</b> / <b>.dvc/config</b></dd>
+        <dd><b>dags/ml_pipeline.py</b><i>:180</i> — a <code>BashOperator</code>, so <b>dvc.yaml</b> / <b>.dvc/config</b></dd>
         <dt>spark_preprocess</dt>
-        <dd><b>dags/ml_pipeline.py</b><i>:153</i> → <b>src/ml_framework/pipeline/spark_preprocess.py</b></dd>
+        <dd><b>dags/ml_pipeline.py</b><i>:189</i> → <b>src/ml_framework/pipeline/spark_preprocess.py</b></dd>
         <dt>validate_data</dt>
-        <dd><b>dags/ml_pipeline.py</b><i>:163</i> → <b>src/ml_framework/pipeline/contracts.py</b></dd>
+        <dd><b>dags/ml_pipeline.py</b><i>:201</i> → <b>src/ml_framework/pipeline/contracts.py</b></dd>
         <dt>train</dt>
-        <dd><b>dags/ml_pipeline.py</b><i>:176</i> → <code>mlf train --config $TRAIN_CONFIG</code> → <b>src/ml_framework/pipeline/train.py</b></dd>
+        <dd><b>dags/ml_pipeline.py</b><i>:212</i> → <code>mlf train --config $TRAIN_CONFIG</code> → <b>src/ml_framework/pipeline/train.py</b></dd>
         <dt>evaluate_gate · promote_model</dt>
-        <dd><b>dags/ml_pipeline.py</b><i>:185 · :186</i> — Python callables in the same file; promotion goes through <b>src/ml_framework/tracking/mlflow_utils.py</b></dd>
+        <dd><b>dags/ml_pipeline.py</b><i>:221 · :222</i> — Python callables in the same file; promotion calls <code>MlflowClient.set_registered_model_alias</code> directly (<i>:158</i>)</dd>
         <dt>trigger_deploy</dt>
-        <dd><b>dags/ml_pipeline.py</b><i>:188</i></dd>
+        <dd><b>dags/ml_pipeline.py</b><i>:224</i></dd>
         <dt>make airflow-up</dt>
         <dd><b>Makefile</b><i>:67</i></dd>
       </dl>
@@ -1227,7 +1227,7 @@ kubectl -n ml-framework rollout status  deployment/ml-framework-api --timeout=18
       <div class="rh">what actually runs</div>
       <dl>
         <dt>get_model_version_by_alias</dt>
-        <dd><b>the only authoritative answer.</b> The same client call <b>orchestration/airflow/dags/ml_pipeline.py</b><i>:147–160</i> writes with <code>set_registered_model_alias</code></dd>
+        <dd><b>the only authoritative answer.</b> The same client call <b>orchestration/airflow/dags/ml_pipeline.py</b><i>:149–159</i> writes with <code>set_registered_model_alias</code></dd>
         <dt>what the pods read</dt>
         <dd><b>deploy/k8s/api.yaml</b> <code>command: ["mlf","serve"]</code> with <code>--registry-model $(MODEL_NAME) --registry-stage $(REGISTRY_STAGE)</code> → <b>src/ml_framework/tracking/mlflow_utils.py</b><i>:119</i> <code>models:/{name}/{stage}</code>. The pod spec names an <i>alias</i>, never a version — which is why moving the alias is the real deploy</dd>
         <dt>rollout undo</dt>

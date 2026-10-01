@@ -1,7 +1,7 @@
 # ML Framework
 
-Production-grade training + serving framework for **tabular**, **image**, **text** and
-**time-series** data. Supports binary/multi-class classification, regression,
+Production-grade training + serving framework for **tabular**, **image**, **text**,
+**time-series**, **audio** and **video** data. Supports binary/multi-class classification, regression,
 forecasting, token classification and seq2seq across neural networks (PyTorch
 Lightning), transformers (HuggingFace), gradient-boosted trees (XGBoost, LightGBM,
 CatBoost) and statistical forecasters (Prophet, ARIMA, seasonal-naive) — driven
@@ -31,12 +31,14 @@ immediately with the command that fixes it —
 model 'xgboost' requires xgboost>=2.0. Install it with: pip install 'ml-framework[gbdt]'
 ```
 
-All 17 extras:
+All 19 extras:
 
 | Extra | Brings | For |
 |---|---|---|
 | `lightning` | torch, pytorch-lightning, torchmetrics | `mlp`, `cnn`, `ts.lstm`, every `nlp.*` |
 | `image` | torchvision, Pillow | `cnn` and the image source — install *with* `lightning` |
+| `audio` | soundfile, torchaudio | the `audio.flac` decoder and `audio.cnn` — install *with* `lightning` |
+| `video` | av (PyAV) | the `audio.mp3`, `audio.opus` and `video.h264` decoders |
 | `gbdt` | xgboost, lightgbm, catboost | the three tree families |
 | `timeseries` | statsmodels, prophet | `ts.arima`, `ts.prophet` |
 | `nlp` | transformers, tokenizers, datasets | `nlp.hf_text`, `nlp.hf_token`, `nlp.hf_seq2seq` |
@@ -54,7 +56,8 @@ All 17 extras:
 | `dev` | every runtime + the toolchain | running the suite |
 
 > **torch + torchvision are a pair.** Every torchvision release pins one exact
-> torch patch, so install `[lightning,image]` together and from one index.
+> torch patch, so install `[lightning,image]` together and from one index. The same
+> holds for torchaudio and `[lightning,audio]`.
 
 ## Quickstart
 
@@ -167,19 +170,21 @@ src/ml_framework/
 │   ├── evaluate.py      report.txt · predictions.csv · confusion_matrix.txt
 │   ├── baseline.py      the trivial predictor every chosen-model run is scored against
 │   ├── profile.py       latency (warmed p50/p95/p99) · artifact bytes · fit seconds
+│   ├── stall.py         data-wait / GPU-stall profile · stall.json · faults.json
 │   ├── explain.py       attribution tiers: native 1.0 → shap 0.8 → permutation 0.5
 │   ├── export.py        ONNX · TorchScript · native · pickle
 │   ├── inference.py     Inferencer.from_artifacts(dir) — imports no torch
 │   └── registry.py      MODELS / BACKENDS / SOURCES / DATA_BACKENDS
-├── backends/            one per fit-loop shape — lightning.py owns pl.Trainer
-├── plugins/             mlp · cnn · gbdt/ (xgboost…) · ts/ (naive…) · nlp/ (hf_text, hf_token, hf_seq2seq)
+├── backends/            one per fit-loop shape — lightning.py owns pl.Trainer · staged.py (epoch/stall/fault callback)
+├── plugins/             mlp · cnn · audio · video · gbdt/ (xgboost…) · ts/ (naive…) · nlp/ (hf_text, hf_token, hf_seq2seq)
 ├── data/
 │   ├── backends/        the processing engine: local (pandas) · polars · spark
-│   ├── sources/         tabular · image · text · timeseries
-│   ├── preprocess/      scaling, imbalance, tokenizers, windows
+│   ├── sources/         tabular · image · text · timeseries · audio · video (staged_folder)
+│   ├── preprocess/      scaling, imbalance, tokenizers, windows, mel front-end, clip layout
+│   ├── streaming/       staged decode: decoders/ · shard index · sampler · materialize · tail probe
 │   ├── splitters.py     random · temporal · group · rolling-origin · purged · CPCV
 │   └── sniff.py         data-kind / target / task detection
-├── pipeline/            train · select · tune · lr_finder · spark_preprocess · contracts
+├── pipeline/            train · select · tune · lr_finder · spark_preprocess · contracts · stage_config
 ├── monitoring/          drift.py (PSI/KS) · model_quality.py (delayed labels)
 ├── serving/api.py       FastAPI: /health /predict /predict_proba
 │                        /predict_with_confidence /drift /metrics
@@ -243,8 +248,8 @@ way with `SourceSpec`.
 - Self-contained artifact bundle v2: `manifest.json` (the only file a loader must
   understand) · `config.json` · `model/` · `preprocessor/` · `metrics.json` ·
   `report.txt` · `predictions.csv` · `confusion_matrix.txt` · `reference_stats.json`
-  (the drift baseline) · `hpo.json` — plus `cv.json` when cross-validating and
-  `selection.json` after a bake-off
+  (the drift baseline) · `hpo.json` · `stall.json` · `faults.json` — plus `cv.json`
+  when cross-validating and `selection.json` after a bake-off
 
 ## Task reference
 
@@ -703,6 +708,35 @@ obvious alternative — does not raise. It makes one word's single decision coun
 once per piece, re-weighting the corpus toward whichever words the tokenizer
 fragments most, which is exactly the rare proper nouns NER is about.
 
+## Audio and video
+
+`data.kind: audio` and `data.kind: video` read a folder of clips, one
+sub-directory per class. Anything that has to be decoded goes through one offline
+pass first — `mlf train` refuses a corpus that has not, and names the command:
+
+```bash
+pip install -e '.[lightning,audio]'          # FLAC/WAV; add `video` for MP3, Opus and MP4/H.264
+mlf decoders                                  # which formats this install can read, and how each fails
+mlf materialize --data ./clips --max-fault-rate 0.02   # decode-probe every sample, write the shard index
+mlf train --data ./clips                      # sniffs the kind, picks audio.cnn / video.r3d, trains
+```
+
+`materialize` writes `_mlf_shards/` beside the data — `shards.json`,
+`entries.jsonl` and `faults.jsonl` — and is the **only** place the fault ceiling
+aborts. At training time a corrupt sample is *substituted*, never skipped: under DDP
+every rank must produce the same number of batches, and a content-dependent skip is
+a collective hang with no error message. What was substituted lands in the bundle's
+`faults.json`, and how long the run waited on data in `stall.json`.
+
+Storage → tensor is seven named stages — `read · demux · decode` belong to the
+decoder, `construct · transform · h2d · gpu_transform` to the preprocessor. With a
+CUDA device the transform (the mel front-end, the clip permute) runs **after** the
+host→device copy, so workers stay on IO and the bus carries the smaller tensor;
+`--no-device-transform` turns that off to compare. `mlf materialize -c cfg.yaml
+--probe-full` pushes one batch through all seven before a run commits to them.
+
+Serving does not accept audio or video yet — `/predict` returns `501` for these
+bundles.
 
 ## Zero-config
 

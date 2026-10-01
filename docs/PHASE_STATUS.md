@@ -24,7 +24,7 @@ predict what actually happened stops being evidence of anything.
 | P10 — Exporter migration | **partial** — ONNX done, TorchScript open | see below |
 | P11 — Model selection | **done** | `c42dc04` |
 | P12 — Pluggable data backends | **done** — all five phases | `c42dc04` |
-| P13 — Staged decode pipeline | **done** — all five sub-phases | see below |
+| P13 — Staged decode pipeline | **done** — all six sub-phases (a–f) | see below |
 
 P11 and P12 share a commit. They were developed in sequence but could not be split
 into two: `cli.py`, `config/schema.py` and `core/registry.py` each carry changes for
@@ -51,9 +51,10 @@ v1 *bundles* still load (`test_v1_bundle_compat.py`); v1 *configs* do not, and
 
 ## Test baseline
 
-**922 passed, 18 skipped** with every declared extra installed except DVC
+**1247 passed, 22 skipped** with every declared extra installed except DVC
 (46/4 before P0 → 130/4 after P0 → 249/4 after P1 → 258/1 → 284/1 after P2 → 355/1 after P3 → 395/1 after P4 → 429/1 after P5 → 458/1 after P6 → 471/1 after the image-augmentation fix → 511/1 after P7 → 549/1 after the two NLP tasks → 555/1 after `mlf models` → 563/1 after the HF cache pin → 621/1 after P8 →
-641/1 after P9 → 643/1 after the P10 ONNX half → 811/1 after P11 → **922/18** after P12). Every phase gate is measured against this number — a phase that ends
+641/1 after P9 → 643/1 after the P10 ONNX half → 811/1 after P11 → 922/18 after P12 → 1181/18 after P13a–e → 1240/22 after P13f →
+**1247/22** after the config-drift guard). Every phase gate is measured against this number — a phase that ends
 with fewer passing tests than it started with has regressed something, regardless
 of what its own new tests say.
 
@@ -63,7 +64,9 @@ machine does not have (`shutil.which("java")`), not on an uninstalled package �
 pyspark itself imports fine here, which is exactly why `importorskip` is not the
 gate. They run in the `spark-contract` CI job, which refuses to pass by skipping.
 The Polars backend added in P12's last phase needs no JVM, so its share of the
-same suites runs here rather than skipping.
+same suites runs here rather than skipping. **It rose again, 18 → 22, at P13f**, for
+the same kind of reason: the four are `gpu`-marked tests gated on
+`torch.cuda.is_available()`, not on a missing package.
 
 **Read the 257 → 256 step carefully: it was not a regression** (2 parquet-guard tests then took it to 258). Installing
 `torchvision` makes `MODELS.is_available("cnn")` true, so
@@ -1535,9 +1538,10 @@ the ratios can be re-measured rather than trusted.
 
 ## P13 — Staged decode pipeline
 
-**All five sub-phases landed.** Test baseline: **1181 passed, 18 skipped** (up from 922;
-the 18 remain the JVM-gated Spark tests — P13a added 62, P13b 112, P13c 26, P13d 29 and
-P13e 30, and none of them skipped, because all five rest on the zero-dependency decoders).
+**All six sub-phases landed.** Test baseline: **1240 passed, 22 skipped** (up from 922;
+P13a added 62, P13b 112, P13c 26, P13d 29, P13e 30 and P13f 59). Of the skips, 18 remain
+the JVM-gated Spark tests and 4 are P13f's `gpu`-marked tests, which need a CUDA device;
+none of P13a–e's tests skipped, because all five rest on the zero-dependency decoders.
 
 Storage → tensor is eleven stages, and this framework previously expressed about
 three of them. The two claims driving the phase:
@@ -1553,7 +1557,7 @@ three of them. The two claims driving the phase:
    NVDEC garbage frames — which yield valid-shaped tensors that degrade the model
    without tripping any handler.
 
-### P13a — decoder registry and stage vocabulary (done)
+### P13a — decoder registry and stage vocabulary (done, `d189bb3`)
 
 Zero behaviour change: nothing outside `data/streaming/` imports it yet.
 
@@ -1604,7 +1608,7 @@ Four decisions in that table worth keeping:
   no device memory is what lets CI execute all three. A real DALI/NVDEC decoder
   registers identically.
 
-### P13b — shards, sampler, dataset, state, materialize (done)
+### P13b — shards, sampler, dataset, state, materialize (done, `b1b2c5c`)
 
 The layer that makes the parity guarantee real. Needs no optional dependency: it is
 tested end to end with `audio.pcm` and `text.tokens` alone.
@@ -1660,7 +1664,7 @@ to pass, the design has regressed.
   `n_samples`, which is the one number that must not depend on the state of the
   bytes. Verified against a corpus with 15% corruption: the index declares 20, not 17.
 
-### P13c — the transport tail (done)
+### P13c — the transport tail (done, `bebc52e`)
 
 The stages after decode — wrap as tensor, collate, **pin**, **H2D** — which the
 framework did not have at all: `pin_memory`, `persistent_workers` and
@@ -1709,7 +1713,7 @@ Existing tabular bundles already carry C-contiguous float32, so `from_numpy` tak
 the fast path and produces bit-identical tensors — zero-copy is an optimization,
 and an optimization that changed a number would be a bug.
 
-### P13d — `audio` and `video` as data kinds (done)
+### P13d — `audio` and `video` as data kinds (done, `0286299`)
 
 The first sources that consume P13's machinery end to end. `mlf train --data ./clips`
 now sniffs an audio corpus, picks `audio.cnn`, reads through the shard index and the
@@ -1774,7 +1778,7 @@ indexing: 4 substitutions per epoch, each drawn from the same shard, run complet
 normally, `faults/rank0-worker0.jsonl` records each one with the index served instead.
 A healthy run writes no fault file at all.
 
-### P13e — stall profiler, epoch shuffling and the fault→tracker path (done)
+### P13e — stall profiler, epoch shuffling and the fault→tracker path (done, `1fae4da`)
 
 The last sub-phase, and the one that makes the previous four *legible*: it reports
 what fraction of a run went into waiting for data, and it wires up the sampler and
@@ -1823,16 +1827,72 @@ scope (the CUDA event timing is imported inside its methods).
 **Verified end to end**: a four-epoch audio run reports `data_wait_pct: 56.9`,
 `gpu_stall_pct: null`, and writes both JSON files plus the `report.txt` block.
 
+### P13f — the pipeline's tail, named; the transform moved past H2D (done, `8f903b5`)
+
+Storage → tensor was seven stages wearing three names: `read`/`demux`/`decode` were
+declared per decoder and probed offline, and everything after them was fused into one
+opaque `collate_fn` in a DataLoader worker — so nothing after decode could be placed,
+probed or declared.
+
+* `Stage` grows to `read · demux · decode · construct · transform · h2d ·
+  gpu_transform`; `DecoderStage` narrows to the first three, so a decoder declaring
+  `h2d` is a type error. The tail is declared by the preprocessor
+  (`BasePreprocessor.stages`), because nothing about it belongs to a codec.
+* **Construct is separated from transform.** `build_tensor` attaches dtype, shape and
+  strides and stops; `transform_batch` does the dtype/layout/scale change.
+* **The transform actually runs on the GPU now.** `audio.py` had claimed its mel
+  front-end ran "on the GPU when there is one"; it never did — the collate built a CPU
+  tensor in a worker, so `mel.to(x.device)` resolved to CPU on every run.
+  `BundleDataModule.defers_transform` moves `transform_batch` to
+  `on_after_batch_transfer` when there is a CUDA device, the decoder landed on the
+  host, and the preprocessor declared the work device-agnostic. For video the bus now
+  carries uint8 rather than float32. `runtime.device_transform` /
+  `--no-device-transform` turns it off to compare; `mlf lr` turns it off itself,
+  because `torch_lr_finder` drives the loader and the post-copy hook never fires.
+* **`mlf materialize --probe-full`** pushes one batch of cleanly-decoded samples
+  through construct/transform/h2d/gpu_transform (`data/streaming/tail_probe.py`) and
+  checks the device transform against the host one rather than trusting the
+  declaration. The offline walk covered only the head, so a corpus could probe clean
+  and still die on step 1.
+
+**Also closed:** `host_array()` refuses a device handle by name (`np.asarray` on one
+produced a 0-d object array, reachable from `audio.py`); `mlf materialize` derives
+decoder params through `decoder_params_for()` instead of passing
+`data.decoder_params` raw, so video no longer materializes at the decoder's default
+geometry; audio construct allocates the batch buffer once and casts each clip straight
+into its row (bit-identical, asserted by a regression test).
+
+Gate: **1240 passed, 22 skipped** — the four new skips are `gpu`-marked tests that
+need a CUDA device. mypy / ruff / black clean, coverage 87.32%.
+
+### Post-P13 — one owner for the target column and the data path (`275acc8`)
+
+Not a phase; a fix to the pipeline definition files. `data.target` and `data.path`
+were typed out in four places that had to agree by hand — `params.yaml`, the train
+config, and twice in the Airflow DAG — and neither DVC nor Airflow runs in CI, which
+is how a stale `outs:` list had already survived two phases unnoticed.
+
+* `pipeline/stage_config.py` — `resolve()` reads both from the train config the stage
+  is pointed at; explicit `--target-col`/`--output` still win, for ad-hoc runs. It
+  reads the YAML rather than building an `ExperimentConfig`, because a preprocess
+  stage must not fail on a config that cannot yet describe a valid *training* run.
+* `dvc.yaml` loads the train config as `vars`, and tracks `data.target`/`data.path`
+  as `params` so a changed column invalidates the preprocess stage. `params.yaml`
+  keeps only what belongs to the pipeline: the raw input and the pinned config.
+* The DAG gains `assert_pinned_config`, which fails the run before `dvc pull` if
+  `TRAIN_CONFIG` has `select.enabled: true` or no `model.name`. The in-DAG selection
+  fan-out is gone: the daily DAG retrains, it does not choose
+  ([MLOPS.md §4](MLOPS.md#4-airflow--orchestration)).
+* `tests/unit/test_config_drift.py` reads the definition files as data — no DVC or
+  Airflow needed — and asserts the values are not duplicated.
+
 ### Known gaps P13 leaves open, deliberately
 
-1. **Nothing consumes the registry yet.** `decoder_for` resolves and instantiates,
-   but no source calls it — that is P13b/P13d. The phase is a foundation, and its
-   gate was "`mlf decoders` prints the table truthfully on a bare install".
-2. **`audio`/`video` are in `DataKind` with no source behind them.** Setting
-   `data.kind: audio` today reaches `SOURCES` and fails with "unknown source", which
-   is a clear error but not the eventual one. `_check_required_by_kind` grows its
-   cases in P13d.
-3. **The compressed-audio and video decoders are still untested against real files.**
+The two gaps first recorded here — *nothing consumes the decoder registry* and
+*`audio`/`video` are in `DataKind` with no source behind them* — were P13a's
+foundation-only state, and were closed by P13b and P13d respectively.
+
+1. **The compressed-audio and video decoders are still untested against real files.**
    Both are gated on `av`, which is not installed here, so `audio.mp3`, `audio.opus`
    and `video.h264` are exercised only as registry entries. `audio.mp3` now emits the
    `expected_samples`/`n_samples` pair `mlf materialize` compares and the comparison
@@ -1841,20 +1901,26 @@ scope (the CUDA event timing is imported inside its methods).
    Neither can be synthesized without an encoder. **This is the largest remaining
    hole in P13**: the two rows the reference table calls most dangerous are the two
    with no end-to-end coverage.
-4. **Mid-epoch resume is wired but not proven against a real interrupted run.**
+2. **Mid-epoch resume is wired but not proven against a real interrupted run.**
    `state_dict`/`load_state_dict` round-trip and the skip arithmetic are unit-tested,
    and the corpus-changed refusal works — but no test kills a run mid-epoch and
    restarts it, because doing so reliably in CI needs a fixture that can be
    interrupted deterministically.
-5. **Nothing is proven under an actual multi-process DDP run.** The batch-count
+3. **Nothing is proven under an actual multi-process DDP run.** The batch-count
    parity argument is verified by instantiating `DistributedSampler` for two ranks
    directly, which tests the arithmetic that matters and needs no process group.
    What it does not test is the collective behaviour itself — that needs two real
    processes and a GPU box, which is the same gap P12's `spark-contract` job has.
-6. **The stall profiler's 10-batch warmup consumes a small epoch.** A corpus with
+4. **The stall profiler's 10-batch warmup consumes a small epoch.** A corpus with
    fewer than 11 batches reports `measured: false` with a reason rather than a
    number. Correct, and thin on toy data; real runs have hundreds of batches.
-5. **Parquet is deliberately not a decoder row.** Its read/demux/decode is already
+5. **`DEVICE_AGREEMENT_TOLERANCE` is unvalidated on hardware** (P13f). It was chosen
+   on a CPU-only machine, where the device path is a no-op copy and the observed drift
+   is exactly 0. Calibrate it once on a real GPU: run `mlf materialize -c cfg.yaml
+   --probe-full`, read the `max abs diff` line, and set the constant in
+   `data/streaming/tail_probe.py` an order of magnitude above it. Until then the risk
+   is one-sided — too tight fails a healthy corpus loudly.
+6. **Parquet is deliberately not a decoder row.** Its read/demux/decode is already
    owned by `DataBackend` (P12), and the reference table itself notes the
    Thrift-footer→chunk-offset step is "same API, no seam". A second owner for one
    read path is what `DataBackendSpec`'s docstring forbids.
