@@ -5,25 +5,43 @@
 #
 # The Spark preprocess stage needs a JVM (Java 11/17) + pyspark. The train stage
 # reads the processed Parquet the datamodule now understands.
+
+# `params.yaml` is NOT listed here: DVC loads the repo-root params.yaml into the
+# substitution namespace by default, which is what makes `${preprocess.input}`
+# and `${train.config}` below resolve with nothing declaring them. Listing it
+# again would define those variables twice.
+#
+# The train config is not a default, so it has to be named. Loading it is what
+# lets `${data.path}` resolve to the same value `mlf train` will read — the
+# preprocess stage is handed the config rather than a copy of its contents.
+vars:
+  - configs/dvc_tabular.yaml
+
 stages:
   preprocess:
     cmd: >-
       python -m ml_framework.pipeline.spark_preprocess
       --input ${preprocess.input}
-      --output ${preprocess.output}
-      --target-col ${preprocess.target_col}
+      --config ${train.config}
     deps:
       - ${preprocess.input}
+      - ${train.config}
       - src/ml_framework/pipeline/spark_preprocess.py
+    # `vars` substitutes but does not track. Both files are declared here so a
+    # changed target column or output path actually invalidates this stage
+    # instead of silently reusing a cache entry built for the old column.
     params:
       - preprocess
+      - configs/dvc_tabular.yaml:
+          - data.target
+          - data.path
     outs:
-      - ${preprocess.output}
+      - ${data.path}
 
   train:
     cmd: mlf train --config ${train.config}
     deps:
-      - ${preprocess.output}
+      - ${data.path}
       - ${train.config}
       - src/ml_framework
     # Bundle v2 — P3 deleted the v1 root artifacts (model.ckpt/scaler.pkl/

@@ -560,15 +560,44 @@ in `fit`), close to none for a Python-bound loop. Leave at 1 on a single GPU.
 
 ### Airflow — across a cluster
 
-`orchestration/airflow/dags/ml_pipeline.py` uses **dynamic task mapping** to fan
-out one task per family, then reduces:
+**The shipped retraining DAG does not select.** `orchestration/airflow/dags/ml_pipeline.py`
+trains the model its config names and nothing else:
 
 ```
-dvc_pull → spark_preprocess → validate_data
-    → tune_candidate.expand([xgboost, lightgbm, catboost, mlp])   ← concurrent
-    → collect_winner
-    → announce_winner
+assert_pinned_config → dvc_pull → spark_preprocess → validate_data
     → train → evaluate_gate → promote_model → trigger_deploy
+```
+
+Choosing a family is a decision; retraining it on fresh data is a routine, and
+they belong on different clocks. Run the bake-off out of band, emit the winner,
+commit it, and point the DAG at it:
+
+```bash
+mlf select --config configs/example_selection.yaml \
+    --emit-config configs/winner.yaml
+```
+
+`configs/winner.yaml` carries the winner's `model.name`, its tuned
+`model.params`, and `select.enabled: false` — a candidate config is built with
+the bake-off switched off, so the emitted file cannot start another one. Setting
+`TRAIN_CONFIG=configs/winner.yaml` is the whole handoff.
+
+`assert_pinned_config` enforces it: `mlf train` reads `select.enabled` from the
+YAML, so a config with the comparison switched on would compare families *inside*
+the `train` task — daily, under one task id, invisible in the graph. The guard
+fails the run first. Re-running a bake-off nightly does not just spend GPU hours
+on a decision nobody will revisit; it lets the winner flip on cross-validation
+noise, changing the production family with no one choosing it.
+
+#### Distributing a bake-off you *do* want to run
+
+When a comparison is genuinely worth a cluster — many families, each expensive —
+`--candidate` / `--collect` split it across **dynamic task mapping** in a
+*separate*, occasionally-triggered DAG:
+
+```
+tune_candidate.expand([xgboost, lightgbm, catboost, mlp])   ← concurrent
+    → collect_winner
 ```
 
 ```python
@@ -594,19 +623,10 @@ Independent retries and independent failures are the reason this is N tasks
 rather than one task with a loop: a family whose extra is missing on one worker
 should be one red square, not a dead pipeline.
 
-Configure it with environment variables:
-
-```bash
-SELECT_CANDIDATES=xgboost,lightgbm,catboost,mlp
-SELECT_REPORT_DIR=outputs/reports
-SELECT_MAX_LATENCY_MS=20
-SELECT_MAX_MODEL_MB=100
-SELECT_MIN_EXPLAINABILITY=0.5
-```
-
-`SELECT_CANDIDATES=""` (the default) skips the bake-off entirely and trains the
-configured model — the original linear DAG. Re-running a bake-off nightly for a
-decision nobody will revisit is just a way to spend GPU hours.
+Such a DAG ends at `collect_winner`. Its output is `selection.json` and a
+proposed `configs/winner.yaml` — a **pull request**, not a deployment. A model
+family change deserves a diff and a reviewer; the retraining DAG picks it up on
+its next run once the file is merged.
 
 Requires Airflow ≥ 2.3 for `.expand()`.
 

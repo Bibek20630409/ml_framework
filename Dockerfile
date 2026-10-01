@@ -47,7 +47,7 @@ CMD ["gunicorn", "ml_framework.serving.asgi:app", \
 # learning stack. Expect roughly an order of magnitude less image, and a cold
 # start to match.
 #
-#   docker build --target serve-gbdt -t mlf-serve-gbdt .
+#   docker build --target serve-gbdt -t ml-framework-serve-gbdt .
 #
 # `parquet` is included because a serving container is exactly where the pyarrow
 # coupling used to break: it arrived only via mlflow, which this image omits.

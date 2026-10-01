@@ -3,33 +3,38 @@ orchestration/airflow/dags/ml_pipeline.py
 ──────────────────────────────────────────
 Airflow DAG that orchestrates the end-to-end MLOps pipeline:
 
-    dvc_pull → spark_preprocess → validate_data
-        → tune_candidate.expand([...])   ← one mapped task per model family
-        → collect_winner
+    assert_pinned_config → dvc_pull → spark_preprocess → validate_data
         → train → evaluate_gate → promote_model → trigger_deploy
 
 Each task is a thin wrapper around tooling the framework already provides (DVC, the
 Spark job, the ``mlf`` CLI, MLflow). Airflow only schedules and sequences them.
 
-**The fan-out is the point of this shape.** ``CANDIDATES`` families are tuned and
-profiled *concurrently*, each in its own worker slot, and a single reduce task
-applies the constraints and the decision rule to the reports they wrote. The
-framework can do the same thing in-process (``mlf select --max-workers N``), and
-that is the right tool on one machine; this is the right tool when the candidates
-should be spread across a cluster, retried independently, and shown as separate
-rows in a UI when one of them fails.
+**This DAG retrains; it does not choose.** Choosing a model family is a decision,
+retraining it on fresh data is a routine, and the two belong on different clocks.
+The bake-off runs out of band — on a laptop, in a one-off job, on whatever cadence
+a model review actually has — and writes its answer to a config:
 
-Set ``SELECT_CANDIDATES=""`` to skip the bake-off entirely and train
-``TRAIN_CONFIG``'s configured model — the original linear behaviour, which is
-still the right default for a pipeline whose model choice is already settled.
-Re-running a bake-off nightly for a decision nobody is going to revisit is just
-a way to spend GPU hours.
+    mlf select --config configs/example_selection.yaml \\
+        --emit-config configs/winner.yaml      # or: mlf train --select --emit-config ...
+
+``configs/winner.yaml`` is the effective config of the winning candidate: its
+``model.name``, its tuned ``model.params``, and — because a candidate config is
+built with the bake-off switched off — ``select.enabled: false``. Commit it, point
+``TRAIN_CONFIG`` at it, and this DAG trains that model and only that model.
+
+Running the comparison nightly would not just spend GPU hours on a decision nobody
+is going to revisit. It would let the winner *flip* on cross-validation noise, so
+the family in production changes without anyone choosing it — and the latency
+budget, the explainability story and on-call's mental model all change with it.
+
+``assert_pinned_config`` is what makes that a property rather than a convention:
+``mlf train`` reads ``select.enabled`` from the YAML, so deleting a selection stage
+from this file is not by itself enough to stop a bake-off happening inside the
+``train`` task.
 
 Deploy: copy this file into your Airflow ``dags/`` folder. The project must be
 installed (``pip install -e ".[mlops]"``) in the Airflow workers' environment, and
 ``PROJECT_DIR`` / ``MLFLOW_TRACKING_URI`` set via Airflow Variables or env.
-
-Dynamic task mapping (``.expand``) needs Airflow >= 2.3.
 """
 
 from __future__ import annotations
@@ -39,44 +44,40 @@ import os
 from datetime import datetime, timedelta
 
 from airflow import DAG
-from airflow.exceptions import AirflowFailException, AirflowSkipException
+from airflow.exceptions import AirflowFailException
 from airflow.operators.bash import BashOperator
 from airflow.operators.python import PythonOperator
 
 PROJECT_DIR = os.environ.get("PROJECT_DIR", "/opt/ml_framework")
 TRACKING_URI = os.environ.get("MLFLOW_TRACKING_URI", "http://mlflow:5000")
 MODEL_NAME = os.environ.get("MODEL_NAME", "ml-framework")
+# The pinned config: the winner emitted by `mlf select --emit-config`, or any
+# config whose `model.name` is already settled. Never one with a bake-off in it.
 CONFIG = os.environ.get("TRAIN_CONFIG", "configs/dvc_tabular.yaml")
 ACCURACY_GATE = float(os.environ.get("ACCURACY_GATE", "0.6"))
 
-# The families to compare. Empty disables the bake-off and trains the configured
-# model directly.
-CANDIDATES = [c.strip() for c in os.environ.get("SELECT_CANDIDATES", "").split(",") if c.strip()]
-# Where the mapped tasks write their reports and the reduce task reads them.
-REPORT_DIR = os.environ.get("SELECT_REPORT_DIR", "outputs/reports")
-# Production limits every candidate must meet. Empty means unconstrained; these
-# are interpolated into the CLI flags of each mapped task.
-MAX_LATENCY_MS = os.environ.get("SELECT_MAX_LATENCY_MS", "")
-MAX_MODEL_MB = os.environ.get("SELECT_MAX_MODEL_MB", "")
-MIN_EXPLAINABILITY = os.environ.get("SELECT_MIN_EXPLAINABILITY", "")
 
+def _raw_input() -> str:
+    """Where the preprocess stage reads from — owned by ``params.yaml``.
 
-def _constraint_flags() -> str:
-    """The constraint flags, shared by the fan-out and the reduce task.
-
-    Both halves need them: the mapped tasks so the a-priori gate can skip a
-    family it already knows cannot qualify, and the reduce task because the
-    *measured* constraints are applied there. Building the string once is what
-    keeps the two from disagreeing about the budget.
+    Read rather than repeated. This DAG used to spell out the input path, the
+    output path and the target column in its Bash commands, which meant editing
+    ``params.yaml`` changed what ``dvc repro`` did and changed nothing at all
+    about what ran on the schedule. The target and output now come from
+    ``TRAIN_CONFIG`` (the stages read it themselves via ``--config``); the raw
+    input is the one pipeline-owned value left, and it comes from here.
     """
-    flags = []
-    if MAX_LATENCY_MS:
-        flags.append(f"--max-latency-ms {MAX_LATENCY_MS}")
-    if MAX_MODEL_MB:
-        flags.append(f"--max-model-mb {MAX_MODEL_MB}")
-    if MIN_EXPLAINABILITY:
-        flags.append(f"--min-explainability {MIN_EXPLAINABILITY}")
-    return " ".join(flags)
+    import yaml
+
+    path = os.path.join(PROJECT_DIR, "params.yaml")
+    try:
+        with open(path, encoding="utf-8") as f:
+            params = yaml.safe_load(f) or {}
+        return (params.get("preprocess") or {})["input"]
+    except (OSError, KeyError) as exc:
+        # At DAG-parse time a raised exception would break the whole file, not
+        # just this DAG. Fail inside the task instead, where it is visible.
+        return f"__unresolved__:{exc}"
 
 
 default_args = {
@@ -88,7 +89,16 @@ default_args = {
 
 def _evaluate_gate() -> None:
     """Fail the pipeline if the fresh model doesn't clear the quality bar."""
-    metrics_path = os.path.join(PROJECT_DIR, "outputs", "metrics.json")
+    # `runtime.output_dir` is the config's to decide; hardcoding "outputs" here
+    # meant changing it in the config silently broke the gate with a FileNotFound
+    # at the end of a full training run.
+    import yaml
+
+    with open(os.path.join(PROJECT_DIR, CONFIG), encoding="utf-8") as f:
+        config = yaml.safe_load(f) or {}
+    output_dir = (config.get("runtime") or {}).get("output_dir", "outputs")
+
+    metrics_path = os.path.join(PROJECT_DIR, output_dir, "metrics.json")
     with open(metrics_path, encoding="utf-8") as f:
         metrics = json.load(f)
     score = metrics.get("test_acc")
@@ -102,31 +112,38 @@ def _evaluate_gate() -> None:
     print(f"quality gate passed: {metrics}")
 
 
-def _winning_model() -> str:
-    """The family the reduce task chose, read from ``selection.json``.
+def _assert_pinned_config() -> None:
+    """Refuse to start if ``TRAIN_CONFIG`` would run a bake-off.
 
-    Pushed to XCom so the ``train`` task can pin ``model.name`` to it. Reading
-    the file rather than parsing the reduce task's stdout because the file is the
-    artifact the framework commits to, and a log format is not a contract.
+    ``mlf train`` reads ``select.enabled`` from the YAML, so a config with the
+    comparison switched on compares families *inside* the ``train`` task — daily,
+    under one task id, invisible in the graph. Removing a selection stage from
+    this DAG does not prevent that; this check does.
+
+    It is deliberately the first task: the config is on disk, the check costs
+    milliseconds, and a misconfigured pipeline should fail before it pulls data
+    and starts a Spark job rather than after.
     """
-    path = os.path.join(PROJECT_DIR, "outputs", "selection.json")
+    import yaml
+
+    path = os.path.join(PROJECT_DIR, CONFIG)
     if not os.path.exists(path):
-        raise AirflowSkipException("no selection.json — the bake-off did not run")
+        raise AirflowFailException(f"TRAIN_CONFIG not found: {path}")
     with open(path, encoding="utf-8") as f:
-        selection = json.load(f)
-    winner = selection.get("winner")
-    if not winner:
-        raise AirflowFailException(f"selection.json names no winner: {selection.get('reason')}")
-    print(f"selected {winner}: {selection.get('reason')}")
-    for candidate in selection.get("candidates", []):
-        profile = candidate.get("profile") or {}
-        print(
-            f"  {candidate['model']:<16} "
-            f"score={profile.get('score')} "
-            f"p95={(profile.get('latency') or {}).get('p95_ms')} "
-            f"status={'winner' if candidate['model'] == winner else candidate.get('disqualified') or candidate.get('skipped') or 'ok'}"
+        config = yaml.safe_load(f) or {}
+
+    if (config.get("select") or {}).get("enabled"):
+        raise AirflowFailException(
+            f"{CONFIG} has select.enabled: true. This DAG trains a pinned winner and "
+            "must not run a bake-off. Choose the family out of band with "
+            "`mlf select --config <c> --emit-config configs/winner.yaml`, commit that "
+            "file, and point TRAIN_CONFIG at it."
         )
-    return winner
+
+    model = (config.get("model") or {}).get("name")
+    if not model:
+        raise AirflowFailException(f"{CONFIG} names no model.name, so there is nothing to train")
+    print(f"training pinned model '{model}' from {CONFIG}")
 
 
 def _promote_model() -> None:
@@ -151,91 +168,55 @@ with DAG(
     catchup=False,
     tags=["mlops", "ml-framework"],
 ) as dag:
+    # The structural guarantee that this DAG never chooses a model. First in the
+    # chain, and cheap, so a config that would start a bake-off fails the run
+    # before anything expensive happens.
+    assert_pinned_config = PythonOperator(
+        task_id="assert_pinned_config",
+        python_callable=_assert_pinned_config,
+        retries=0,  # a bad config is not transient; retrying it just delays the red square
+    )
+
     dvc_pull = BashOperator(
         task_id="dvc_pull",
         bash_command=f"cd {PROJECT_DIR} && dvc pull || true",
     )
 
+    # `--config` rather than `--target-col`/`--output`: the stage reads the target
+    # column and the processed-data path out of the same config the train task is
+    # pinned to, so those values cannot drift between the two tasks or between
+    # this DAG and `dvc repro`.
     spark_preprocess = BashOperator(
         task_id="spark_preprocess",
         bash_command=(
             f"cd {PROJECT_DIR} && "
             "python -m ml_framework.pipeline.spark_preprocess "
-            "--input data/raw/sample.csv --output data/processed --target-col label"
+            f"--input {_raw_input()} --config {CONFIG}"
         ),
     )
 
     # Data contract gate — fails the pipeline before training on bad data.
+    # Reads its input path and target from the config too, so the gate is
+    # structurally guaranteed to validate the column training will read.
     validate_data = BashOperator(
         task_id="validate_data",
         bash_command=(
-            f"cd {PROJECT_DIR} && "
-            "python -m ml_framework.pipeline.contracts "
-            "--input data/processed --target-col label"
+            f"cd {PROJECT_DIR} && python -m ml_framework.pipeline.contracts --config {CONFIG}"
         ),
     )
 
-    # ── Model selection: fan out, then reduce ─────────────
-    # One mapped task per candidate family. Each tunes and profiles its own model
-    # and writes a report; none of them decides anything. Independent retries and
-    # independent failures are the reason this is N tasks rather than one task
-    # with a loop inside it — a family whose extra is missing on one worker
-    # should be one red square, not a dead pipeline.
-    if CANDIDATES:
-        tune_candidate = BashOperator.partial(
-            task_id="tune_candidate",
-            # A candidate that gets gated out exits 0 with a note; a genuine
-            # crash is what should be retried.
-            retries=1,
-        ).expand(
-            bash_command=[
-                (
-                    f"cd {PROJECT_DIR} && MLFLOW_TRACKING_URI={TRACKING_URI} "
-                    f"mlf select --config {CONFIG} "
-                    f"--candidate {candidate} --report-dir {REPORT_DIR} "
-                    f"{_constraint_flags()}"
-                )
-                for candidate in CANDIDATES
-            ]
-        )
-
-        # The reduce step: read every report, apply the measured constraints, run
-        # the decision rule, write selection.json.
-        collect_winner = BashOperator(
-            task_id="collect_winner",
-            bash_command=(
-                f"cd {PROJECT_DIR} && "
-                f"mlf select --config {CONFIG} --collect {REPORT_DIR} "
-                f"{_constraint_flags()}"
-            ),
-        )
-
-        announce_winner = PythonOperator(task_id="announce_winner", python_callable=_winning_model)
-
-        # `train` pins the winner rather than re-running the bake-off: the
-        # comparison already happened, and repeating it here would double the
-        # cost of the pipeline to re-derive an answer sitting in a file.
-        train = BashOperator(
-            task_id="train",
-            bash_command=(
-                f"cd {PROJECT_DIR} && MLFLOW_TRACKING_URI={TRACKING_URI} "
-                f"mlf train --config {CONFIG} "
-                "--set model.name="
-                "{{ ti.xcom_pull(task_ids='announce_winner') }} "
-                f"--set logging.mlflow_tracking_uri={TRACKING_URI}"
-            ),
-        )
-        selection_stage = [tune_candidate, collect_winner, announce_winner]
-    else:
-        train = BashOperator(
-            task_id="train",
-            bash_command=(
-                f"cd {PROJECT_DIR} && MLFLOW_TRACKING_URI={TRACKING_URI} "
-                f"mlf train --config {CONFIG} "
-                f"--set logging.mlflow_tracking_uri={TRACKING_URI}"
-            ),
-        )
-        selection_stage = []
+    # Trains exactly what the config names. No --select, and no `--set
+    # model.name=...` override: the family is whatever was committed to
+    # TRAIN_CONFIG, so the file in git is the single answer to "what is in
+    # production", and a run cannot disagree with it.
+    train = BashOperator(
+        task_id="train",
+        bash_command=(
+            f"cd {PROJECT_DIR} && MLFLOW_TRACKING_URI={TRACKING_URI} "
+            f"mlf train --config {CONFIG} "
+            f"--set logging.mlflow_tracking_uri={TRACKING_URI}"
+        ),
+    )
 
     evaluate_gate = PythonOperator(task_id="evaluate_gate", python_callable=_evaluate_gate)
     promote_model = PythonOperator(task_id="promote_model", python_callable=_promote_model)
@@ -249,8 +230,15 @@ with DAG(
         ),
     )
 
-    chain = [dvc_pull, spark_preprocess, validate_data]
-    chain += selection_stage
-    chain += [train, evaluate_gate, promote_model, trigger_deploy]
+    chain = [
+        assert_pinned_config,
+        dvc_pull,
+        spark_preprocess,
+        validate_data,
+        train,
+        evaluate_gate,
+        promote_model,
+        trigger_deploy,
+    ]
     for upstream, downstream in zip(chain, chain[1:], strict=False):
         upstream >> downstream

@@ -8,6 +8,10 @@ Enforces: the target column exists and is non-null, feature columns are numeric 
 non-null, there are no duplicate rows, and (optionally) values sit in expected ranges.
 
     python -m ml_framework.pipeline.contracts --input data/processed --target-col label
+
+Orchestrated, where both values come from the training config instead:
+
+    python -m ml_framework.pipeline.contracts --config configs/dvc_tabular.yaml
 """
 
 from __future__ import annotations
@@ -16,6 +20,8 @@ import argparse
 import logging
 
 import pandas as pd
+
+from .stage_config import resolve
 
 log = logging.getLogger(__name__)
 
@@ -69,14 +75,31 @@ def validate_file(path: str, target_col: str, *, backend: str = "local") -> int:
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="Data contract / quality gate")
-    p.add_argument("--input", required=True, help="CSV/Parquet dataset")
-    p.add_argument("--target-col", required=True)
+    p.add_argument("--input", help="CSV/Parquet dataset (default: data.path)")
+    p.add_argument("--target-col", help="Target column (default: data.target)")
+    # As in the preprocess stage: the orchestrated path names a config, so the
+    # gate validates the same column training is about to read, by construction.
+    p.add_argument(
+        "--config",
+        metavar="PATH",
+        help="Training config to read data.target / data.path from",
+    )
     p.add_argument(
         "--data-backend", default="local", help="Engine: local (default), polars or spark"
     )
     args = p.parse_args(argv)
     logging.basicConfig(level=logging.INFO)
-    validate_file(args.input, args.target_col, backend=args.data_backend)
+
+    try:
+        target_col, input_path = resolve(
+            args.config, target_col=args.target_col, data_path=args.input
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        p.error(str(exc))
+    if not input_path:
+        p.error("pass --input, or a --config that sets data.path")
+
+    validate_file(input_path, target_col, backend=args.data_backend)
     return 0
 
 

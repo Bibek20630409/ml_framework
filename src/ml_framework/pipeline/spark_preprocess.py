@@ -23,6 +23,11 @@ Run standalone:
     python -m ml_framework.pipeline.spark_preprocess \\
         --input data/raw/dataset.csv --output data/processed --target-col label
 
+Orchestrated (DVC/Airflow), where the target and output come from the training
+config so no caller has to repeat them:
+    python -m ml_framework.pipeline.spark_preprocess \\
+        --input data/raw/dataset.csv --config configs/dvc_tabular.yaml
+
 The default engine is ``spark``, which needs a JVM (Java 11/17) and
 ``pip install -e ".[mlops]"``. Add ``--data-backend local`` for neither.
 """
@@ -31,6 +36,8 @@ from __future__ import annotations
 
 import argparse
 import logging
+
+from .stage_config import resolve
 
 log = logging.getLogger(__name__)
 
@@ -84,8 +91,16 @@ def preprocess(
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Data preprocessing stage")
     parser.add_argument("--input", required=True, help="Raw CSV/Parquet path")
-    parser.add_argument("--output", required=True, help="Processed Parquet output dir")
-    parser.add_argument("--target-col", required=True)
+    parser.add_argument("--output", help="Processed Parquet output dir (default: data.path)")
+    parser.add_argument("--target-col", help="Target column (default: data.target)")
+    # The orchestrated path passes this instead of --output/--target-col, so the
+    # train config is the one place those two values are written down. Explicit
+    # flags still win, per the precedence the `mlf` CLI documents.
+    parser.add_argument(
+        "--config",
+        metavar="PATH",
+        help="Training config to read data.target / data.path from",
+    )
     parser.add_argument("--no-dropna", action="store_true")
     parser.add_argument("--no-dedup", action="store_true")
     # Additive and defaulted, so the DVC stage and the Airflow BashOperator --
@@ -99,10 +114,20 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO)
+
+    # A missing flag is a usage error, not a crash: argparse prints the usage
+    # line and exits 2, which is what a DVC/Airflow log is readable with.
+    try:
+        target_col, output = resolve(args.config, target_col=args.target_col, data_path=args.output)
+    except (FileNotFoundError, ValueError) as exc:
+        parser.error(str(exc))
+    if not output:
+        parser.error("pass --output, or a --config that sets data.path")
+
     preprocess(
         args.input,
-        args.output,
-        args.target_col,
+        output,
+        target_col,
         dropna=not args.no_dropna,
         deduplicate=not args.no_dedup,
         backend=args.data_backend,

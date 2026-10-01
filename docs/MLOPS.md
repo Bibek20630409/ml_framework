@@ -71,9 +71,25 @@ dvc metrics show   # reads outputs/metrics.json
 ```
 
 The pipeline (`dvc.yaml`) has two stages: `preprocess` runs the Spark job, `train`
-runs `mlf train` on the processed Parquet. `params.yaml` holds the tunables.
+runs `mlf train` on the processed Parquet.
+
+`params.yaml` holds what belongs to the *pipeline* — the raw input path and which
+config the run is pinned to. It deliberately does not carry a target column or an
+output path: those describe the dataset, so they live in the train config's
+`data:` block and every stage reads them from there via `--config`. One value, one
+owner. See [§3](#3-spark--preprocessing).
 
 ## 3. Spark — preprocessing
+
+In the pipeline, the stage is handed the config and reads `data.target` /
+`data.path` itself — so the target column is written down exactly once:
+
+```bash
+python -m ml_framework.pipeline.spark_preprocess \
+  --input data/raw/sample.csv --config configs/dvc_tabular.yaml
+```
+
+For a one-off run, the explicit flags still work and still win over the config:
 
 ```bash
 python -m ml_framework.pipeline.spark_preprocess \
@@ -126,40 +142,35 @@ docker compose -f docker-compose.airflow.yml up airflow-init
 docker compose -f docker-compose.airflow.yml up      # UI :8080 (airflow/airflow)
 ```
 
-The `ml_framework_pipeline` DAG runs: `dvc_pull → spark_preprocess →
-validate_data → train → evaluate_gate → promote_model → trigger_deploy`. The gate
-fails the run if accuracy is below `ACCURACY_GATE`; promotion sets the
-`@production` alias in MLflow.
+The `ml_framework_pipeline` DAG runs: `assert_pinned_config → dvc_pull →
+spark_preprocess → validate_data → train → evaluate_gate → promote_model →
+trigger_deploy`. The gate fails the run if accuracy is below `ACCURACY_GATE`;
+promotion sets the `@production` alias in MLflow.
 
-### Optional: a model-selection fan-out
+### The DAG retrains; it does not choose
 
-Setting `SELECT_CANDIDATES` inserts a **dynamically mapped** stage — one task per
-model family, run concurrently, then a reduce task that applies the constraints
-and picks a winner:
+`train` fits whatever `TRAIN_CONFIG` names — no bake-off, no `model.name`
+override. Choosing a family is a decision, retraining it on fresh data is a
+routine, and running the comparison nightly lets the winner flip on
+cross-validation noise, changing the production family with nobody choosing it.
 
-```
-dvc_pull → spark_preprocess → validate_data
-    → tune_candidate.expand([xgboost, lightgbm, catboost, mlp])   ← concurrent
-    → collect_winner → announce_winner
-    → train → evaluate_gate → promote_model → trigger_deploy
-```
+Select out of band, emit the winner, commit it, point the DAG at it:
 
 ```bash
-SELECT_CANDIDATES=xgboost,lightgbm,catboost,mlp
-SELECT_REPORT_DIR=outputs/reports
-SELECT_MAX_LATENCY_MS=20        # optional hard constraints
-SELECT_MAX_MODEL_MB=100
-SELECT_MIN_EXPLAINABILITY=0.5
+mlf select --config configs/example_selection.yaml \
+    --emit-config configs/winner.yaml     # model.name + tuned params + select.enabled: false
+
+export TRAIN_CONFIG=configs/winner.yaml
 ```
 
-Each mapped task runs `mlf select --candidate <model> --report-dir …` and writes
-one JSON report; `collect_winner` runs `mlf select --collect …` and writes
-`selection.json`; `train` pins `model.name` to the winner via XCom rather than
-re-running the comparison. N tasks rather than one loop so a family whose extra
-is missing on a worker is one red square, not a dead pipeline.
+`assert_pinned_config` is what makes this structural rather than conventional:
+`mlf train` reads `select.enabled` from the YAML, so a config with the comparison
+switched on would run a bake-off *inside* the `train` task. The guard fails the
+run before `dvc pull`, naming the file and what to do about it.
 
-Empty (the default) skips the stage entirely and trains the configured model.
-Needs Airflow ≥ 2.3 for `.expand()`. See
+To distribute a bake-off you do want, `mlf select --candidate` / `--collect` fan
+out across dynamic task mapping in a **separate** DAG whose output is a proposed
+`configs/winner.yaml`. See
 [MODEL_SELECTION.md](MODEL_SELECTION.md#6-running-candidates-in-parallel).
 
 ## 5. Kubernetes — deploy + scale

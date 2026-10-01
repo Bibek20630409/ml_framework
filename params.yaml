@@ -1,8 +1,14 @@
-# DVC pipeline parameters — the single source of truth the pipeline stages read.
+# DVC pipeline parameters.
+#
+# This file owns only what belongs to the *pipeline*: where raw data comes from,
+# and which config the run is pinned to. It deliberately no longer carries a
+# target column or an output path — those describe the *dataset*, they live in
+# the train config's `data:` block, and every stage now reads them from there.
+#
+# Rule of thumb for adding anything here: if `mlf train` would need the value to
+# make sense of the data, it belongs in the train config, not in this file.
 preprocess:
   input: data/raw/sample.csv
-  output: data/processed
-  target_col: label
 
 train:
   config: configs/dvc_tabular.yaml
