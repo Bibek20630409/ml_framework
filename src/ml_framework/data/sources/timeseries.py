@@ -166,6 +166,9 @@ def build_timeseries_bundle(config, *, indices: Any = None) -> DataBundle:
         # rows happened to be ordered" and "the rows are ordered".
         frame = frame.sort_values(time_col, kind="stable").reset_index(drop=True)
         stamps = pd.to_datetime(frame[time_col], errors="coerce")
+        # Pinned to ns: every reader decodes this index with `pd.to_datetime(int)`,
+        # which assumes ns, and pandas 3 parses to `datetime64[us]` by default.
+        stamps = stamps.astype("datetime64[ns]")
         index = np.asarray(stamps.astype("int64") if stamps.notna().all() else frame[time_col])
     else:
         log.info("no split.time_col — treating row order as the chronology")

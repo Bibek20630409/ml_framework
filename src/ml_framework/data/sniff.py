@@ -377,7 +377,9 @@ def _sniff_table(
 
 
 def _string_columns(frame: Any, target: str) -> list[str]:
-    return [c for c in frame.columns if c != target and frame[c].dtype == object]  # noqa: E721
+    # `kind == "O"` rather than `== object`: pandas 3 reads strings as `str`
+    # (a StringDtype), which is not `object` but shares its kind.
+    return [c for c in frame.columns if c != target and frame[c].dtype.kind == "O"]
 
 
 def _text_column(frame: Any, target: str) -> str | None:

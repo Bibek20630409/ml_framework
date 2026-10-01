@@ -161,9 +161,8 @@ def _pick_text_column(frame: Any, target: str, declared: str | None) -> str:
             raise KeyError(f"data.params.text_col '{declared}' is not a column of the file")
         return declared
 
-    candidates = [
-        c for c in frame.columns if c != target and frame[c].dtype == object  # noqa: E721
-    ]
+    # `kind == "O"` covers both `object` and pandas 3's default `str` dtype.
+    candidates = [c for c in frame.columns if c != target and frame[c].dtype.kind == "O"]
     if not candidates:
         raise FrameworkError(
             f"no text column found beside the target '{target}'. "
